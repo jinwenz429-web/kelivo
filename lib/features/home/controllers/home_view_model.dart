@@ -336,11 +336,20 @@ class HomeViewModel extends ChangeNotifier {
     _onMaybeOrganizeMemory(message.conversationId);
   }
 
-  void _onProactiveAssistantMessageFinished(
+  Future<void> _onProactiveAssistantMessageFinished(
     ChatMessage message,
     String? eventKey,
-  ) {
-    AgencyCoordinator.instance.recordProactiveMessage(eventKey: eventKey);
+  ) async {
+    try {
+      await AgencyCoordinator.instance.recordProactiveMessage(
+        eventKey: eventKey,
+      );
+    } catch (error, stackTrace) {
+      FlutterLogger.log(
+        '[Agency] failed to persist delivery ledger: $error\n$stackTrace',
+        tag: 'HomeViewModel',
+      );
+    }
   }
 
   /// Schedule background memory organize after a successful finalize (§12.1).

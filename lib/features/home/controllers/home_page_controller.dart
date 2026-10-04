@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../core/database/chat_database_repository.dart';
+import '../../../core/database/business_preferences.dart';
 import '../../../core/agency/agency_coordinator.dart';
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
@@ -387,8 +388,11 @@ class HomePageController extends ChangeNotifier {
     _initializeScrollController();
     _initializeServices();
     _initializeViewModel();
-    AgencyCoordinator.instance.start(
-      busy: () => ChatActions.hasAnyActiveGeneration,
+    unawaited(
+      AgencyCoordinator.instance.start(
+        busy: () => ChatActions.hasAnyActiveGeneration,
+        preferences: _context.read<BusinessPreferences>(),
+      ),
     );
     _agencyConsiderationSub = AgencyCoordinator.instance.considerations.listen(
       (consideration) => unawaited(_handleAgencyConsideration(consideration)),
@@ -1267,6 +1271,8 @@ class HomePageController extends ChangeNotifier {
       _clearSelectionState();
       notifyListeners();
     }
+
+    unawaited(_sampleAgencyReality());
 
     if (isDesktopPlatform) {
       WidgetsBinding.instance.addPostFrameCallback((_) {

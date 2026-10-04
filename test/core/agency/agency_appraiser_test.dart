@@ -4,6 +4,8 @@ import 'package:Kelivo/core/agency/agency_event.dart';
 import 'package:Kelivo/core/agency/agency_event_bus.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import '../../support/business_preferences_test_harness.dart';
+
 void main() {
   group('AgencyAppraiser', () {
     final now = DateTime(2026, 10, 4, 20);
@@ -86,7 +88,7 @@ void main() {
       await coordinator.stop();
       await bus.dispose();
     });
-    coordinator.start();
+    await coordinator.start();
 
     final candidates = <AgencyConsideration>[];
     final subscription = coordinator.considerations.listen(candidates.add);
@@ -114,7 +116,7 @@ void main() {
       await coordinator.stop();
       await bus.dispose();
     });
-    coordinator.start();
+    await coordinator.start();
 
     final candidates = <AgencyConsideration>[];
     final subscription = coordinator.considerations.listen(candidates.add);
@@ -131,12 +133,114 @@ void main() {
     bus.post(eventAt(now.add(const Duration(minutes: 1))));
     expect(candidates, hasLength(2));
 
-    coordinator.recordProactiveMessage(
+    await coordinator.recordProactiveMessage(
       at: now.add(const Duration(minutes: 2)),
       eventKey: candidates.last.event.dedupeKey,
     );
     bus.post(eventAt(now.add(const Duration(minutes: 3))));
 
     expect(candidates, hasLength(2));
+  });
+
+  test('AgencyCoordinator restores delivered-event dedupe across restart and day rollover', () async {
+    final harness = await BusinessPreferencesTestHarness.create();
+    addTearDown(harness.dispose);
+
+    final now = DateTime.now();
+    final deliveredAt = now.subtract(const Duration(days: 1));
+    const eventKey = 'calendar:a:c:restart-test';
+    const policy = AgencyAppraisalPolicy(
+      proactiveCooldown: Duration.zero,
+      dailyProactiveCap: 99,
+    );
+
+    final firstSession = await harness.open();
+    final firstBus = AgencyEventBus();
+    final first = AgencyCoordinator(
+      bus: firstBus,
+      appraiser: const AgencyAppraiser(policy: policy),
+      preferences: firstSession.preferences,
+    );
+    await first.start();
+    await first.recordProactiveMessage(
+      at: deliveredAt,
+      eventKey: eventKey,
+    );
+    final stored =
+        firstSession.preferences.getString('agency_delivery_state_v1') ?? '';
+    expect(stored, isNot(contains(eventKey)));
+    await first.stop();
+    await firstBus.dispose();
+    await firstSession.close();
+
+    final secondSession = await harness.open();
+    final secondBus = AgencyEventBus();
+    final second = AgencyCoordinator(
+      bus: secondBus,
+      appraiser: const AgencyAppraiser(policy: policy),
+      preferences: secondSession.preferences,
+    );
+    addTearDown(() async {
+      await second.stop();
+      await secondBus.dispose();
+    });
+    await second.start();
+
+    final candidates = <AgencyConsideration>[];
+    final subscription = second.considerations.listen(candidates.add);
+    addTearDown(subscription.cancel);
+
+    secondBus.post(
+      AgencyEvent(
+        kind: AgencyEventKind.calendarUpcoming,
+        occurredAt: now.add(const Duration(minutes: 1)),
+        dedupeKey: eventKey,
+      ),
+    );
+
+    expect(candidates, isEmpty);
+  });
+
+  test('AgencyCoordinator restores proactive cooldown after restart', () async {
+    final harness = await BusinessPreferencesTestHarness.create();
+    addTearDown(harness.dispose);
+
+    final now = DateTime.now();
+    final firstSession = await harness.open();
+    final firstBus = AgencyEventBus();
+    final first = AgencyCoordinator(
+      bus: firstBus,
+      preferences: firstSession.preferences,
+    );
+    await first.start();
+    await first.recordProactiveMessage(at: now);
+    await first.stop();
+    await firstBus.dispose();
+    await firstSession.close();
+
+    final secondSession = await harness.open();
+    final secondBus = AgencyEventBus();
+    final second = AgencyCoordinator(
+      bus: secondBus,
+      preferences: secondSession.preferences,
+    );
+    addTearDown(() async {
+      await second.stop();
+      await secondBus.dispose();
+    });
+    await second.start();
+
+    final candidates = <AgencyConsideration>[];
+    final subscription = second.considerations.listen(candidates.add);
+    addTearDown(subscription.cancel);
+
+    secondBus.post(
+      AgencyEvent(
+        kind: AgencyEventKind.calendarUpcoming,
+        occurredAt: now.add(const Duration(minutes: 1)),
+      ),
+    );
+
+    expect(candidates, isEmpty);
   });
 }
