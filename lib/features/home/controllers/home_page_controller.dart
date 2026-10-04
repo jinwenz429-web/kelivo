@@ -3003,6 +3003,21 @@ class HomePageController extends ChangeNotifier {
           ),
         );
         break;
+      case 'bluetooth_audio':
+        final connected = signal.payload['connected'] == true;
+        final deviceKey = signal.payload['deviceKey']?.toString().trim() ?? '';
+        AgencyEventBus.instance.post(
+          AgencyEvent(
+            kind: AgencyEventKind.bluetoothDeviceSeen,
+            source: 'android_audio_device',
+            urgency: connected ? 0.12 : 0.05,
+            dedupeKey: connected && deviceKey.isNotEmpty
+                ? 'bluetooth:${assistant.id}:${conversation.id}:$deviceKey'
+                : null,
+            payload: basePayload,
+          ),
+        );
+        break;
     }
   }
 

@@ -116,7 +116,7 @@ class AgencyAppraiser {
     AgencyEventKind.screenTimeThreshold => 0.65,
     AgencyEventKind.batteryChanged => 0.30,
     AgencyEventKind.networkChanged => 0.25,
-    AgencyEventKind.bluetoothDeviceSeen => 0.58,
+    AgencyEventKind.bluetoothDeviceSeen => 0.12,
     AgencyEventKind.notificationReceived => 0.62,
   };
 }

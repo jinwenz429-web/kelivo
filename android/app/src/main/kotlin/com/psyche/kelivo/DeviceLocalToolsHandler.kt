@@ -12,6 +12,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -77,6 +80,8 @@ class DeviceLocalToolsHandler(private val context: Context) {
     private var networkReceiver: BroadcastReceiver? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var observedDefaultNetwork: Network? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
+    private val knownBluetoothAudioDeviceIds = mutableSetOf<Int>()
     private var pendingCalendarPermissionCallback: ((Boolean) -> Unit)? = null
     private var pendingLocationPermissionCallback: ((Boolean, Boolean) -> Unit)? = null
     private val locationHandler = LocationToolHandler(context)
@@ -286,6 +291,37 @@ class DeviceLocalToolsHandler(private val context: Context) {
             }
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            knownBluetoothAudioDeviceIds.clear()
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .filter(::isBluetoothAudioDevice)
+                .forEach { device ->
+                    knownBluetoothAudioDeviceIds.add(device.id)
+                    emitBluetoothAudioDevice(device, connected = true)
+                }
+            audioDeviceCallback = object : AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                    for (device in addedDevices) {
+                        if (!isBluetoothAudioDevice(device)) continue
+                        if (knownBluetoothAudioDeviceIds.add(device.id)) {
+                            emitBluetoothAudioDevice(device, connected = true)
+                        }
+                    }
+                }
+
+                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    for (device in removedDevices) {
+                        if (knownBluetoothAudioDeviceIds.remove(device.id)) {
+                            emitBluetoothAudioDevice(device, connected = false)
+                        }
+                    }
+                }
+            }.also { callback ->
+                audioManager.registerAudioDeviceCallback(callback, mainHandler)
+            }
+        }
+
         emitCurrentBatterySnapshot(force = false)
         emitNetworkSnapshot(force = false)
     }
@@ -310,6 +346,16 @@ class DeviceLocalToolsHandler(private val context: Context) {
         }
         networkCallback = null
         observedDefaultNetwork = null
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioDeviceCallback?.let { callback ->
+                runCatching { audioManager.unregisterAudioDeviceCallback(callback) }
+            }
+        }
+        audioDeviceCallback = null
+        knownBluetoothAudioDeviceIds.clear()
+
         lastBatterySignature = null
         lastNetworkSignature = null
     }
@@ -427,6 +473,52 @@ class DeviceLocalToolsHandler(private val context: Context) {
                 "online" to online,
                 "transport" to transport,
                 "metered" to metered,
+            ),
+        )
+    }
+
+    private fun isBluetoothAudioDevice(device: AudioDeviceInfo): Boolean {
+        if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        ) {
+            return true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            device.type == AudioDeviceInfo.TYPE_HEARING_AID
+        ) {
+            return true
+        }
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            (device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_BLE_SPEAKER)
+    }
+
+    private fun bluetoothAudioType(device: AudioDeviceInfo): String = when {
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "a2dp"
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "sco"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            device.type == AudioDeviceInfo.TYPE_HEARING_AID -> "hearing_aid"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            device.type == AudioDeviceInfo.TYPE_BLE_HEADSET -> "ble_headset"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            device.type == AudioDeviceInfo.TYPE_BLE_SPEAKER -> "ble_speaker"
+        else -> "bluetooth"
+    }
+
+    private fun emitBluetoothAudioDevice(
+        device: AudioDeviceInfo,
+        connected: Boolean,
+    ) {
+        val type = bluetoothAudioType(device)
+        val name = device.productName.toString().trim()
+        emitRealitySignal(
+            "bluetooth_audio",
+            mapOf(
+                "connected" to connected,
+                "deviceId" to device.id,
+                "deviceType" to type,
+                "deviceName" to name,
+                "deviceKey" to "$type:$name",
             ),
         )
     }
