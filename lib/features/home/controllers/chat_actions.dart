@@ -1510,6 +1510,7 @@ class ChatActions {
     bool scheduledNotify = true,
     bool scheduledPreview = true,
     String? ephemeralSystemPrompt,
+    bool requireIdleTail = false,
   }) async {
     final claimToken = ++_sendInFlightClaimSerial;
     if (isSendInFlight(conversation.id)) {
@@ -1517,6 +1518,21 @@ class ChatActions {
     }
     _sendInFlightClaims[conversation.id] = claimToken;
     try {
+      if (requireIdleTail) {
+        if (chatController.isConversationLoading(conversation.id) ||
+            activeStreamingMessageId(conversation.id) != null) {
+          return ChatActionResult.inFlight();
+        }
+        final current = await chatService.loadSelectedMessageProjections(
+          conversation.id,
+        );
+        if (current.isEmpty ||
+            current.last.id != message.id ||
+            current.last.role != 'assistant' ||
+            current.last.isStreaming) {
+          return ChatActionResult.error('proactive_context_changed');
+        }
+      }
       return await _regenerateAtMessageClaimed(
         message: message,
         conversation: conversation,

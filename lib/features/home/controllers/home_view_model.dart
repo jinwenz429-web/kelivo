@@ -473,6 +473,7 @@ class HomeViewModel extends ChangeNotifier {
       preserveFollowingMessages: true,
       onGenerationStarted: onGenerationStarted,
       ephemeralSystemPrompt: instruction,
+      requireIdleTail: true,
     );
     if (result.success) {
       AgencyCoordinator.instance.recordProactiveMessage();

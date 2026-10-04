@@ -305,17 +305,9 @@ class MessageGenerationService {
 
     final transientPrompt = ephemeralSystemPrompt?.trim();
     if (transientPrompt != null && transientPrompt.isNotEmpty) {
-      final firstConversationMessage = apiMessages.indexWhere(
-        (message) => message['role'] != 'system',
-      );
-      apiMessages.insert(
-        firstConversationMessage < 0
-            ? apiMessages.length
-            : firstConversationMessage,
-        <String, dynamic>{
-          'role': 'system',
-          'content': transientPrompt,
-        },
+      messageBuilderService.injectTransientSystemPrompt(
+        apiMessages,
+        transientPrompt,
       );
     }
 

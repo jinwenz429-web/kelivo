@@ -2383,6 +2383,20 @@ class MessageBuilderService {
     } catch (_) {}
   }
 
+  /// Append request-scoped system context without persisting it in chat history.
+  void injectTransientSystemPrompt(
+    List<Map<String, dynamic>> apiMessages,
+    String content,
+  ) {
+    final prompt = content.trim();
+    if (prompt.isEmpty) return;
+    _appendToSystemMessage(
+      apiMessages,
+      prompt,
+      source: ContextSource.instructionInjection,
+    );
+  }
+
   /// Helper to append content to the system message (or create one if missing).
   void _appendToSystemMessage(
     List<Map<String, dynamic>> apiMessages,
