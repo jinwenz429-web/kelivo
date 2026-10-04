@@ -12,6 +12,7 @@ import '../../../core/database/business_preferences.dart';
 import '../../../core/agency/agency_coordinator.dart';
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
+import '../../../core/agency/agency_intention_gate.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
 import '../../../core/models/message_part.dart';
@@ -162,6 +163,8 @@ class HomePageController extends ChangeNotifier {
   late FileUploadService _fileUploadService;
   late scroll_ctrl.ChatScrollController _scrollCtrl;
   final AgencyRealitySampler _agencyRealitySampler = AgencyRealitySampler();
+  static const AgencyIntentionGate _agencyIntentionGate =
+      AgencyIntentionGate();
 
   McpProvider? _mcpProvider;
   StreamSubscription<ChatAction>? _chatActionSub;
@@ -3025,6 +3028,9 @@ class HomePageController extends ChangeNotifier {
     AgencyConsideration consideration,
   ) async {
     if (!_chatInitialized || !_context.mounted) return;
+    final intention = _agencyIntentionGate.decide(consideration);
+    if (!intention.shouldMessage) return;
+
     final event = consideration.event;
     final originAssistantId =
         event.payload['originAssistantId']?.toString().trim() ?? '';
