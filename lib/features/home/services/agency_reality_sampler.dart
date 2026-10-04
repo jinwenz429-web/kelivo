@@ -21,8 +21,10 @@ class AgencyRealitySampler {
     AgencyEventBus? bus,
     AgencyPermissionCheck? hasUsageStatsPermission,
     AgencyPermissionCheck? hasCalendarPermission,
+    AgencyPermissionCheck? hasLocationPermission,
     AgencyCapabilityCheck? screenTimeSupported,
     AgencyCapabilityCheck? calendarSupported,
+    AgencyCapabilityCheck? locationSupported,
     AgencyDeviceInvoker? invokeDeviceTool,
     this.minimumInterval = const Duration(minutes: 15),
   }) : _bus = bus ?? AgencyEventBus.instance,
@@ -30,18 +32,24 @@ class AgencyRealitySampler {
            hasUsageStatsPermission ?? DeviceLocalTools.hasUsageStatsPermission,
        _hasCalendarPermission =
            hasCalendarPermission ?? DeviceLocalTools.hasCalendarPermission,
+       _hasLocationPermission =
+           hasLocationPermission ?? DeviceLocalTools.hasLocationPermission,
        _screenTimeSupported =
            screenTimeSupported ?? (() => DeviceLocalTools.screenTimeSupported),
        _calendarSupported =
            calendarSupported ?? (() => DeviceLocalTools.calendarSupported),
+       _locationSupported =
+           locationSupported ?? (() => DeviceLocalTools.locationSupported),
        _invokeDeviceTool =
            invokeDeviceTool ?? DeviceLocalTools.invokeJsonTool;
 
   final AgencyEventBus _bus;
   final AgencyPermissionCheck _hasUsageStatsPermission;
   final AgencyPermissionCheck _hasCalendarPermission;
+  final AgencyPermissionCheck _hasLocationPermission;
   final AgencyCapabilityCheck _screenTimeSupported;
   final AgencyCapabilityCheck _calendarSupported;
+  final AgencyCapabilityCheck _locationSupported;
   final AgencyDeviceInvoker _invokeDeviceTool;
   final Duration minimumInterval;
 
@@ -66,7 +74,9 @@ class AgencyRealitySampler {
         assistant.localToolIds.contains(LocalToolNames.calendarQuery);
     final wantsScreenTime =
         assistant.localToolIds.contains(LocalToolNames.screenTime);
-    if (!wantsCalendar && !wantsScreenTime) return;
+    final wantsLocation =
+        assistant.localToolIds.contains(LocalToolNames.currentLocation);
+    if (!wantsCalendar && !wantsScreenTime && !wantsLocation) return;
 
     final clock = now ?? DateTime.now();
     final originKey = '${assistant.id}|$boundConversationId';
@@ -89,6 +99,15 @@ class AgencyRealitySampler {
       if (wantsScreenTime) {
         didReadDeviceData =
             await _sampleScreenTime(
+              clock,
+              assistantId: assistant.id,
+              conversationId: boundConversationId,
+            ) ||
+            didReadDeviceData;
+      }
+      if (wantsLocation) {
+        didReadDeviceData =
+            await _sampleLocation(
               clock,
               assistantId: assistant.id,
               conversationId: boundConversationId,
@@ -211,6 +230,43 @@ class AgencyRealitySampler {
     return true;
   }
 
+  Future<bool> _sampleLocation(
+    DateTime now, {
+    required String assistantId,
+    required String conversationId,
+  }) async {
+    if (!_locationSupported()) return false;
+    if (!await _hasLocationPermission()) return false;
+
+    final raw = await _invokeDeviceTool(
+      'getCurrentLocation',
+      const <String, dynamic>{},
+    );
+    final json = _decodeObject(raw);
+    if (json == null || json.containsKey('error')) return true;
+
+    final latitude = _asDouble(json['latitude']);
+    final longitude = _asDouble(json['longitude']);
+    if (latitude == null || longitude == null) return true;
+
+    _bus.post(
+      AgencyEvent(
+        kind: AgencyEventKind.locationChanged,
+        source: 'kelivo_location',
+        urgency: 0.20,
+        payload: <String, Object?>{
+          'originAssistantId': assistantId,
+          'originConversationId': conversationId,
+          'latitude': latitude,
+          'longitude': longitude,
+          'accuracyM': _asDouble(json['accuracy_m']),
+          'timestamp': json['timestamp']?.toString() ?? '',
+        },
+      ),
+    );
+    return true;
+  }
+
   static Map<String, dynamic>? _decodeObject(String raw) {
     try {
       final decoded = jsonDecode(raw);
@@ -227,6 +283,11 @@ class AgencyRealitySampler {
     if (value is int) return value;
     if (value is num) return value.round();
     return int.tryParse(value?.toString() ?? '');
+  }
+
+  static double? _asDouble(Object? value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
   }
 
   static DateTime? _parseDeviceDate(Object? value) {

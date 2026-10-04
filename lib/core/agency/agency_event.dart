@@ -8,6 +8,7 @@ enum AgencyEventKind {
   screenTimeThreshold,
   batteryChanged,
   networkChanged,
+  locationChanged,
   bluetoothDeviceSeen,
   notificationReceived,
 }

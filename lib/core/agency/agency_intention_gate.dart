@@ -90,6 +90,7 @@ class AgencyIntentionGate {
 
       case AgencyEventKind.bluetoothDeviceSeen:
       case AgencyEventKind.networkChanged:
+      case AgencyEventKind.locationChanged:
         return const AgencyIntention(
           action: AgencyIntentionAction.retain,
           reason: 'ambient_context_only',

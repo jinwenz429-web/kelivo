@@ -57,6 +57,7 @@ void main() {
     const assistant = Assistant(
       id: 'assistant',
       name: 'Companion',
+      companionAgencyEnabled: true,
       localToolIds: [
         LocalToolNames.calendarQuery,
         LocalToolNames.screenTime,
@@ -121,7 +122,11 @@ void main() {
     );
 
     await sampler.sample(
-      assistant: const Assistant(id: 'a', name: 'No device tools'),
+      assistant: const Assistant(
+        id: 'a',
+        name: 'No device tools',
+        companionAgencyEnabled: true,
+      ),
       conversationId: 'conversation-1',
       now: DateTime(2026, 10, 4, 20),
     );
@@ -147,6 +152,7 @@ void main() {
       assistant: const Assistant(
         id: 'a',
         name: 'Companion',
+        companionAgencyEnabled: true,
         localToolIds: [
           LocalToolNames.calendarQuery,
           LocalToolNames.screenTime,
@@ -175,6 +181,7 @@ void main() {
     const assistant = Assistant(
       id: 'a',
       name: 'Companion',
+      companionAgencyEnabled: true,
       localToolIds: [LocalToolNames.screenTime],
     );
     final now = DateTime(2026, 10, 5, 0, 0);
@@ -215,6 +222,7 @@ void main() {
     const assistant = Assistant(
       id: 'a',
       name: 'Companion',
+      companionAgencyEnabled: true,
       localToolIds: [LocalToolNames.screenTime],
     );
     final now = DateTime(2026, 10, 5, 0, 0);
@@ -232,5 +240,84 @@ void main() {
     );
 
     expect(calls, ['getScreenTime']);
+  });
+
+  test('reuses existing one-shot location without requesting permission', () async {
+    final bus = AgencyEventBus();
+    addTearDown(bus.dispose);
+    final events = <AgencyEvent>[];
+    final subscription = bus.events.listen(events.add);
+    addTearDown(subscription.cancel);
+
+    final calls = <String>[];
+    final sampler = AgencyRealitySampler(
+      bus: bus,
+      minimumInterval: Duration.zero,
+      screenTimeSupported: () => false,
+      calendarSupported: () => false,
+      locationSupported: () => true,
+      hasUsageStatsPermission: () async => false,
+      hasCalendarPermission: () async => false,
+      hasLocationPermission: () async => true,
+      invokeDeviceTool: (method, args) async {
+        calls.add(method);
+        expect(args, isEmpty);
+        return jsonEncode({
+          'latitude': 31.2304,
+          'longitude': 121.4737,
+          'accuracy_m': 18.0,
+          'timestamp': '2026-10-05T01:00:00Z',
+        });
+      },
+    );
+
+    await sampler.sample(
+      assistant: const Assistant(
+        id: 'a',
+        name: 'Companion',
+        companionAgencyEnabled: true,
+        localToolIds: [LocalToolNames.currentLocation],
+      ),
+      conversationId: 'conversation-1',
+      now: DateTime(2026, 10, 5, 9),
+    );
+
+    expect(calls, ['getCurrentLocation']);
+    expect(events, hasLength(1));
+    expect(events.single.kind, AgencyEventKind.locationChanged);
+    expect(events.single.payload['originAssistantId'], 'a');
+    expect(events.single.payload['originConversationId'], 'conversation-1');
+    expect(events.single.payload['latitude'], closeTo(31.2304, 0.00001));
+    expect(events.single.payload['longitude'], closeTo(121.4737, 0.00001));
+  });
+
+  test('location sampling never opens a permission flow', () async {
+    final calls = <String>[];
+    final sampler = AgencyRealitySampler(
+      minimumInterval: Duration.zero,
+      screenTimeSupported: () => false,
+      calendarSupported: () => false,
+      locationSupported: () => true,
+      hasUsageStatsPermission: () async => false,
+      hasCalendarPermission: () async => false,
+      hasLocationPermission: () async => false,
+      invokeDeviceTool: (method, args) async {
+        calls.add(method);
+        return '{}';
+      },
+    );
+
+    await sampler.sample(
+      assistant: const Assistant(
+        id: 'a',
+        name: 'Companion',
+        companionAgencyEnabled: true,
+        localToolIds: [LocalToolNames.currentLocation],
+      ),
+      conversationId: 'conversation-1',
+      now: DateTime(2026, 10, 5, 9),
+    );
+
+    expect(calls, isEmpty);
   });
 }

@@ -49,7 +49,7 @@ void main() {
     expect(prompt, contains('transport=wifi'));
   });
 
-  test('calendar and screen time remain scoped to their origin', () async {
+  test('calendar, screen time, and location remain scoped to their origin', () async {
     final bus = AgencyEventBus();
     final world = AgencyWorldState(bus: bus)..start();
     addTearDown(() async {
@@ -86,6 +86,19 @@ void main() {
         },
       ),
     );
+    bus.post(
+      AgencyEvent(
+        kind: AgencyEventKind.locationChanged,
+        occurredAt: now,
+        payload: const <String, Object?>{
+          'originAssistantId': 'a',
+          'originConversationId': 'c1',
+          'latitude': 31.2304,
+          'longitude': 121.4737,
+          'accuracyM': 18.0,
+        },
+      ),
+    );
 
     final sameOrigin = world.buildSystemContext(
       assistantId: 'a',
@@ -100,6 +113,8 @@ void main() {
 
     expect(sameOrigin, contains('315 minutes'));
     expect(sameOrigin, contains('Meeting'));
+    expect(sameOrigin, contains('latitude=31.230'));
+    expect(sameOrigin, contains('longitude=121.474'));
     expect(otherOrigin, isNull);
   });
 

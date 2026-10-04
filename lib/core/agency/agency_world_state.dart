@@ -22,6 +22,8 @@ class AgencyWorldState {
   final Map<String, AgencyEvent> _bluetoothAudio = <String, AgencyEvent>{};
   final Map<String, AgencyEvent> _screenTimeByOrigin =
       <String, AgencyEvent>{};
+  final Map<String, AgencyEvent> _locationByOrigin =
+      <String, AgencyEvent>{};
   final Map<String, AgencyEvent> _calendarByKey = <String, AgencyEvent>{};
 
   void start() {
@@ -39,6 +41,7 @@ class AgencyWorldState {
     _network = null;
     _bluetoothAudio.clear();
     _screenTimeByOrigin.clear();
+    _locationByOrigin.clear();
     _calendarByKey.clear();
   }
 
@@ -62,6 +65,10 @@ class AgencyWorldState {
       case AgencyEventKind.screenTimeThreshold:
         final origin = _originKey(event);
         if (origin != null) _screenTimeByOrigin[origin] = event;
+        break;
+      case AgencyEventKind.locationChanged:
+        final origin = _originKey(event);
+        if (origin != null) _locationByOrigin[origin] = event;
         break;
       case AgencyEventKind.calendarUpcoming:
         final origin = _originKey(event);
@@ -127,6 +134,22 @@ class AgencyWorldState {
     }
 
     final origin = '$assistantId|$conversationId';
+
+    final location = _locationByOrigin[origin];
+    if (location != null &&
+        _fresh(location, clock, const Duration(minutes: 90))) {
+      final latitude = _asDouble(location.payload['latitude']);
+      final longitude = _asDouble(location.payload['longitude']);
+      final accuracy = _asDouble(location.payload['accuracyM']);
+      if (latitude != null && longitude != null) {
+        lines.add(
+          'current_location: latitude=${latitude.toStringAsFixed(3)}, '
+          'longitude=${longitude.toStringAsFixed(3)}'
+          '${accuracy == null ? "" : ", accuracy_m=${accuracy.round()}"}',
+        );
+      }
+    }
+
     final screen = _screenTimeByOrigin[origin];
     if (screen != null &&
         _fresh(screen, clock, const Duration(hours: 18)) &&
@@ -182,6 +205,9 @@ class AgencyWorldState {
     _screenTimeByOrigin.removeWhere(
       (_, event) => !_fresh(event, now, const Duration(hours: 24)),
     );
+    _locationByOrigin.removeWhere(
+      (_, event) => !_fresh(event, now, const Duration(hours: 2)),
+    );
     _calendarByKey.removeWhere((_, event) {
       final start = _parseDeviceDate(event.payload['start']);
       return start == null ||
@@ -207,6 +233,11 @@ class AgencyWorldState {
     if (value is int) return value;
     if (value is num) return value.round();
     return int.tryParse(value?.toString() ?? '');
+  }
+
+  static double? _asDouble(Object? value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
   }
 
   static String _fixedToken(Object? value) {
