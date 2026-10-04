@@ -56,6 +56,7 @@ class AgencyRealitySampler {
   }) async {
     final boundConversationId = conversationId?.trim();
     if (assistant == null ||
+        !assistant.companionAgencyEnabled ||
         boundConversationId == null ||
         boundConversationId.isEmpty) {
       return;

@@ -13,6 +13,7 @@ import '../../../core/agency/agency_coordinator.dart';
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
 import '../../../core/agency/agency_intention_gate.dart';
+import '../../../core/agency/agency_world_state.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
 import '../../../core/models/message_part.dart';
@@ -392,6 +393,7 @@ class HomePageController extends ChangeNotifier {
     _initializeScrollController();
     _initializeServices();
     _initializeViewModel();
+    AgencyWorldState.instance.start();
     unawaited(
       AgencyCoordinator.instance.start(
         busy: () => ChatActions.hasAnyActiveGeneration,
@@ -2923,8 +2925,6 @@ class HomePageController extends ChangeNotifier {
 
   Future<void> _sampleAgencyReality() async {
     if (!_canSampleAgencyReality) return;
-    await DeviceLocalTools.startRealitySignals();
-    if (!_canSampleAgencyReality) return;
     final assistants = _context.read<AssistantProvider>();
     await assistants.loaded;
     if (!_canSampleAgencyReality) return;
@@ -2935,6 +2935,13 @@ class HomePageController extends ChangeNotifier {
     final assistant = assistantId == null
         ? assistants.currentAssistant
         : assistants.getById(assistantId);
+    if (assistant?.companionAgencyEnabled != true) {
+      await DeviceLocalTools.stopRealitySignals();
+      return;
+    }
+
+    await DeviceLocalTools.startRealitySignals();
+    if (!_canSampleAgencyReality) return;
     await _agencyRealitySampler.sample(
       assistant: assistant,
       conversationId: conversation.id,
@@ -2958,7 +2965,7 @@ class HomePageController extends ChangeNotifier {
     final assistant = assistantId == null
         ? assistants.currentAssistant
         : assistants.getById(assistantId);
-    if (assistant == null) return;
+    if (assistant == null || !assistant.companionAgencyEnabled) return;
 
     final now = DateTime.now();
     final basePayload = <String, Object?>{
@@ -3050,7 +3057,7 @@ class HomePageController extends ChangeNotifier {
     await assistants.loaded;
     if (!_context.mounted) return;
     final assistant = assistants.getById(originAssistantId);
-    if (assistant == null) return;
+    if (assistant == null || !assistant.companionAgencyEnabled) return;
 
     final requiredTool = _agencyRequiredLocalTool(event.kind);
     if (requiredTool != null &&

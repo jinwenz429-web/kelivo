@@ -2,6 +2,7 @@ import 'package:Kelivo/core/providers/external_mounts_provider.dart';
 import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
+import '../../../core/agency/agency_world_state.dart';
 import '../../../core/models/assistant.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
@@ -302,6 +303,20 @@ class MessageGenerationService {
       conversationId: currentConversation?.id,
       workspaceContext: workspaceContext,
     );
+
+    if (assistant?.companionAgencyEnabled == true &&
+        currentConversation != null) {
+      final realityContext = AgencyWorldState.instance.buildSystemContext(
+        assistantId: assistant!.id,
+        conversationId: currentConversation.id,
+      );
+      if (realityContext != null && realityContext.isNotEmpty) {
+        messageBuilderService.injectTransientSystemPrompt(
+          apiMessages,
+          realityContext,
+        );
+      }
+    }
 
     final transientPrompt = ephemeralSystemPrompt?.trim();
     if (transientPrompt != null && transientPrompt.isNotEmpty) {

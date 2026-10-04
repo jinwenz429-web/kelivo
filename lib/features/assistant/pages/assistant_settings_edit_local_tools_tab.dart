@@ -67,6 +67,16 @@ class _LocalToolsTab extends StatelessWidget {
         SectionCard(
           children: [
             _LocalToolRow(
+              icon: Lucide.WandSparkles,
+              title: 'Companion Agency',
+              subtitle: '现实感知、环境上下文与必要时的主动联系',
+              enabled: assistant.companionAgencyEnabled,
+              onChanged: (value) => ap.updateAssistant(
+                assistant.copyWith(companionAgencyEnabled: value),
+              ),
+            ),
+            _iosDivider(context),
+            _LocalToolRow(
               icon: Lucide.clock,
               title: l10n.assistantEditLocalToolTimeInfoTitle,
               subtitle: l10n.assistantEditLocalToolTimeInfoSubtitle,
