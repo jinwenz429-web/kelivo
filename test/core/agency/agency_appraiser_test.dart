@@ -98,4 +98,45 @@ void main() {
     expect(candidates, hasLength(1));
     expect(candidates.single.event.kind, AgencyEventKind.calendarUpcoming);
   });
+
+  test('AgencyCoordinator deduplicates only after successful delivery', () async {
+    final bus = AgencyEventBus();
+    final coordinator = AgencyCoordinator(
+      bus: bus,
+      appraiser: const AgencyAppraiser(
+        policy: AgencyAppraisalPolicy(
+          proactiveCooldown: Duration.zero,
+          dailyProactiveCap: 99,
+        ),
+      ),
+    );
+    addTearDown(() async {
+      await coordinator.stop();
+      await bus.dispose();
+    });
+    coordinator.start();
+
+    final candidates = <AgencyConsideration>[];
+    final subscription = coordinator.considerations.listen(candidates.add);
+    addTearDown(subscription.cancel);
+
+    final now = DateTime(2026, 10, 4, 20);
+    AgencyEvent eventAt(DateTime at) => AgencyEvent(
+      kind: AgencyEventKind.calendarUpcoming,
+      occurredAt: at,
+      dedupeKey: 'calendar:a:c:7|2026-10-04T20:20:00+08:00',
+    );
+
+    bus.post(eventAt(now));
+    bus.post(eventAt(now.add(const Duration(minutes: 1))));
+    expect(candidates, hasLength(2));
+
+    coordinator.recordProactiveMessage(
+      at: now.add(const Duration(minutes: 2)),
+      eventKey: candidates.last.event.dedupeKey,
+    );
+    bus.post(eventAt(now.add(const Duration(minutes: 3))));
+
+    expect(candidates, hasLength(2));
+  });
 }

@@ -68,6 +68,38 @@ class DeviceLocalTools {
 
   static const MethodChannel _channel = MethodChannel('app.device_tools');
 
+  /// Shared device-tool bridge used by both chat tools and companion agency.
+  /// Keeping one native invocation path avoids parallel calendar/screen-time
+  /// implementations drifting apart.
+  static Future<String> invokeJsonTool(
+    String method,
+    Map<String, dynamic> args,
+  ) async {
+    try {
+      final result = await _channel.invokeMethod<String>(
+        method,
+        jsonEncode(args),
+      );
+      if (result == null || result.isEmpty) {
+        return jsonEncode({
+          'error': 'no_result',
+          'message': 'The device tool returned no result.',
+        });
+      }
+      return result;
+    } on MissingPluginException {
+      return jsonEncode({
+        'error': 'unsupported_platform',
+        'message': 'This tool is not available on the current platform.',
+      });
+    } on PlatformException catch (e) {
+      return jsonEncode({
+        'error': e.code,
+        'message': e.message ?? 'The device tool failed.',
+      });
+    }
+  }
+
   static bool get phoneControlSupported =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
@@ -585,8 +617,6 @@ class LocalToolsService {
     }
     return null;
   }
-
-  static const MethodChannel _deviceToolsChannel = DeviceLocalTools._channel;
 
   static const Map<String, dynamic> _phoneControlDefinition = {
     'type': 'function',
@@ -1144,31 +1174,7 @@ class LocalToolsService {
   static Future<String> _invokeDeviceTool(
     String method,
     Map<String, dynamic> args,
-  ) async {
-    try {
-      final result = await _deviceToolsChannel.invokeMethod<String>(
-        method,
-        jsonEncode(args),
-      );
-      if (result == null || result.isEmpty) {
-        return jsonEncode({
-          'error': 'no_result',
-          'message': 'The device tool returned no result.',
-        });
-      }
-      return result;
-    } on MissingPluginException {
-      return jsonEncode({
-        'error': 'unsupported_platform',
-        'message': 'This tool is not available on the current platform.',
-      });
-    } on PlatformException catch (e) {
-      return jsonEncode({
-        'error': e.code,
-        'message': e.message ?? 'The device tool failed.',
-      });
-    }
-  }
+  ) => DeviceLocalTools.invokeJsonTool(method, args);
 
   static Future<String> _handleClipboardTool(Map<String, dynamic> args) async {
     final action = (args['action'] ?? '').toString();

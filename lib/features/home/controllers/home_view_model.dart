@@ -336,8 +336,11 @@ class HomeViewModel extends ChangeNotifier {
     _onMaybeOrganizeMemory(message.conversationId);
   }
 
-  void _onProactiveAssistantMessageFinished(ChatMessage message) {
-    AgencyCoordinator.instance.recordProactiveMessage();
+  void _onProactiveAssistantMessageFinished(
+    ChatMessage message,
+    String? eventKey,
+  ) {
+    AgencyCoordinator.instance.recordProactiveMessage(eventKey: eventKey);
   }
 
   /// Schedule background memory organize after a successful finalize (§12.1).
@@ -444,6 +447,7 @@ class HomeViewModel extends ChangeNotifier {
     required Conversation conversation,
     required Assistant assistant,
     required String agencyInstruction,
+    String? agencyEventKey,
     ({String providerKey, String modelId})? modelOverride,
     ValueChanged<String>? onGenerationStarted,
     bool notify = true,
@@ -488,6 +492,7 @@ class HomeViewModel extends ChangeNotifier {
       onGenerationStarted: onGenerationStarted,
       ephemeralSystemPrompt: instruction,
       requireIdleTail: true,
+      proactiveEventKey: agencyEventKey,
     );
     return result;
   }

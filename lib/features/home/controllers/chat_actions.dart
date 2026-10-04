@@ -295,7 +295,7 @@ class ChatActions {
 
   /// Called only after a proactive assistant-only turn is successfully
   /// persisted. Failed/cancelled attempts never reach this callback.
-  FutureOr<void> Function(ChatMessage message)?
+  FutureOr<void> Function(ChatMessage message, String? eventKey)?
   onProactiveAssistantMessageFinished;
 
   /// Called when file processing starts for the assistant message [messageId].
@@ -378,6 +378,7 @@ class ChatActions {
       <String, Future<void>>{};
   final Map<String, String> _transientSystemPrompts = <String, String>{};
   final Set<String> _proactiveMessageIds = <String>{};
+  final Map<String, String> _proactiveEventKeys = <String, String>{};
 
   /// Per-conversation send/regenerate claim, taken synchronously before the
   /// first await so a re-entrant call loses before persisting anything. The
@@ -612,6 +613,7 @@ class ChatActions {
     _streamingStates.remove(message.id);
     _transientSystemPrompts.remove(message.id);
     _proactiveMessageIds.remove(message.id);
+    _proactiveEventKeys.remove(message.id);
     _activeAssistantMessages.removeIfMatches(message);
   }
 
@@ -1520,6 +1522,7 @@ class ChatActions {
     bool scheduledPreview = true,
     String? ephemeralSystemPrompt,
     bool requireIdleTail = false,
+    String? proactiveEventKey,
   }) async {
     final claimToken = ++_sendInFlightClaimSerial;
     if (isSendInFlight(conversation.id)) {
@@ -1560,6 +1563,8 @@ class ChatActions {
         scheduledNotify: scheduledNotify,
         scheduledPreview: scheduledPreview,
         ephemeralSystemPrompt: ephemeralSystemPrompt,
+        requireIdleTail: requireIdleTail,
+        proactiveEventKey: proactiveEventKey,
       );
     } finally {
       if (_sendInFlightClaims[conversation.id] == claimToken) {
@@ -1581,6 +1586,8 @@ class ChatActions {
     bool scheduledNotify = true,
     bool scheduledPreview = true,
     String? ephemeralSystemPrompt,
+    bool requireIdleTail = false,
+    String? proactiveEventKey,
   }) async {
     // Avoid using BuildContext across async gaps (this class holds a BuildContext).
     final settings = contextProvider.read<SettingsProvider>();
@@ -1706,6 +1713,10 @@ class ChatActions {
     }
     if (requireIdleTail) {
       _proactiveMessageIds.add(assistantMessage.id);
+      final eventKey = proactiveEventKey?.trim();
+      if (eventKey != null && eventKey.isNotEmpty) {
+        _proactiveEventKeys[assistantMessage.id] = eventKey;
+      }
     }
     _registerGenerationRun(assistantMessage.id, begin.runId);
     _activeAssistantMessages.put(assistantMessage);
@@ -2648,6 +2659,7 @@ class ChatActions {
     final messageId = state.messageId;
     final conversationId = state.conversationId;
     final wasProactive = _proactiveMessageIds.contains(messageId);
+    final proactiveEventKey = _proactiveEventKeys[messageId];
 
     // Mark streaming as ended to allow UI rebuilds again
     streamController.markStreamingEnded(messageId);
@@ -2741,7 +2753,10 @@ class ChatActions {
       state.terminalPersisted = true;
 
       if (wasProactive) {
-        await onProactiveAssistantMessageFinished?.call(finalizedMessage);
+        await onProactiveAssistantMessageFinished?.call(
+          finalizedMessage,
+          proactiveEventKey,
+        );
       }
       await onAssistantMessageFinished?.call(finalizedMessage);
 

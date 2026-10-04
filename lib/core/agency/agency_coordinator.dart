@@ -38,6 +38,7 @@ class AgencyCoordinator {
   DateTime? _lastProactiveMessageAt;
   DateTime? _countDate;
   int _proactiveMessagesToday = 0;
+  final Set<String> _deliveredEventKeys = <String>{};
 
   Stream<AgencyConsideration> get considerations => _considerations.stream;
 
@@ -51,15 +52,23 @@ class AgencyCoordinator {
     _subscription = null;
   }
 
-  void recordProactiveMessage({DateTime? at}) {
+  void recordProactiveMessage({DateTime? at, String? eventKey}) {
     final when = at ?? DateTime.now();
     _rollDay(when);
     _lastProactiveMessageAt = when;
     _proactiveMessagesToday++;
+    final key = eventKey?.trim();
+    if (key != null && key.isNotEmpty) {
+      _deliveredEventKeys.add(key);
+    }
   }
 
   void _onEvent(AgencyEvent event) {
     _rollDay(event.occurredAt);
+    final key = event.dedupeKey?.trim();
+    if (key != null && key.isNotEmpty && _deliveredEventKeys.contains(key)) {
+      return;
+    }
     if (event.kind == AgencyEventKind.userMessage) {
       _lastUserInteractionAt = event.occurredAt;
     }
