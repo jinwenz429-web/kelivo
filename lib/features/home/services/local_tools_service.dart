@@ -61,12 +61,74 @@ class PhoneControlStatus {
   final bool connected;
 }
 
+class DeviceRealitySignal {
+  const DeviceRealitySignal({required this.kind, required this.payload});
+
+  final String kind;
+  final Map<String, dynamic> payload;
+}
+
 /// Platform availability of the device-backed local tools (implemented over
 /// a MethodChannel in the Android/iOS host apps).
 class DeviceLocalTools {
   const DeviceLocalTools._();
 
   static const MethodChannel _channel = MethodChannel('app.device_tools');
+  static final StreamController<DeviceRealitySignal> _realitySignals =
+      StreamController<DeviceRealitySignal>.broadcast(sync: true);
+  static bool _realityHandlerInstalled = false;
+
+  static bool get realitySignalsSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  static Stream<DeviceRealitySignal> get realitySignals {
+    _installRealitySignalHandler();
+    return _realitySignals.stream;
+  }
+
+  static void _installRealitySignalHandler() {
+    if (_realityHandlerInstalled || !realitySignalsSupported) return;
+    _realityHandlerInstalled = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method != 'realitySignal') return;
+      final raw = call.arguments;
+      if (raw is! Map) return;
+      final values = Map<String, dynamic>.from(raw);
+      final kind = values['kind']?.toString().trim() ?? '';
+      final payload = values['payload'];
+      if (kind.isEmpty || payload is! Map) return;
+      _realitySignals.add(
+        DeviceRealitySignal(
+          kind: kind,
+          payload: Map<String, dynamic>.from(payload),
+        ),
+      );
+    });
+  }
+
+  static Future<bool> startRealitySignals() async {
+    if (!realitySignalsSupported) return false;
+    _installRealitySignalHandler();
+    try {
+      await _channel.invokeMethod<void>('startRealitySignals');
+      return true;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<void> stopRealitySignals() async {
+    if (!realitySignalsSupported) return;
+    try {
+      await _channel.invokeMethod<void>('stopRealitySignals');
+    } on MissingPluginException {
+      return;
+    } on PlatformException {
+      return;
+    }
+  }
 
   /// Shared device-tool bridge used by both chat tools and companion agency.
   /// Keeping one native invocation path avoids parallel calendar/screen-time

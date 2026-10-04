@@ -5,12 +5,19 @@ import android.app.Activity
 import android.app.AppOpsManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -62,17 +69,33 @@ class DeviceLocalToolsHandler(private val context: Context) {
 
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var channel: MethodChannel? = null
+    private var realitySignalsStarted = false
+    private var lastBatterySignature: String? = null
+    private var lastNetworkSignature: String? = null
+    private var batteryReceiver: BroadcastReceiver? = null
+    private var networkReceiver: BroadcastReceiver? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var observedDefaultNetwork: Network? = null
     private var pendingCalendarPermissionCallback: ((Boolean) -> Unit)? = null
     private var pendingLocationPermissionCallback: ((Boolean, Boolean) -> Unit)? = null
     private val locationHandler = LocationToolHandler(context)
 
     fun configure(messenger: BinaryMessenger) {
-        val channel = MethodChannel(messenger, CHANNEL_NAME)
-        channel.setMethodCallHandler { call, result ->
+        channel = MethodChannel(messenger, CHANNEL_NAME)
+        channel!!.setMethodCallHandler { call, result ->
             val argsJson = call.arguments as? String ?: "{}"
             when (call.method) {
                 "phoneControlStatus" -> result.success(PhoneControlService.status(context))
                 "phoneControl" -> PhoneControlService.execute(argsJson) { result.success(it) }
+                "startRealitySignals" -> {
+                    startRealitySignals()
+                    result.success(null)
+                }
+                "stopRealitySignals" -> {
+                    stopRealitySignals()
+                    result.success(null)
+                }
                 "openAccessibilitySettings" -> {
                     try {
                         activity.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -173,9 +196,252 @@ class DeviceLocalToolsHandler(private val context: Context) {
     }
 
     fun dispose() {
+        stopRealitySignals()
         locationHandler.dispose()
         pendingLocationPermissionCallback?.invoke(false, false)
         pendingLocationPermissionCallback = null
+        channel?.setMethodCallHandler(null)
+        channel = null
+    }
+
+    // ---------------------------------------------------------------------
+    // Passive reality signals
+    // ---------------------------------------------------------------------
+
+    private fun startRealitySignals() {
+        if (realitySignalsStarted) {
+            emitCurrentBatterySnapshot(force = false)
+            emitNetworkSnapshot(force = false)
+            return
+        }
+        realitySignalsStarted = true
+
+        val batteryFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+        }
+        batteryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent == null) return
+                if (intent.action == Intent.ACTION_BATTERY_CHANGED) {
+                    emitBatteryIntent(intent, force = false)
+                } else {
+                    emitCurrentBatterySnapshot(force = false)
+                }
+            }
+        }.also { receiver ->
+            val sticky = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(
+                    receiver,
+                    batteryFilter,
+                    Context.RECEIVER_NOT_EXPORTED,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, batteryFilter)
+            }
+            sticky?.let { emitBatteryIntent(it, force = true) }
+        }
+
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    observedDefaultNetwork = network
+                }
+
+                override fun onLost(network: Network) {
+                    if (observedDefaultNetwork != network) return
+                    observedDefaultNetwork = null
+                    emitNetworkState(
+                        online = false,
+                        transport = "none",
+                        metered = false,
+                        force = false,
+                    )
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) {
+                    observedDefaultNetwork = network
+                    emitNetworkCapabilities(networkCapabilities, force = false)
+                }
+            }.also { callback ->
+                runCatching { connectivity.registerDefaultNetworkCallback(callback) }
+                    .onFailure { networkCallback = null }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
+            networkReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    emitNetworkSnapshot(force = false)
+                }
+            }.also { receiver ->
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, filter)
+            }
+        }
+
+        emitCurrentBatterySnapshot(force = false)
+        emitNetworkSnapshot(force = false)
+    }
+
+    private fun stopRealitySignals() {
+        if (!realitySignalsStarted) return
+        realitySignalsStarted = false
+
+        batteryReceiver?.let { receiver ->
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+        batteryReceiver = null
+
+        networkReceiver?.let { receiver ->
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+        networkReceiver = null
+
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        networkCallback?.let { callback ->
+            runCatching { connectivity.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+        observedDefaultNetwork = null
+        lastBatterySignature = null
+        lastNetworkSignature = null
+    }
+
+    private fun emitCurrentBatterySnapshot(force: Boolean) {
+        @Suppress("DEPRECATION")
+        val sticky = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?: return
+        emitBatteryIntent(sticky, force)
+    }
+
+    private fun emitBatteryIntent(intent: Intent, force: Boolean) {
+        val rawLevel = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (rawLevel < 0 || scale <= 0) return
+
+        val level = ((rawLevel.toDouble() / scale.toDouble()) * 100.0)
+            .toInt()
+            .coerceIn(0, 100)
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+        val charging =
+            status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL ||
+                plugged != 0
+        val bucket = when {
+            level <= 10 -> "critical"
+            level <= 20 -> "low"
+            level <= 50 -> "medium"
+            else -> "high"
+        }
+        val signature = "$bucket:$charging"
+        val retryUntilDelivered = !charging && (bucket == "low" || bucket == "critical")
+        if (!force && signature == lastBatterySignature && !retryUntilDelivered) return
+        lastBatterySignature = signature
+
+        emitRealitySignal(
+            "battery",
+            mapOf(
+                "level" to level,
+                "charging" to charging,
+                "bucket" to bucket,
+            ),
+        )
+    }
+
+    private fun emitNetworkSnapshot(force: Boolean) {
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = connectivity.activeNetwork
+            observedDefaultNetwork = network
+            val capabilities = network?.let(connectivity::getNetworkCapabilities)
+            emitNetworkCapabilities(capabilities, force)
+            return
+        }
+
+        @Suppress("DEPRECATION")
+        val info = connectivity.activeNetworkInfo
+        @Suppress("DEPRECATION")
+        val transport = when (info?.type) {
+            ConnectivityManager.TYPE_WIFI -> "wifi"
+            ConnectivityManager.TYPE_MOBILE -> "cellular"
+            ConnectivityManager.TYPE_ETHERNET -> "ethernet"
+            ConnectivityManager.TYPE_BLUETOOTH -> "bluetooth"
+            else -> if (info == null) "none" else "other"
+        }
+        @Suppress("DEPRECATION")
+        val online = info?.isConnected == true
+        val metered = runCatching { connectivity.isActiveNetworkMetered }.getOrDefault(false)
+        emitNetworkState(online, transport, metered, force)
+    }
+
+    private fun emitNetworkCapabilities(
+        capabilities: NetworkCapabilities?,
+        force: Boolean,
+    ) {
+        if (capabilities == null) {
+            emitNetworkState(
+                online = false,
+                transport = "none",
+                metered = false,
+                force = force,
+            )
+            return
+        }
+        val online =
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val transport = when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) -> "bluetooth"
+            else -> "other"
+        }
+        val metered =
+            !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        emitNetworkState(online, transport, metered, force)
+    }
+
+    private fun emitNetworkState(
+        online: Boolean,
+        transport: String,
+        metered: Boolean,
+        force: Boolean,
+    ) {
+        val signature = "$online:$transport:$metered"
+        if (!force && signature == lastNetworkSignature) return
+        lastNetworkSignature = signature
+
+        emitRealitySignal(
+            "network",
+            mapOf(
+                "online" to online,
+                "transport" to transport,
+                "metered" to metered,
+            ),
+        )
+    }
+
+    private fun emitRealitySignal(kind: String, payload: Map<String, Any>) {
+        if (!realitySignalsStarted) return
+        mainHandler.post {
+            channel?.invokeMethod(
+                "realitySignal",
+                mapOf(
+                    "kind" to kind,
+                    "payload" to payload,
+                ),
+            )
+        }
     }
 
     // ---------------------------------------------------------------------

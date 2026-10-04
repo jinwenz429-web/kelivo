@@ -167,6 +167,7 @@ class HomePageController extends ChangeNotifier {
   StreamSubscription<ChatAction>? _chatActionSub;
   StreamSubscription<String>? _notificationTapSub;
   StreamSubscription<AgencyConsideration>? _agencyConsiderationSub;
+  StreamSubscription<DeviceRealitySignal>? _deviceRealitySignalSub;
   Timer? _agencyForegroundTimer;
 
   static const Duration _agencyForegroundSampleInterval = Duration(
@@ -396,6 +397,9 @@ class HomePageController extends ChangeNotifier {
     );
     _agencyConsiderationSub = AgencyCoordinator.instance.considerations.listen(
       (consideration) => unawaited(_handleAgencyConsideration(consideration)),
+    );
+    _deviceRealitySignalSub = DeviceLocalTools.realitySignals.listen(
+      (signal) => unawaited(_handleDeviceRealitySignal(signal)),
     );
     _wireViewModelCallbacks();
     _initializeProviders();
@@ -2916,6 +2920,8 @@ class HomePageController extends ChangeNotifier {
 
   Future<void> _sampleAgencyReality() async {
     if (!_canSampleAgencyReality) return;
+    await DeviceLocalTools.startRealitySignals();
+    if (!_canSampleAgencyReality) return;
     final assistants = _context.read<AssistantProvider>();
     await assistants.loaded;
     if (!_canSampleAgencyReality) return;
@@ -2930,6 +2936,74 @@ class HomePageController extends ChangeNotifier {
       assistant: assistant,
       conversationId: conversation.id,
     );
+  }
+
+  Future<void> _handleDeviceRealitySignal(
+    DeviceRealitySignal signal,
+  ) async {
+    if (!_chatInitialized || !_context.mounted) return;
+    final conversation = currentConversation;
+    if (conversation == null ||
+        _chatService.isTemporaryConversation(conversation.id)) {
+      return;
+    }
+
+    final assistants = _context.read<AssistantProvider>();
+    await assistants.loaded;
+    if (!_context.mounted || currentConversation?.id != conversation.id) return;
+    final assistantId = conversation.assistantId;
+    final assistant = assistantId == null
+        ? assistants.currentAssistant
+        : assistants.getById(assistantId);
+    if (assistant == null) return;
+
+    final now = DateTime.now();
+    final basePayload = <String, Object?>{
+      'originAssistantId': assistant.id,
+      'originConversationId': conversation.id,
+      ...signal.payload,
+    };
+
+    switch (signal.kind) {
+      case 'battery':
+        final level = signal.payload['level'];
+        final batteryLevel = level is num ? level.toInt() : 100;
+        final charging = signal.payload['charging'] == true;
+        final bucket = signal.payload['bucket']?.toString() ?? 'unknown';
+        final dayKey =
+            '${now.year.toString().padLeft(4, '0')}-'
+            '${now.month.toString().padLeft(2, '0')}-'
+            '${now.day.toString().padLeft(2, '0')}';
+        final urgency = charging
+            ? 0.15
+            : batteryLevel <= 10
+            ? 0.92
+            : batteryLevel <= 20
+            ? 0.74
+            : 0.25;
+        AgencyEventBus.instance.post(
+          AgencyEvent(
+            kind: AgencyEventKind.batteryChanged,
+            source: 'android_battery',
+            urgency: urgency,
+            dedupeKey:
+                'battery:${assistant.id}:${conversation.id}:$dayKey:$bucket:$charging',
+            payload: basePayload,
+          ),
+        );
+        break;
+      case 'network':
+        final online = signal.payload['online'] == true;
+        AgencyEventBus.instance.post(
+          AgencyEvent(
+            kind: AgencyEventKind.networkChanged,
+            source: 'android_network',
+            urgency: online ? 0.15 : 0.35,
+            payload: basePayload,
+          ),
+        );
+        break;
+    }
   }
 
   Future<void> _handleAgencyConsideration(
@@ -2958,7 +3032,8 @@ class HomePageController extends ChangeNotifier {
     if (assistant == null) return;
 
     final requiredTool = _agencyRequiredLocalTool(event.kind);
-    if (requiredTool == null || !assistant.localToolIds.contains(requiredTool)) {
+    if (requiredTool != null &&
+        !assistant.localToolIds.contains(requiredTool)) {
       return;
     }
 
@@ -3012,6 +3087,19 @@ class HomePageController extends ChangeNotifier {
               'reasonable from this context. Avoid lecturing or moralizing. '
               'If useful, you may use the existing screen-time tool for more '
               'detail.',
+        ].join('\n');
+      case AgencyEventKind.batteryChanged:
+        final level = payload['level']?.toString() ?? '';
+        final charging = payload['charging'] == true;
+        return [
+          'A private local companion signal passed the interruption gate.',
+          'It is not a user message. Do not mention the agency system, device '
+              'bridge, or say the user told you this.',
+          'Reality fact: the phone battery is at about $level% and '
+              '${charging ? "is charging." : "is not charging."}',
+          'Send one brief, natural, in-character companion message only if '
+              'this low-battery context is worth interrupting for. Avoid '
+              'lecturing or sounding like a system notification.',
         ].join('\n');
       default:
         return null;
@@ -3201,6 +3289,8 @@ class HomePageController extends ChangeNotifier {
     _agencyForegroundTimer?.cancel();
     _agencyForegroundTimer = null;
     unawaited(_agencyConsiderationSub?.cancel());
+    unawaited(_deviceRealitySignalSub?.cancel());
+    unawaited(DeviceLocalTools.stopRealitySignals());
     unawaited(AgencyCoordinator.instance.stop());
     if (_scheduledExecutor case final executor?) {
       _scheduledPreparation?.dispose();
