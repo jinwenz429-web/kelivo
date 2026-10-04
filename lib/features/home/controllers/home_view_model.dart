@@ -1,4 +1,7 @@
 import '../../../core/services/scheduled_tasks_service.dart';
+import '../../../core/agency/agency_coordinator.dart';
+import '../../../core/agency/agency_event.dart';
+import '../../../core/agency/agency_event_bus.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -317,6 +320,16 @@ class HomeViewModel extends ChangeNotifier {
   }
 
   Future<void> _onAssistantMessageFinished(ChatMessage message) async {
+    AgencyEventBus.instance.post(
+      AgencyEvent(
+        kind: AgencyEventKind.assistantMessage,
+        source: 'chat',
+        payload: <String, Object?>{
+          'conversationId': message.conversationId,
+          'messageId': message.id,
+        },
+      ),
+    );
     await onAssistantMessageFinished?.call(message);
     _onMaybeOrganizeMemory(message.conversationId);
   }
@@ -416,6 +429,57 @@ class HomeViewModel extends ChangeNotifier {
     );
   }
 
+  /// Generate a new assistant-only turn for agency/proactive behavior.
+  ///
+  /// The trigger instruction is ephemeral request context: it is never written
+  /// as a fake user message. We only continue from a completed assistant tail
+  /// so agency cannot race an unanswered user turn.
+  Future<ChatActionResult> sendProactiveAssistantMessage({
+    required Conversation conversation,
+    required Assistant assistant,
+    required String agencyInstruction,
+    ({String providerKey, String modelId})? modelOverride,
+    ValueChanged<String>? onGenerationStarted,
+    bool notify = true,
+    bool showPreview = true,
+  }) async {
+    if (_chatController.isConversationLoading(conversation.id) ||
+        _chatActions.activeStreamingMessageId(conversation.id) != null) {
+      return ChatActionResult.inFlight();
+    }
+    final messages = await _chatService.loadSelectedMessageProjections(
+      conversation.id,
+    );
+    if (messages.isEmpty) {
+      return ChatActionResult.error('proactive_empty_conversation');
+    }
+    final anchor = messages.last;
+    if (anchor.role != 'assistant' || anchor.isStreaming) {
+      return ChatActionResult.error('proactive_requires_assistant_tail');
+    }
+    final instruction = agencyInstruction.trim();
+    if (instruction.isEmpty) {
+      return ChatActionResult.error('proactive_empty_instruction');
+    }
+    final result = await _chatActions.regenerateAtMessage(
+      message: anchor,
+      conversation: conversation,
+      assistantAsNewReply: true,
+      assistantOverride: assistant,
+      scheduled: true,
+      scheduledNotify: notify,
+      scheduledPreview: showPreview,
+      modelOverride: modelOverride,
+      preserveFollowingMessages: true,
+      onGenerationStarted: onGenerationStarted,
+      ephemeralSystemPrompt: instruction,
+    );
+    if (result.success) {
+      AgencyCoordinator.instance.recordProactiveMessage();
+    }
+    return result;
+  }
+
   Future<ChatInputSubmissionResult> sendMessage(ChatInputData input) async {
     await ScheduledTasksService.instance.reconcileBeforeSend();
     final content = input.text.trim();
@@ -499,6 +563,18 @@ class HomeViewModel extends ChangeNotifier {
       return false;
     }
 
+    AgencyEventBus.instance.post(
+      AgencyEvent(
+        kind: AgencyEventKind.userMessage,
+        source: 'chat',
+        payload: <String, Object?>{
+          'conversationId': conversation.id,
+          'hasAttachments':
+              input.imagePaths.isNotEmpty || input.documents.isNotEmpty,
+          'textLength': input.text.length,
+        },
+      ),
+    );
     return true;
   }
 

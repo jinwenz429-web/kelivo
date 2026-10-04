@@ -8,6 +8,9 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../core/database/chat_database_repository.dart';
+import '../../../core/agency/agency_coordinator.dart';
+import '../../../core/agency/agency_event.dart';
+import '../../../core/agency/agency_event_bus.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
 import '../../../core/models/message_part.dart';
@@ -376,6 +379,9 @@ class HomePageController extends ChangeNotifier {
     _initializeScrollController();
     _initializeServices();
     _initializeViewModel();
+    AgencyCoordinator.instance.start(
+      busy: () => ChatActions.hasAnyActiveGeneration,
+    );
     _wireViewModelCallbacks();
     _initializeProviders();
     _setupKeyboardListeners();
@@ -2872,6 +2878,18 @@ class HomePageController extends ChangeNotifier {
         state != AppLifecycleState.paused &&
         state != AppLifecycleState.hidden &&
         state != AppLifecycleState.detached;
+    if (state == AppLifecycleState.resumed) {
+      AgencyEventBus.instance.post(
+        AgencyEvent(kind: AgencyEventKind.appResumed, source: 'app_lifecycle'),
+      );
+    } else if (state == AppLifecycleState.paused) {
+      AgencyEventBus.instance.post(
+        AgencyEvent(
+          kind: AgencyEventKind.appBackgrounded,
+          source: 'app_lifecycle',
+        ),
+      );
+    }
     _streamController.setPresentationEnabled(
       _homePresentationVisible && _homeAppVisible,
     );
@@ -3024,6 +3042,7 @@ class HomePageController extends ChangeNotifier {
 
   @override
   void dispose() {
+    unawaited(AgencyCoordinator.instance.stop());
     if (_scheduledExecutor case final executor?) {
       _scheduledPreparation?.dispose();
       ScheduledTasksService.instance.detach(executor);

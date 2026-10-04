@@ -1509,6 +1509,7 @@ class ChatActions {
     bool scheduled = false,
     bool scheduledNotify = true,
     bool scheduledPreview = true,
+    String? ephemeralSystemPrompt,
   }) async {
     final claimToken = ++_sendInFlightClaimSerial;
     if (isSendInFlight(conversation.id)) {
@@ -1528,6 +1529,7 @@ class ChatActions {
         scheduled: scheduled,
         scheduledNotify: scheduledNotify,
         scheduledPreview: scheduledPreview,
+        ephemeralSystemPrompt: ephemeralSystemPrompt,
       );
     } finally {
       if (_sendInFlightClaims[conversation.id] == claimToken) {
@@ -1548,6 +1550,7 @@ class ChatActions {
     bool scheduled = false,
     bool scheduledNotify = true,
     bool scheduledPreview = true,
+    String? ephemeralSystemPrompt,
   }) async {
     // Avoid using BuildContext across async gaps (this class holds a BuildContext).
     final settings = contextProvider.read<SettingsProvider>();
@@ -1746,6 +1749,7 @@ class ChatActions {
               approvalService: regenApprovalService,
               askUserService: regenAskUserService,
               processingMessageId: assistantMessage.id,
+              ephemeralSystemPrompt: ephemeralSystemPrompt,
             );
 
         // Build user image paths

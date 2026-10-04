@@ -164,6 +164,7 @@ class MessageGenerationService {
     required String providerKey,
     required String modelId,
     String? requiredAttachmentMessageId,
+    String? ephemeralSystemPrompt,
     bool syncWorkspaceAttachments = true,
     bool persistWorldBookActivation = true,
     void Function(int before, int after)? onWorldBookActivationPersisted,
@@ -302,6 +303,22 @@ class MessageGenerationService {
       workspaceContext: workspaceContext,
     );
 
+    final transientPrompt = ephemeralSystemPrompt?.trim();
+    if (transientPrompt != null && transientPrompt.isNotEmpty) {
+      final firstConversationMessage = apiMessages.indexWhere(
+        (message) => message['role'] != 'system',
+      );
+      apiMessages.insert(
+        firstConversationMessage < 0
+            ? apiMessages.length
+            : firstConversationMessage,
+        <String, dynamic>{
+          'role': 'system',
+          'content': transientPrompt,
+        },
+      );
+    }
+
     messageBuilderService.applyContextLimit(apiMessages, assistant);
 
     final mcpRouteSnapshot = generationController.captureMcpToolRoutes(
@@ -399,6 +416,7 @@ class MessageGenerationService {
     AskUserInteractionService? askUserService,
     String? processingMessageId,
     String? requiredAttachmentMessageId,
+    String? ephemeralSystemPrompt,
   }) async {
     var requestRevision = currentConversation == null
         ? null
@@ -439,6 +457,7 @@ class MessageGenerationService {
       providerKey: providerKey,
       modelId: modelId,
       requiredAttachmentMessageId: requiredAttachmentMessageId,
+      ephemeralSystemPrompt: ephemeralSystemPrompt,
       onWorldBookActivationPersisted: (before, after) {
         // Accept only this preparation's own write. A history edit before or
         // during persistence invalidates provenance and must not be rebased.
