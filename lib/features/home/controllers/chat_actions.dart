@@ -293,6 +293,11 @@ class ChatActions {
   /// not its full duration, before releasing this generation's resources.
   FutureOr<void> Function(ChatMessage message)? onAssistantMessageFinished;
 
+  /// Called only after a proactive assistant-only turn is successfully
+  /// persisted. Failed/cancelled attempts never reach this callback.
+  FutureOr<void> Function(ChatMessage message)?
+  onProactiveAssistantMessageFinished;
+
   /// Called when file processing starts for the assistant message [messageId].
   void Function(String messageId)? onFileProcessingStarted;
 
@@ -371,6 +376,8 @@ class ChatActions {
       <String, stream_ctrl.StreamingState>{};
   final Map<String, Future<void>> _cancelStreamingFutures =
       <String, Future<void>>{};
+  final Map<String, String> _transientSystemPrompts = <String, String>{};
+  final Set<String> _proactiveMessageIds = <String>{};
 
   /// Per-conversation send/regenerate claim, taken synchronously before the
   /// first await so a re-entrant call loses before persisting anything. The
@@ -603,6 +610,8 @@ class ChatActions {
     _generationCheckpointCursors.remove(message.id);
     _streamingToolEvents.remove(message.id);
     _streamingStates.remove(message.id);
+    _transientSystemPrompts.remove(message.id);
+    _proactiveMessageIds.remove(message.id);
     _activeAssistantMessages.removeIfMatches(message);
   }
 
@@ -1526,10 +1535,15 @@ class ChatActions {
         final current = await chatService.loadSelectedMessageProjections(
           conversation.id,
         );
-        if (current.isEmpty ||
-            current.last.id != message.id ||
-            current.last.role != 'assistant' ||
-            current.last.isStreaming) {
+        if (current.isEmpty || current.last.id != message.id) {
+          return ChatActionResult.error('proactive_context_changed');
+        }
+        final persistedTail = await chatService.chatRepositoryOrNull?.getMessage(
+          current.last.id,
+        );
+        if (persistedTail == null ||
+            persistedTail.role != 'assistant' ||
+            persistedTail.isStreaming) {
           return ChatActionResult.error('proactive_context_changed');
         }
       }
@@ -1686,6 +1700,13 @@ class ChatActions {
       );
     }
     final assistantMessage = begin.assistantMessage;
+    final transientPrompt = ephemeralSystemPrompt?.trim();
+    if (transientPrompt != null && transientPrompt.isNotEmpty) {
+      _transientSystemPrompts[assistantMessage.id] = transientPrompt;
+    }
+    if (requireIdleTail) {
+      _proactiveMessageIds.add(assistantMessage.id);
+    }
     _registerGenerationRun(assistantMessage.id, begin.runId);
     _activeAssistantMessages.put(assistantMessage);
 
@@ -1765,7 +1786,8 @@ class ChatActions {
               approvalService: regenApprovalService,
               askUserService: regenAskUserService,
               processingMessageId: assistantMessage.id,
-              ephemeralSystemPrompt: ephemeralSystemPrompt,
+              ephemeralSystemPrompt:
+                  _transientSystemPrompts[assistantMessage.id],
             );
 
         // Build user image paths
@@ -1928,6 +1950,8 @@ class ChatActions {
             approvalService: approvalService,
             askUserService: askUserService,
             processingMessageId: streamingMessage.id,
+            ephemeralSystemPrompt:
+                _transientSystemPrompts[streamingMessage.id],
           );
 
       final userImagePaths = messageGenerationService.buildUserImagePaths(
@@ -2623,6 +2647,7 @@ class ChatActions {
     state.finishRequestTiming();
     final messageId = state.messageId;
     final conversationId = state.conversationId;
+    final wasProactive = _proactiveMessageIds.contains(messageId);
 
     // Mark streaming as ended to allow UI rebuilds again
     streamController.markStreamingEnded(messageId);
@@ -2715,6 +2740,9 @@ class ChatActions {
       );
       state.terminalPersisted = true;
 
+      if (wasProactive) {
+        await onProactiveAssistantMessageFinished?.call(finalizedMessage);
+      }
       await onAssistantMessageFinished?.call(finalizedMessage);
 
       if (shouldGenerateTitle) {

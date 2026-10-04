@@ -134,6 +134,8 @@ class HomeViewModel extends ChangeNotifier {
     _chatActions.onMaybeGenerateSuggestions = _onMaybeGenerateSuggestions;
     _chatActions.onStreamFinished = _onStreamFinished;
     _chatActions.onAssistantMessageFinished = _onAssistantMessageFinished;
+    _chatActions.onProactiveAssistantMessageFinished =
+        _onProactiveAssistantMessageFinished;
     _chatActions.onFileProcessingStarted = _onFileProcessingStarted;
     _chatActions.onFileProcessingFinished = _onFileProcessingFinished;
   }
@@ -334,6 +336,10 @@ class HomeViewModel extends ChangeNotifier {
     _onMaybeOrganizeMemory(message.conversationId);
   }
 
+  void _onProactiveAssistantMessageFinished(ChatMessage message) {
+    AgencyCoordinator.instance.recordProactiveMessage();
+  }
+
   /// Schedule background memory organize after a successful finalize (§12.1).
   /// Never awaited; failures must not surface as chat errors.
   void _onMaybeOrganizeMemory(String conversationId) {
@@ -447,14 +453,22 @@ class HomeViewModel extends ChangeNotifier {
         _chatActions.activeStreamingMessageId(conversation.id) != null) {
       return ChatActionResult.inFlight();
     }
+    if (_chatService.isTemporaryConversation(conversation.id)) {
+      return ChatActionResult.error('proactive_temporary_conversation');
+    }
     final messages = await _chatService.loadSelectedMessageProjections(
       conversation.id,
     );
     if (messages.isEmpty) {
       return ChatActionResult.error('proactive_empty_conversation');
     }
-    final anchor = messages.last;
-    if (anchor.role != 'assistant' || anchor.isStreaming) {
+    final projectedTail = messages.last;
+    final anchor = await _chatService.chatRepositoryOrNull?.getMessage(
+      projectedTail.id,
+    );
+    if (anchor == null ||
+        anchor.role != 'assistant' ||
+        anchor.isStreaming) {
       return ChatActionResult.error('proactive_requires_assistant_tail');
     }
     final instruction = agencyInstruction.trim();
@@ -475,9 +489,6 @@ class HomeViewModel extends ChangeNotifier {
       ephemeralSystemPrompt: instruction,
       requireIdleTail: true,
     );
-    if (result.success) {
-      AgencyCoordinator.instance.recordProactiveMessage();
-    }
     return result;
   }
 
