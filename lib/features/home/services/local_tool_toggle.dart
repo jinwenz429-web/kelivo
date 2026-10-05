@@ -95,6 +95,17 @@ Future<void> setLocalToolEnabled(
     return;
   }
 
+  if (toolId == LocalToolNames.bluetoothScan &&
+      DeviceLocalTools.bluetoothScanSupported) {
+    final granted = await DeviceLocalTools.hasBluetoothScanPermission();
+    if (!granted) {
+      final requested = await DeviceLocalTools.requestBluetoothScanPermission();
+      if (!requested) return;
+    }
+    await write(true);
+    return;
+  }
+
   if (toolId == LocalToolNames.currentLocation &&
       DeviceLocalTools.locationSupported) {
     final granted = await DeviceLocalTools.hasLocationPermission();

@@ -36,6 +36,9 @@ class _LocalToolsTab extends StatelessWidget {
     final locationEnabled = assistant.localToolIds.contains(
       LocalToolNames.currentLocation,
     );
+    final bluetoothScanEnabled = assistant.localToolIds.contains(
+      LocalToolNames.bluetoothScan,
+    );
     final weatherEnabled = assistant.localToolIds.contains(
       LocalToolNames.weather,
     );
@@ -156,6 +159,17 @@ class _LocalToolsTab extends StatelessWidget {
                 enabled: locationEnabled,
                 onChanged: (value) =>
                     toggleTool(LocalToolNames.currentLocation, value),
+              ),
+            ],
+            if (DeviceLocalTools.bluetoothScanSupported) ...[
+              _iosDivider(context),
+              _LocalToolRow(
+                icon: Lucide.Smartphone,
+                title: 'Bluetooth LE',
+                subtitle: '扫描附近的低功耗蓝牙设备（只读发现，不连接或控制）',
+                enabled: bluetoothScanEnabled,
+                onChanged: (value) =>
+                    toggleTool(LocalToolNames.bluetoothScan, value),
               ),
             ],
             if (DeviceLocalTools.phoneControlSupported) ...[

@@ -22,6 +22,7 @@ class LocalToolNames {
   static const String calendarQuery = 'calendar_query';
   static const String calendarCreate = 'calendar_create';
   static const String currentLocation = 'get_current_location';
+  static const String bluetoothScan = 'bluetooth_scan';
   static const String phoneControl = 'phone_control';
   static const String weather = 'get_weather';
   static const String healthSummary = 'get_health_summary';
@@ -39,6 +40,7 @@ class LocalToolNames {
     calendarQuery,
     calendarCreate,
     currentLocation,
+    bluetoothScan,
     phoneControl,
     weather,
     healthSummary,
@@ -211,6 +213,9 @@ class DeviceLocalTools {
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS);
 
+  static bool get bluetoothScanSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
   /// WeatherKit is iOS 16+. Defaults false until [prefetchIosCapabilities].
   static bool? _weatherKitAvailable;
 
@@ -300,6 +305,32 @@ class DeviceLocalTools {
     if (!locationSupported) return false;
     try {
       final result = await _channel.invokeMethod<bool>('hasLocationPermission');
+      return result == true;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<bool> hasBluetoothScanPermission() async {
+    if (!bluetoothScanSupported) return false;
+    try {
+      final result = await _channel.invokeMethod<bool>('hasBleScanPermission');
+      return result == true;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<bool> requestBluetoothScanPermission() async {
+    if (!bluetoothScanSupported) return false;
+    try {
+      final result = await _channel.invokeMethod<bool>(
+        'requestBleScanPermission',
+      );
       return result == true;
     } on MissingPluginException {
       return false;
@@ -508,6 +539,8 @@ class LocalToolsService {
         return DeviceLocalTools.calendarSupported;
       case LocalToolNames.currentLocation:
         return DeviceLocalTools.locationSupported;
+      case LocalToolNames.bluetoothScan:
+        return DeviceLocalTools.bluetoothScanSupported;
       case LocalToolNames.weather:
         return DeviceLocalTools.weatherSupported;
       case LocalToolNames.healthSummary:
@@ -549,6 +582,8 @@ class LocalToolsService {
         return _calendarCreateDefinition();
       case LocalToolNames.currentLocation:
         return _currentLocationDefinition;
+      case LocalToolNames.bluetoothScan:
+        return _bluetoothScanDefinition;
       case LocalToolNames.weather:
         return _weatherDefinition();
       case LocalToolNames.healthSummary:
@@ -632,6 +667,10 @@ class LocalToolsService {
     if (name == LocalToolNames.currentLocation &&
         DeviceLocalTools.locationSupported) {
       return _invokeDeviceTool('getCurrentLocation', args);
+    }
+    if (name == LocalToolNames.bluetoothScan &&
+        DeviceLocalTools.bluetoothScanSupported) {
+      return _invokeDeviceTool('scanBluetoothLe', args);
     }
     if (name == LocalToolNames.phoneControl &&
         DeviceLocalTools.phoneControlSupported) {
@@ -887,6 +926,48 @@ class LocalToolsService {
           'user asked for their location or it is needed for weather. '
           'Requires the Location permission; if it is not granted, an error is returned.',
       'parameters': {'type': 'object', 'properties': <String, dynamic>{}},
+    },
+  };
+
+  static const Map<String, dynamic> _bluetoothScanDefinition = {
+    'type': 'function',
+    'function': {
+      'name': LocalToolNames.bluetoothScan,
+      'description':
+          'Perform a short, explicit Bluetooth Low Energy discovery scan on the '
+          'user\'s Android device. Use it when nearby BLE devices are relevant. '
+          'This only discovers devices; it does not connect, pair, read GATT '
+          'characteristics, or control hardware. The returned device_id is an '
+          'opaque local identifier, not a MAC address. Prefer a name_contains '
+          'filter when looking for a known device.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'name_contains': {
+            'type': 'string',
+            'description':
+                'Optional case-insensitive substring to match advertised device names.',
+          },
+          'duration_ms': {
+            'type': 'integer',
+            'minimum': 1000,
+            'maximum': 10000,
+            'description': 'Scan duration in milliseconds. Default 4000.',
+          },
+          'limit': {
+            'type': 'integer',
+            'minimum': 1,
+            'maximum': 50,
+            'description': 'Maximum number of devices to return. Default 20.',
+          },
+          'include_unnamed': {
+            'type': 'boolean',
+            'description':
+                'Include BLE advertisements without a readable device name. Default false.',
+          },
+        },
+        'additionalProperties': false,
+      },
     },
   };
 

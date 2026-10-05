@@ -1,10 +1,15 @@
 package com.psyche.kelivo
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AppOpsManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.ContentUris
 import android.content.ContentValues
@@ -39,11 +44,13 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
+import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
- * Native backend for the AI assistant's device-local tools:
- * screen time (usage stats), calendar query/creation and one-shot location.
+ * Native backend for the AI assistant's device-local tools and companion
+ * reality signals: screen time, calendar, one-shot location, explicit BLE
+ * discovery, battery/network state and connected Bluetooth audio devices.
  *
  * All methods receive the tool arguments as a JSON string and return a JSON
  * string payload. Errors that the LLM should see (missing permission, bad
@@ -62,12 +69,15 @@ class DeviceLocalToolsHandler(private val context: Context) {
         pendingCalendarPermissionCallback = null
         pendingLocationPermissionCallback?.invoke(false, false)
         pendingLocationPermissionCallback = null
+        pendingBlePermissionCallback?.invoke(false)
+        pendingBlePermissionCallback = null
     }
 
     companion object {
         const val CHANNEL_NAME = "app.device_tools"
         const val CALENDAR_PERMISSION_REQUEST_CODE = 4201
         const val LOCATION_PERMISSION_REQUEST_CODE = 4202
+        const val BLE_PERMISSION_REQUEST_CODE = 4203
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -84,6 +94,12 @@ class DeviceLocalToolsHandler(private val context: Context) {
     private val knownBluetoothAudioDeviceIds = mutableSetOf<Int>()
     private var pendingCalendarPermissionCallback: ((Boolean) -> Unit)? = null
     private var pendingLocationPermissionCallback: ((Boolean, Boolean) -> Unit)? = null
+    private var pendingBlePermissionCallback: ((Boolean) -> Unit)? = null
+    private var pendingBleScanResult: MethodChannel.Result? = null
+    private var bleScanCallback: ScanCallback? = null
+    private var bleScanFinishRunnable: Runnable? = null
+    private val bleScanResults = linkedMapOf<String, JSONObject>()
+    private val bleOpaqueIds = mutableMapOf<String, String>()
     private val locationHandler = LocationToolHandler(context)
 
     fun configure(messenger: BinaryMessenger) {
@@ -117,6 +133,11 @@ class DeviceLocalToolsHandler(private val context: Context) {
                 "hasCalendarPermission" -> result.success(hasCalendarPermission())
                 "requestCalendarPermission" -> requestCalendarPermission(result)
                 "hasLocationPermission" -> result.success(locationHandler.hasPermission())
+                "hasBleScanPermission" -> result.success(hasBleScanPermission())
+                "requestBleScanPermission" -> requestBleScanPermission { granted ->
+                    result.success(granted)
+                }
+                "scanBluetoothLe" -> scanBluetoothLe(argsJson, result)
                 "requestLocationPermission" -> requestLocationPermission { granted, permanentlyDenied ->
                     if (permanentlyDenied) {
                         result.error(
@@ -179,6 +200,12 @@ class DeviceLocalToolsHandler(private val context: Context) {
         requestCode: Int,
         grantResults: IntArray,
     ): Boolean {
+        if (requestCode == BLE_PERMISSION_REQUEST_CODE) {
+            val callback = pendingBlePermissionCallback
+            pendingBlePermissionCallback = null
+            callback?.invoke(hasBleScanPermission())
+            return true
+        }
         if (requestCode == LOCATION_PERMISSION_REQUEST_CODE) {
             val callback = pendingLocationPermissionCallback
             pendingLocationPermissionCallback = null
@@ -202,9 +229,17 @@ class DeviceLocalToolsHandler(private val context: Context) {
 
     fun dispose() {
         stopRealitySignals()
+        cancelBleScan(
+            errorPayload(
+                "BLE_SCAN_CANCELLED",
+                "Bluetooth scan cancelled because the host was destroyed.",
+            ),
+        )
         locationHandler.dispose()
         pendingLocationPermissionCallback?.invoke(false, false)
         pendingLocationPermissionCallback = null
+        pendingBlePermissionCallback?.invoke(false)
+        pendingBlePermissionCallback = null
         channel?.setMethodCallHandler(null)
         channel = null
     }
@@ -545,7 +580,10 @@ class DeviceLocalToolsHandler(private val context: Context) {
             completion(true, false)
             return
         }
-        if (pendingCalendarPermissionCallback != null || pendingLocationPermissionCallback != null) {
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
             completion(false, false)
             return
         }
@@ -558,6 +596,54 @@ class DeviceLocalToolsHandler(private val context: Context) {
             activity,
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
             LOCATION_PERMISSION_REQUEST_CODE,
+        )
+    }
+
+    private fun bleScanPermissions(): Array<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            )
+        } else {
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+    private fun hasBleScanPermission(): Boolean =
+        bleScanPermissions().all {
+            ContextCompat.checkSelfPermission(context, it) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+
+    private fun requestBleScanPermission(completion: (Boolean) -> Unit) {
+        if (hasBleScanPermission()) {
+            completion(true)
+            return
+        }
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
+            completion(false)
+            return
+        }
+        if (attachedActivity == null) {
+            completion(false)
+            return
+        }
+        val missing = bleScanPermissions().filter {
+            ContextCompat.checkSelfPermission(context, it) !=
+                PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            completion(true)
+            return
+        }
+        pendingBlePermissionCallback = completion
+        ActivityCompat.requestPermissions(
+            activity,
+            missing.toTypedArray(),
+            BLE_PERMISSION_REQUEST_CODE,
         )
     }
 
@@ -581,7 +667,10 @@ class DeviceLocalToolsHandler(private val context: Context) {
             result.success(true)
             return
         }
-        if (pendingCalendarPermissionCallback != null || pendingLocationPermissionCallback != null) {
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
             result.success(false)
             return
         }
@@ -609,7 +698,10 @@ class DeviceLocalToolsHandler(private val context: Context) {
             action()
             return
         }
-        if (pendingCalendarPermissionCallback != null || pendingLocationPermissionCallback != null) {
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
             result.success(
                 errorPayload(
                     "PERMISSION_REQUEST_IN_PROGRESS",
@@ -672,6 +764,206 @@ class DeviceLocalToolsHandler(private val context: Context) {
                 // Settings page unavailable; the error payload still informs the model.
             }
         }
+    }
+
+
+    // ---------------------------------------------------------------------
+    // Explicit Bluetooth LE discovery
+    // ---------------------------------------------------------------------
+
+    @SuppressLint("MissingPermission")
+    private fun scanBluetoothLe(argsJson: String, result: MethodChannel.Result) {
+        if (!hasBleScanPermission()) {
+            result.success(
+                errorPayload(
+                    "NO_PERMISSION",
+                    "Bluetooth nearby-device permission is not granted. Enable the Bluetooth LE tool in Assistant settings first.",
+                ),
+            )
+            return
+        }
+        if (pendingBleScanResult != null) {
+            result.success(
+                errorPayload(
+                    "BLE_SCAN_BUSY",
+                    "A Bluetooth LE scan is already running. Wait for it to finish and try again.",
+                ),
+            )
+            return
+        }
+
+        val adapter = context
+            .getSystemService(BluetoothManager::class.java)
+            ?.adapter
+        if (adapter == null) {
+            result.success(errorPayload("BLE_UNAVAILABLE", "This device does not support Bluetooth."))
+            return
+        }
+        if (!adapter.isEnabled) {
+            result.success(errorPayload("BLE_DISABLED", "Bluetooth is turned off on this device."))
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            result.success(errorPayload("BLE_UNAVAILABLE", "Bluetooth LE scanning is not available."))
+            return
+        }
+
+        val params = try {
+            JSONObject(argsJson)
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        val durationMs = params.optLong("duration_ms", 4000L).coerceIn(1000L, 10_000L)
+        val includeUnnamed = params.optBoolean("include_unnamed", false)
+        val nameFilter = params.optString("name_contains")
+            .trim()
+            .lowercase()
+            .takeIf { it.isNotEmpty() }
+        val limit = params.optInt("limit", 20).coerceIn(1, 50)
+
+        pendingBleScanResult = result
+        bleScanResults.clear()
+
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, scanResult: ScanResult) {
+                recordBleScanResult(scanResult, includeUnnamed, nameFilter)
+            }
+
+            override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                for (scanResult in results) {
+                    recordBleScanResult(scanResult, includeUnnamed, nameFilter)
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                finishBleScan(
+                    errorPayload(
+                        "BLE_SCAN_FAILED",
+                        "Bluetooth LE scan failed with Android error code " + errorCode + ".",
+                    ),
+                )
+            }
+        }
+        bleScanCallback = callback
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        try {
+            scanner.startScan(null, settings, callback)
+        } catch (_: SecurityException) {
+            finishBleScan(
+                errorPayload(
+                    "NO_PERMISSION",
+                    "Bluetooth scan permission was revoked. Re-enable the Bluetooth LE tool and try again.",
+                ),
+            )
+            return
+        } catch (error: Exception) {
+            finishBleScan(
+                errorPayload(
+                    "BLE_SCAN_FAILED",
+                    error.message ?: "Bluetooth LE scan could not start.",
+                ),
+            )
+            return
+        }
+
+        val finish = Runnable {
+            finishBleScan(buildBleScanPayload(durationMs, limit))
+        }
+        bleScanFinishRunnable = finish
+        mainHandler.postDelayed(finish, durationMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun recordBleScanResult(
+        scanResult: ScanResult,
+        includeUnnamed: Boolean,
+        nameFilter: String?,
+    ) {
+        if (pendingBleScanResult == null) return
+        val record = scanResult.scanRecord
+        val advertisedName = record?.deviceName?.trim().orEmpty()
+        val systemName = runCatching { scanResult.device.name?.trim().orEmpty() }.getOrDefault("")
+        val name = advertisedName.ifEmpty { systemName }
+        if (name.isEmpty() && !includeUnnamed) return
+        if (nameFilter != null && !name.lowercase().contains(nameFilter)) return
+
+        val address = runCatching { scanResult.device.address }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return
+        val existing = bleScanResults[address]
+        if (existing != null && existing.optInt("rssi", -999) >= scanResult.rssi) return
+
+        val services = JSONArray()
+        record?.serviceUuids?.forEach { parcelUuid ->
+            services.put(parcelUuid.uuid.toString())
+        }
+
+        // Never expose the Bluetooth MAC address to the model. The
+        // opaque id is random and process-local; a future connect/read flow must
+        // resolve it through this in-memory map instead of reversing a hash.
+        val opaqueId = bleOpaqueIds.getOrPut(address) {
+            UUID.randomUUID().toString()
+        }
+        val payload = JSONObject()
+            .put("device_id", opaqueId)
+            .put("name", if (name.isEmpty()) JSONObject.NULL else name)
+            .put("rssi", scanResult.rssi)
+            .put("service_uuids", services)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            payload.put("connectable", scanResult.isConnectable)
+        }
+        val txPower = record?.txPowerLevel ?: Int.MIN_VALUE
+        if (txPower != Int.MIN_VALUE) {
+            payload.put("tx_power", txPower)
+        }
+        bleScanResults[address] = payload
+    }
+
+    private fun buildBleScanPayload(durationMs: Long, limit: Int): String {
+        val devices = JSONArray()
+        bleScanResults.values
+            .sortedByDescending { it.optInt("rssi", -999) }
+            .take(limit)
+            .forEach { devices.put(it) }
+        return JSONObject()
+            .put("devices", devices)
+            .put("count", devices.length())
+            .put("duration_ms", durationMs)
+            .toString()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun finishBleScan(payload: String) {
+        val result = pendingBleScanResult ?: return
+        val callback = bleScanCallback
+        val finish = bleScanFinishRunnable
+
+        pendingBleScanResult = null
+        bleScanCallback = null
+        bleScanFinishRunnable = null
+        if (finish != null) mainHandler.removeCallbacks(finish)
+
+        if (callback != null) {
+            runCatching {
+                context
+                    .getSystemService(BluetoothManager::class.java)
+                    ?.adapter
+                    ?.bluetoothLeScanner
+                    ?.stopScan(callback)
+            }
+        }
+        result.success(payload)
+        bleScanResults.clear()
+    }
+
+    private fun cancelBleScan(payload: String) {
+        finishBleScan(payload)
     }
 
     // ---------------------------------------------------------------------
