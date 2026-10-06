@@ -307,7 +307,7 @@ void main() {
       ]);
     });
 
-    test('location is unavailable on desktop platforms', () {
+    test('location and Bluetooth LE are unavailable on desktop platforms', () {
       addTearDown(() => debugDefaultTargetPlatformOverride = null);
       for (final platform in [
         TargetPlatform.macOS,
@@ -321,8 +321,91 @@ void main() {
           ),
           isFalse,
         );
+        expect(
+          LocalToolsService.isAvailableOnThisPlatform(
+            LocalToolNames.bluetoothScan,
+          ),
+          isFalse,
+        );
       }
     });
+
+    test(
+      'Android Bluetooth LE permissions and scans use the native channel',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        const channel = MethodChannel('app.device_tools');
+        final messenger =
+            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        addTearDown(() {
+          debugDefaultTargetPlatformOverride = null;
+          messenger.setMockMethodCallHandler(channel, null);
+        });
+
+        var granted = false;
+        final calls = <String>[];
+        const payload =
+            '{"devices":[{"device_id":"opaque-1","name":"Demo","rssi":-48}],"count":1,"duration_ms":1500}';
+        messenger.setMockMethodCallHandler(channel, (call) async {
+          calls.add(call.method);
+          switch (call.method) {
+            case 'hasBleScanPermission':
+              return granted;
+            case 'requestBleScanPermission':
+              granted = true;
+              return true;
+            case 'scanBluetoothLe':
+              expect(jsonDecode(call.arguments as String), {
+                'name_contains': 'Demo',
+                'duration_ms': 1500,
+                'limit': 3,
+              });
+              return payload;
+            default:
+              fail('Unexpected platform call: ${call.method}');
+          }
+        });
+
+        expect(await DeviceLocalTools.hasBluetoothScanPermission(), isFalse);
+        expect(await DeviceLocalTools.requestBluetoothScanPermission(), isTrue);
+        expect(await DeviceLocalTools.hasBluetoothScanPermission(), isTrue);
+
+        const assistant = Assistant(
+          id: 'ble',
+          name: 'Assistant',
+          localToolIds: [LocalToolNames.bluetoothScan],
+        );
+        expect(
+          await LocalToolsService.tryHandleToolCall(
+            LocalToolNames.bluetoothScan,
+            const {
+              'name_contains': 'Demo',
+              'duration_ms': 1500,
+              'limit': 3,
+            },
+            assistant,
+          ),
+          payload,
+        );
+        expect(calls, [
+          'hasBleScanPermission',
+          'requestBleScanPermission',
+          'hasBleScanPermission',
+          'scanBluetoothLe',
+        ]);
+
+        calls.clear();
+        expect(
+          await LocalToolsService.tryHandleToolCall(
+            LocalToolNames.bluetoothScan,
+            const {},
+            const Assistant(id: 'disabled', name: 'Disabled'),
+          ),
+          isNull,
+        );
+        expect(calls, isEmpty);
+      },
+    );
 
     test(
       'Android location permissions and calls use the native channel',

@@ -22,6 +22,7 @@ class LocalToolNames {
   static const String calendarQuery = 'calendar_query';
   static const String calendarCreate = 'calendar_create';
   static const String currentLocation = 'get_current_location';
+  static const String bluetoothScan = 'bluetooth_scan';
   static const String phoneControl = 'phone_control';
   static const String weather = 'get_weather';
   static const String healthSummary = 'get_health_summary';
@@ -39,6 +40,7 @@ class LocalToolNames {
     calendarQuery,
     calendarCreate,
     currentLocation,
+    bluetoothScan,
     phoneControl,
     weather,
     healthSummary,
@@ -61,12 +63,106 @@ class PhoneControlStatus {
   final bool connected;
 }
 
+class DeviceRealitySignal {
+  const DeviceRealitySignal({required this.kind, required this.payload});
+
+  final String kind;
+  final Map<String, dynamic> payload;
+}
+
 /// Platform availability of the device-backed local tools (implemented over
 /// a MethodChannel in the Android/iOS host apps).
 class DeviceLocalTools {
   const DeviceLocalTools._();
 
   static const MethodChannel _channel = MethodChannel('app.device_tools');
+  static final StreamController<DeviceRealitySignal> _realitySignals =
+      StreamController<DeviceRealitySignal>.broadcast(sync: true);
+  static bool _realityHandlerInstalled = false;
+
+  static bool get realitySignalsSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  static Stream<DeviceRealitySignal> get realitySignals {
+    _installRealitySignalHandler();
+    return _realitySignals.stream;
+  }
+
+  static void _installRealitySignalHandler() {
+    if (_realityHandlerInstalled || !realitySignalsSupported) return;
+    _realityHandlerInstalled = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method != 'realitySignal') return;
+      final raw = call.arguments;
+      if (raw is! Map) return;
+      final values = Map<String, dynamic>.from(raw);
+      final kind = values['kind']?.toString().trim() ?? '';
+      final payload = values['payload'];
+      if (kind.isEmpty || payload is! Map) return;
+      _realitySignals.add(
+        DeviceRealitySignal(
+          kind: kind,
+          payload: Map<String, dynamic>.from(payload),
+        ),
+      );
+    });
+  }
+
+  static Future<bool> startRealitySignals() async {
+    if (!realitySignalsSupported) return false;
+    _installRealitySignalHandler();
+    try {
+      await _channel.invokeMethod<void>('startRealitySignals');
+      return true;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<void> stopRealitySignals() async {
+    if (!realitySignalsSupported) return;
+    try {
+      await _channel.invokeMethod<void>('stopRealitySignals');
+    } on MissingPluginException {
+      return;
+    } on PlatformException {
+      return;
+    }
+  }
+
+  /// Shared device-tool bridge used by both chat tools and companion agency.
+  /// Keeping one native invocation path avoids parallel calendar/screen-time
+  /// implementations drifting apart.
+  static Future<String> invokeJsonTool(
+    String method,
+    Map<String, dynamic> args,
+  ) async {
+    try {
+      final result = await _channel.invokeMethod<String>(
+        method,
+        jsonEncode(args),
+      );
+      if (result == null || result.isEmpty) {
+        return jsonEncode({
+          'error': 'no_result',
+          'message': 'The device tool returned no result.',
+        });
+      }
+      return result;
+    } on MissingPluginException {
+      return jsonEncode({
+        'error': 'unsupported_platform',
+        'message': 'This tool is not available on the current platform.',
+      });
+    } on PlatformException catch (e) {
+      return jsonEncode({
+        'error': e.code,
+        'message': e.message ?? 'The device tool failed.',
+      });
+    }
+  }
 
   static bool get phoneControlSupported =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -116,6 +212,9 @@ class DeviceLocalTools {
       !kIsWeb &&
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS);
+
+  static bool get bluetoothScanSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   /// WeatherKit is iOS 16+. Defaults false until [prefetchIosCapabilities].
   static bool? _weatherKitAvailable;
@@ -206,6 +305,32 @@ class DeviceLocalTools {
     if (!locationSupported) return false;
     try {
       final result = await _channel.invokeMethod<bool>('hasLocationPermission');
+      return result == true;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<bool> hasBluetoothScanPermission() async {
+    if (!bluetoothScanSupported) return false;
+    try {
+      final result = await _channel.invokeMethod<bool>('hasBleScanPermission');
+      return result == true;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  static Future<bool> requestBluetoothScanPermission() async {
+    if (!bluetoothScanSupported) return false;
+    try {
+      final result = await _channel.invokeMethod<bool>(
+        'requestBleScanPermission',
+      );
       return result == true;
     } on MissingPluginException {
       return false;
@@ -414,6 +539,8 @@ class LocalToolsService {
         return DeviceLocalTools.calendarSupported;
       case LocalToolNames.currentLocation:
         return DeviceLocalTools.locationSupported;
+      case LocalToolNames.bluetoothScan:
+        return DeviceLocalTools.bluetoothScanSupported;
       case LocalToolNames.weather:
         return DeviceLocalTools.weatherSupported;
       case LocalToolNames.healthSummary:
@@ -455,6 +582,8 @@ class LocalToolsService {
         return _calendarCreateDefinition();
       case LocalToolNames.currentLocation:
         return _currentLocationDefinition;
+      case LocalToolNames.bluetoothScan:
+        return _bluetoothScanDefinition;
       case LocalToolNames.weather:
         return _weatherDefinition();
       case LocalToolNames.healthSummary:
@@ -539,6 +668,10 @@ class LocalToolsService {
         DeviceLocalTools.locationSupported) {
       return _invokeDeviceTool('getCurrentLocation', args);
     }
+    if (name == LocalToolNames.bluetoothScan &&
+        DeviceLocalTools.bluetoothScanSupported) {
+      return _invokeDeviceTool('scanBluetoothLe', args);
+    }
     if (name == LocalToolNames.phoneControl &&
         DeviceLocalTools.phoneControlSupported) {
       return _invokeDeviceTool('phoneControl', args);
@@ -585,8 +718,6 @@ class LocalToolsService {
     }
     return null;
   }
-
-  static const MethodChannel _deviceToolsChannel = DeviceLocalTools._channel;
 
   static const Map<String, dynamic> _phoneControlDefinition = {
     'type': 'function',
@@ -795,6 +926,48 @@ class LocalToolsService {
           'user asked for their location or it is needed for weather. '
           'Requires the Location permission; if it is not granted, an error is returned.',
       'parameters': {'type': 'object', 'properties': <String, dynamic>{}},
+    },
+  };
+
+  static const Map<String, dynamic> _bluetoothScanDefinition = {
+    'type': 'function',
+    'function': {
+      'name': LocalToolNames.bluetoothScan,
+      'description':
+          'Perform a short, explicit Bluetooth Low Energy discovery scan on the '
+          'user\'s Android device. Use it when nearby BLE devices are relevant. '
+          'This only discovers devices; it does not connect, pair, read GATT '
+          'characteristics, or control hardware. The returned device_id is an '
+          'opaque local identifier, not a MAC address. Prefer a name_contains '
+          'filter when looking for a known device.',
+      'parameters': {
+        'type': 'object',
+        'properties': {
+          'name_contains': {
+            'type': 'string',
+            'description':
+                'Optional case-insensitive substring to match advertised device names.',
+          },
+          'duration_ms': {
+            'type': 'integer',
+            'minimum': 1000,
+            'maximum': 10000,
+            'description': 'Scan duration in milliseconds. Default 4000.',
+          },
+          'limit': {
+            'type': 'integer',
+            'minimum': 1,
+            'maximum': 50,
+            'description': 'Maximum number of devices to return. Default 20.',
+          },
+          'include_unnamed': {
+            'type': 'boolean',
+            'description':
+                'Include BLE advertisements without a readable device name. Default false.',
+          },
+        },
+        'additionalProperties': false,
+      },
     },
   };
 
@@ -1144,31 +1317,7 @@ class LocalToolsService {
   static Future<String> _invokeDeviceTool(
     String method,
     Map<String, dynamic> args,
-  ) async {
-    try {
-      final result = await _deviceToolsChannel.invokeMethod<String>(
-        method,
-        jsonEncode(args),
-      );
-      if (result == null || result.isEmpty) {
-        return jsonEncode({
-          'error': 'no_result',
-          'message': 'The device tool returned no result.',
-        });
-      }
-      return result;
-    } on MissingPluginException {
-      return jsonEncode({
-        'error': 'unsupported_platform',
-        'message': 'This tool is not available on the current platform.',
-      });
-    } on PlatformException catch (e) {
-      return jsonEncode({
-        'error': e.code,
-        'message': e.message ?? 'The device tool failed.',
-      });
-    }
-  }
+  ) => DeviceLocalTools.invokeJsonTool(method, args);
 
   static Future<String> _handleClipboardTool(Map<String, dynamic> args) async {
     final action = (args['action'] ?? '').toString();

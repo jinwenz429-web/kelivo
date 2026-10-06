@@ -1,16 +1,31 @@
 package com.psyche.kelivo
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AppOpsManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.BatteryManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
@@ -29,11 +44,13 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.ZonedDateTime
+import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
- * Native backend for the AI assistant's device-local tools:
- * screen time (usage stats), calendar query/creation and one-shot location.
+ * Native backend for the AI assistant's device-local tools and companion
+ * reality signals: screen time, calendar, one-shot location, explicit BLE
+ * discovery, battery/network state and connected Bluetooth audio devices.
  *
  * All methods receive the tool arguments as a JSON string and return a JSON
  * string payload. Errors that the LLM should see (missing permission, bad
@@ -52,27 +69,54 @@ class DeviceLocalToolsHandler(private val context: Context) {
         pendingCalendarPermissionCallback = null
         pendingLocationPermissionCallback?.invoke(false, false)
         pendingLocationPermissionCallback = null
+        pendingBlePermissionCallback?.invoke(false)
+        pendingBlePermissionCallback = null
     }
 
     companion object {
         const val CHANNEL_NAME = "app.device_tools"
         const val CALENDAR_PERMISSION_REQUEST_CODE = 4201
         const val LOCATION_PERMISSION_REQUEST_CODE = 4202
+        const val BLE_PERMISSION_REQUEST_CODE = 4203
     }
 
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var channel: MethodChannel? = null
+    private var realitySignalsStarted = false
+    private var lastBatterySignature: String? = null
+    private var lastNetworkSignature: String? = null
+    private var batteryReceiver: BroadcastReceiver? = null
+    private var networkReceiver: BroadcastReceiver? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var observedDefaultNetwork: Network? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
+    private val knownBluetoothAudioDeviceIds = mutableSetOf<Int>()
     private var pendingCalendarPermissionCallback: ((Boolean) -> Unit)? = null
     private var pendingLocationPermissionCallback: ((Boolean, Boolean) -> Unit)? = null
+    private var pendingBlePermissionCallback: ((Boolean) -> Unit)? = null
+    private var pendingBleScanResult: MethodChannel.Result? = null
+    private var bleScanCallback: ScanCallback? = null
+    private var bleScanFinishRunnable: Runnable? = null
+    private val bleScanResults = linkedMapOf<String, JSONObject>()
+    private val bleOpaqueIds = mutableMapOf<String, String>()
     private val locationHandler = LocationToolHandler(context)
 
     fun configure(messenger: BinaryMessenger) {
-        val channel = MethodChannel(messenger, CHANNEL_NAME)
-        channel.setMethodCallHandler { call, result ->
+        channel = MethodChannel(messenger, CHANNEL_NAME)
+        channel!!.setMethodCallHandler { call, result ->
             val argsJson = call.arguments as? String ?: "{}"
             when (call.method) {
                 "phoneControlStatus" -> result.success(PhoneControlService.status(context))
                 "phoneControl" -> PhoneControlService.execute(argsJson) { result.success(it) }
+                "startRealitySignals" -> {
+                    startRealitySignals()
+                    result.success(null)
+                }
+                "stopRealitySignals" -> {
+                    stopRealitySignals()
+                    result.success(null)
+                }
                 "openAccessibilitySettings" -> {
                     try {
                         activity.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -89,6 +133,11 @@ class DeviceLocalToolsHandler(private val context: Context) {
                 "hasCalendarPermission" -> result.success(hasCalendarPermission())
                 "requestCalendarPermission" -> requestCalendarPermission(result)
                 "hasLocationPermission" -> result.success(locationHandler.hasPermission())
+                "hasBleScanPermission" -> result.success(hasBleScanPermission())
+                "requestBleScanPermission" -> requestBleScanPermission { granted ->
+                    result.success(granted)
+                }
+                "scanBluetoothLe" -> scanBluetoothLe(argsJson, result)
                 "requestLocationPermission" -> requestLocationPermission { granted, permanentlyDenied ->
                     if (permanentlyDenied) {
                         result.error(
@@ -151,6 +200,12 @@ class DeviceLocalToolsHandler(private val context: Context) {
         requestCode: Int,
         grantResults: IntArray,
     ): Boolean {
+        if (requestCode == BLE_PERMISSION_REQUEST_CODE) {
+            val callback = pendingBlePermissionCallback
+            pendingBlePermissionCallback = null
+            callback?.invoke(hasBleScanPermission())
+            return true
+        }
         if (requestCode == LOCATION_PERMISSION_REQUEST_CODE) {
             val callback = pendingLocationPermissionCallback
             pendingLocationPermissionCallback = null
@@ -173,9 +228,347 @@ class DeviceLocalToolsHandler(private val context: Context) {
     }
 
     fun dispose() {
+        stopRealitySignals()
+        cancelBleScan(
+            errorPayload(
+                "BLE_SCAN_CANCELLED",
+                "Bluetooth scan cancelled because the host was destroyed.",
+            ),
+        )
         locationHandler.dispose()
         pendingLocationPermissionCallback?.invoke(false, false)
         pendingLocationPermissionCallback = null
+        pendingBlePermissionCallback?.invoke(false)
+        pendingBlePermissionCallback = null
+        channel?.setMethodCallHandler(null)
+        channel = null
+    }
+
+    // ---------------------------------------------------------------------
+    // Passive reality signals
+    // ---------------------------------------------------------------------
+
+    private fun startRealitySignals() {
+        if (realitySignalsStarted) {
+            emitCurrentBatterySnapshot(force = false)
+            emitNetworkSnapshot(force = false)
+            return
+        }
+        realitySignalsStarted = true
+
+        val batteryFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
+        }
+        batteryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent == null) return
+                if (intent.action == Intent.ACTION_BATTERY_CHANGED) {
+                    emitBatteryIntent(intent, force = false)
+                } else {
+                    emitCurrentBatterySnapshot(force = false)
+                }
+            }
+        }.also { receiver ->
+            val sticky = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(
+                    receiver,
+                    batteryFilter,
+                    Context.RECEIVER_NOT_EXPORTED,
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, batteryFilter)
+            }
+            sticky?.let { emitBatteryIntent(it, force = true) }
+        }
+
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    observedDefaultNetwork = network
+                }
+
+                override fun onLost(network: Network) {
+                    if (observedDefaultNetwork != network) return
+                    observedDefaultNetwork = null
+                    emitNetworkState(
+                        online = false,
+                        transport = "none",
+                        metered = false,
+                        force = false,
+                    )
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) {
+                    observedDefaultNetwork = network
+                    emitNetworkCapabilities(networkCapabilities, force = false)
+                }
+            }.also { callback ->
+                runCatching { connectivity.registerDefaultNetworkCallback(callback) }
+                    .onFailure { networkCallback = null }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
+            networkReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    emitNetworkSnapshot(force = false)
+                }
+            }.also { receiver ->
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, filter)
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            knownBluetoothAudioDeviceIds.clear()
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                .filter(::isBluetoothAudioDevice)
+                .forEach { device ->
+                    knownBluetoothAudioDeviceIds.add(device.id)
+                    emitBluetoothAudioDevice(device, connected = true)
+                }
+            audioDeviceCallback = object : AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                    for (device in addedDevices) {
+                        if (!isBluetoothAudioDevice(device)) continue
+                        if (knownBluetoothAudioDeviceIds.add(device.id)) {
+                            emitBluetoothAudioDevice(device, connected = true)
+                        }
+                    }
+                }
+
+                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    for (device in removedDevices) {
+                        if (knownBluetoothAudioDeviceIds.remove(device.id)) {
+                            emitBluetoothAudioDevice(device, connected = false)
+                        }
+                    }
+                }
+            }.also { callback ->
+                audioManager.registerAudioDeviceCallback(callback, mainHandler)
+            }
+        }
+
+        emitCurrentBatterySnapshot(force = false)
+        emitNetworkSnapshot(force = false)
+    }
+
+    private fun stopRealitySignals() {
+        if (!realitySignalsStarted) return
+        realitySignalsStarted = false
+
+        batteryReceiver?.let { receiver ->
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+        batteryReceiver = null
+
+        networkReceiver?.let { receiver ->
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+        networkReceiver = null
+
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        networkCallback?.let { callback ->
+            runCatching { connectivity.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+        observedDefaultNetwork = null
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioDeviceCallback?.let { callback ->
+                runCatching { audioManager.unregisterAudioDeviceCallback(callback) }
+            }
+        }
+        audioDeviceCallback = null
+        knownBluetoothAudioDeviceIds.clear()
+
+        lastBatterySignature = null
+        lastNetworkSignature = null
+    }
+
+    private fun emitCurrentBatterySnapshot(force: Boolean) {
+        @Suppress("DEPRECATION")
+        val sticky = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            ?: return
+        emitBatteryIntent(sticky, force)
+    }
+
+    private fun emitBatteryIntent(intent: Intent, force: Boolean) {
+        val rawLevel = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (rawLevel < 0 || scale <= 0) return
+
+        val level = ((rawLevel.toDouble() / scale.toDouble()) * 100.0)
+            .toInt()
+            .coerceIn(0, 100)
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+        val charging =
+            status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL ||
+                plugged != 0
+        val bucket = when {
+            level <= 10 -> "critical"
+            level <= 20 -> "low"
+            level <= 50 -> "medium"
+            else -> "high"
+        }
+        val signature = "$bucket:$charging"
+        val retryUntilDelivered = !charging && (bucket == "low" || bucket == "critical")
+        if (!force && signature == lastBatterySignature && !retryUntilDelivered) return
+        lastBatterySignature = signature
+
+        emitRealitySignal(
+            "battery",
+            mapOf(
+                "level" to level,
+                "charging" to charging,
+                "bucket" to bucket,
+            ),
+        )
+    }
+
+    private fun emitNetworkSnapshot(force: Boolean) {
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = connectivity.activeNetwork
+            observedDefaultNetwork = network
+            val capabilities = network?.let(connectivity::getNetworkCapabilities)
+            emitNetworkCapabilities(capabilities, force)
+            return
+        }
+
+        @Suppress("DEPRECATION")
+        val info = connectivity.activeNetworkInfo
+        @Suppress("DEPRECATION")
+        val transport = when (info?.type) {
+            ConnectivityManager.TYPE_WIFI -> "wifi"
+            ConnectivityManager.TYPE_MOBILE -> "cellular"
+            ConnectivityManager.TYPE_ETHERNET -> "ethernet"
+            ConnectivityManager.TYPE_BLUETOOTH -> "bluetooth"
+            else -> if (info == null) "none" else "other"
+        }
+        @Suppress("DEPRECATION")
+        val online = info?.isConnected == true
+        val metered = runCatching { connectivity.isActiveNetworkMetered }.getOrDefault(false)
+        emitNetworkState(online, transport, metered, force)
+    }
+
+    private fun emitNetworkCapabilities(
+        capabilities: NetworkCapabilities?,
+        force: Boolean,
+    ) {
+        if (capabilities == null) {
+            emitNetworkState(
+                online = false,
+                transport = "none",
+                metered = false,
+                force = force,
+            )
+            return
+        }
+        val online =
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val transport = when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) -> "bluetooth"
+            else -> "other"
+        }
+        val metered =
+            !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        emitNetworkState(online, transport, metered, force)
+    }
+
+    private fun emitNetworkState(
+        online: Boolean,
+        transport: String,
+        metered: Boolean,
+        force: Boolean,
+    ) {
+        val signature = "$online:$transport:$metered"
+        if (!force && signature == lastNetworkSignature) return
+        lastNetworkSignature = signature
+
+        emitRealitySignal(
+            "network",
+            mapOf(
+                "online" to online,
+                "transport" to transport,
+                "metered" to metered,
+            ),
+        )
+    }
+
+    private fun isBluetoothAudioDevice(device: AudioDeviceInfo): Boolean {
+        if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        ) {
+            return true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            device.type == AudioDeviceInfo.TYPE_HEARING_AID
+        ) {
+            return true
+        }
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            (device.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_BLE_SPEAKER)
+    }
+
+    private fun bluetoothAudioType(device: AudioDeviceInfo): String = when {
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "a2dp"
+        device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "sco"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+            device.type == AudioDeviceInfo.TYPE_HEARING_AID -> "hearing_aid"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            device.type == AudioDeviceInfo.TYPE_BLE_HEADSET -> "ble_headset"
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            device.type == AudioDeviceInfo.TYPE_BLE_SPEAKER -> "ble_speaker"
+        else -> "bluetooth"
+    }
+
+    private fun emitBluetoothAudioDevice(
+        device: AudioDeviceInfo,
+        connected: Boolean,
+    ) {
+        val type = bluetoothAudioType(device)
+        val name = device.productName.toString().trim()
+        emitRealitySignal(
+            "bluetooth_audio",
+            mapOf(
+                "connected" to connected,
+                "deviceId" to device.id,
+                "deviceType" to type,
+                "deviceName" to name,
+                "deviceKey" to "$type:$name",
+            ),
+        )
+    }
+
+    private fun emitRealitySignal(kind: String, payload: Map<String, Any>) {
+        if (!realitySignalsStarted) return
+        mainHandler.post {
+            channel?.invokeMethod(
+                "realitySignal",
+                mapOf(
+                    "kind" to kind,
+                    "payload" to payload,
+                ),
+            )
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -187,7 +580,10 @@ class DeviceLocalToolsHandler(private val context: Context) {
             completion(true, false)
             return
         }
-        if (pendingCalendarPermissionCallback != null || pendingLocationPermissionCallback != null) {
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
             completion(false, false)
             return
         }
@@ -200,6 +596,54 @@ class DeviceLocalToolsHandler(private val context: Context) {
             activity,
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
             LOCATION_PERMISSION_REQUEST_CODE,
+        )
+    }
+
+    private fun bleScanPermissions(): Array<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            )
+        } else {
+            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+    private fun hasBleScanPermission(): Boolean =
+        bleScanPermissions().all {
+            ContextCompat.checkSelfPermission(context, it) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+
+    private fun requestBleScanPermission(completion: (Boolean) -> Unit) {
+        if (hasBleScanPermission()) {
+            completion(true)
+            return
+        }
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
+            completion(false)
+            return
+        }
+        if (attachedActivity == null) {
+            completion(false)
+            return
+        }
+        val missing = bleScanPermissions().filter {
+            ContextCompat.checkSelfPermission(context, it) !=
+                PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            completion(true)
+            return
+        }
+        pendingBlePermissionCallback = completion
+        ActivityCompat.requestPermissions(
+            activity,
+            missing.toTypedArray(),
+            BLE_PERMISSION_REQUEST_CODE,
         )
     }
 
@@ -223,7 +667,10 @@ class DeviceLocalToolsHandler(private val context: Context) {
             result.success(true)
             return
         }
-        if (pendingCalendarPermissionCallback != null || pendingLocationPermissionCallback != null) {
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
             result.success(false)
             return
         }
@@ -251,7 +698,10 @@ class DeviceLocalToolsHandler(private val context: Context) {
             action()
             return
         }
-        if (pendingCalendarPermissionCallback != null || pendingLocationPermissionCallback != null) {
+        if (pendingCalendarPermissionCallback != null ||
+            pendingLocationPermissionCallback != null ||
+            pendingBlePermissionCallback != null
+        ) {
             result.success(
                 errorPayload(
                     "PERMISSION_REQUEST_IN_PROGRESS",
@@ -314,6 +764,206 @@ class DeviceLocalToolsHandler(private val context: Context) {
                 // Settings page unavailable; the error payload still informs the model.
             }
         }
+    }
+
+
+    // ---------------------------------------------------------------------
+    // Explicit Bluetooth LE discovery
+    // ---------------------------------------------------------------------
+
+    @SuppressLint("MissingPermission")
+    private fun scanBluetoothLe(argsJson: String, result: MethodChannel.Result) {
+        if (!hasBleScanPermission()) {
+            result.success(
+                errorPayload(
+                    "NO_PERMISSION",
+                    "Bluetooth nearby-device permission is not granted. Enable the Bluetooth LE tool in Assistant settings first.",
+                ),
+            )
+            return
+        }
+        if (pendingBleScanResult != null) {
+            result.success(
+                errorPayload(
+                    "BLE_SCAN_BUSY",
+                    "A Bluetooth LE scan is already running. Wait for it to finish and try again.",
+                ),
+            )
+            return
+        }
+
+        val adapter = context
+            .getSystemService(BluetoothManager::class.java)
+            ?.adapter
+        if (adapter == null) {
+            result.success(errorPayload("BLE_UNAVAILABLE", "This device does not support Bluetooth."))
+            return
+        }
+        if (!adapter.isEnabled) {
+            result.success(errorPayload("BLE_DISABLED", "Bluetooth is turned off on this device."))
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            result.success(errorPayload("BLE_UNAVAILABLE", "Bluetooth LE scanning is not available."))
+            return
+        }
+
+        val params = try {
+            JSONObject(argsJson)
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        val durationMs = params.optLong("duration_ms", 4000L).coerceIn(1000L, 10_000L)
+        val includeUnnamed = params.optBoolean("include_unnamed", false)
+        val nameFilter = params.optString("name_contains")
+            .trim()
+            .lowercase()
+            .takeIf { it.isNotEmpty() }
+        val limit = params.optInt("limit", 20).coerceIn(1, 50)
+
+        pendingBleScanResult = result
+        bleScanResults.clear()
+
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, scanResult: ScanResult) {
+                recordBleScanResult(scanResult, includeUnnamed, nameFilter)
+            }
+
+            override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                for (scanResult in results) {
+                    recordBleScanResult(scanResult, includeUnnamed, nameFilter)
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                finishBleScan(
+                    errorPayload(
+                        "BLE_SCAN_FAILED",
+                        "Bluetooth LE scan failed with Android error code " + errorCode + ".",
+                    ),
+                )
+            }
+        }
+        bleScanCallback = callback
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        try {
+            scanner.startScan(null, settings, callback)
+        } catch (_: SecurityException) {
+            finishBleScan(
+                errorPayload(
+                    "NO_PERMISSION",
+                    "Bluetooth scan permission was revoked. Re-enable the Bluetooth LE tool and try again.",
+                ),
+            )
+            return
+        } catch (error: Exception) {
+            finishBleScan(
+                errorPayload(
+                    "BLE_SCAN_FAILED",
+                    error.message ?: "Bluetooth LE scan could not start.",
+                ),
+            )
+            return
+        }
+
+        val finish = Runnable {
+            finishBleScan(buildBleScanPayload(durationMs, limit))
+        }
+        bleScanFinishRunnable = finish
+        mainHandler.postDelayed(finish, durationMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun recordBleScanResult(
+        scanResult: ScanResult,
+        includeUnnamed: Boolean,
+        nameFilter: String?,
+    ) {
+        if (pendingBleScanResult == null) return
+        val record = scanResult.scanRecord
+        val advertisedName = record?.deviceName?.trim().orEmpty()
+        val systemName = runCatching { scanResult.device.name?.trim().orEmpty() }.getOrDefault("")
+        val name = advertisedName.ifEmpty { systemName }
+        if (name.isEmpty() && !includeUnnamed) return
+        if (nameFilter != null && !name.lowercase().contains(nameFilter)) return
+
+        val address = runCatching { scanResult.device.address }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return
+        val existing = bleScanResults[address]
+        if (existing != null && existing.optInt("rssi", -999) >= scanResult.rssi) return
+
+        val services = JSONArray()
+        record?.serviceUuids?.forEach { parcelUuid ->
+            services.put(parcelUuid.uuid.toString())
+        }
+
+        // Never expose the Bluetooth MAC address to the model. The
+        // opaque id is random and process-local; a future connect/read flow must
+        // resolve it through this in-memory map instead of reversing a hash.
+        val opaqueId = bleOpaqueIds.getOrPut(address) {
+            UUID.randomUUID().toString()
+        }
+        val payload = JSONObject()
+            .put("device_id", opaqueId)
+            .put("name", if (name.isEmpty()) JSONObject.NULL else name)
+            .put("rssi", scanResult.rssi)
+            .put("service_uuids", services)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            payload.put("connectable", scanResult.isConnectable)
+        }
+        val txPower = record?.txPowerLevel ?: Int.MIN_VALUE
+        if (txPower != Int.MIN_VALUE) {
+            payload.put("tx_power", txPower)
+        }
+        bleScanResults[address] = payload
+    }
+
+    private fun buildBleScanPayload(durationMs: Long, limit: Int): String {
+        val devices = JSONArray()
+        bleScanResults.values
+            .sortedByDescending { it.optInt("rssi", -999) }
+            .take(limit)
+            .forEach { devices.put(it) }
+        return JSONObject()
+            .put("devices", devices)
+            .put("count", devices.length())
+            .put("duration_ms", durationMs)
+            .toString()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun finishBleScan(payload: String) {
+        val result = pendingBleScanResult ?: return
+        val callback = bleScanCallback
+        val finish = bleScanFinishRunnable
+
+        pendingBleScanResult = null
+        bleScanCallback = null
+        bleScanFinishRunnable = null
+        if (finish != null) mainHandler.removeCallbacks(finish)
+
+        if (callback != null) {
+            runCatching {
+                context
+                    .getSystemService(BluetoothManager::class.java)
+                    ?.adapter
+                    ?.bluetoothLeScanner
+                    ?.stopScan(callback)
+            }
+        }
+        result.success(payload)
+        bleScanResults.clear()
+    }
+
+    private fun cancelBleScan(payload: String) {
+        finishBleScan(payload)
     }
 
     // ---------------------------------------------------------------------

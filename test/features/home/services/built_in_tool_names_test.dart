@@ -32,6 +32,7 @@ void main() {
       LocalToolNames.calendarQuery,
       LocalToolNames.calendarCreate,
       LocalToolNames.currentLocation,
+      LocalToolNames.bluetoothScan,
       LocalToolNames.phoneControl,
       LocalToolNames.weather,
       LocalToolNames.healthSummary,

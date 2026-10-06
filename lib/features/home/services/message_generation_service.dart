@@ -2,6 +2,7 @@ import 'package:Kelivo/core/providers/external_mounts_provider.dart';
 import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
+import '../../../core/agency/agency_world_state.dart';
 import '../../../core/models/assistant.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
@@ -164,6 +165,7 @@ class MessageGenerationService {
     required String providerKey,
     required String modelId,
     String? requiredAttachmentMessageId,
+    String? ephemeralSystemPrompt,
     bool syncWorkspaceAttachments = true,
     bool persistWorldBookActivation = true,
     void Function(int before, int after)? onWorldBookActivationPersisted,
@@ -302,6 +304,28 @@ class MessageGenerationService {
       workspaceContext: workspaceContext,
     );
 
+    if (assistant?.companionAgencyEnabled == true &&
+        currentConversation != null) {
+      final realityContext = AgencyWorldState.instance.buildSystemContext(
+        assistantId: assistant!.id,
+        conversationId: currentConversation.id,
+      );
+      if (realityContext != null && realityContext.isNotEmpty) {
+        messageBuilderService.injectTransientSystemPrompt(
+          apiMessages,
+          realityContext,
+        );
+      }
+    }
+
+    final transientPrompt = ephemeralSystemPrompt?.trim();
+    if (transientPrompt != null && transientPrompt.isNotEmpty) {
+      messageBuilderService.injectTransientSystemPrompt(
+        apiMessages,
+        transientPrompt,
+      );
+    }
+
     messageBuilderService.applyContextLimit(apiMessages, assistant);
 
     final mcpRouteSnapshot = generationController.captureMcpToolRoutes(
@@ -399,6 +423,7 @@ class MessageGenerationService {
     AskUserInteractionService? askUserService,
     String? processingMessageId,
     String? requiredAttachmentMessageId,
+    String? ephemeralSystemPrompt,
   }) async {
     var requestRevision = currentConversation == null
         ? null
@@ -439,6 +464,7 @@ class MessageGenerationService {
       providerKey: providerKey,
       modelId: modelId,
       requiredAttachmentMessageId: requiredAttachmentMessageId,
+      ephemeralSystemPrompt: ephemeralSystemPrompt,
       onWorldBookActivationPersisted: (before, after) {
         // Accept only this preparation's own write. A history edit before or
         // during persistence invalidates provenance and must not be rebased.

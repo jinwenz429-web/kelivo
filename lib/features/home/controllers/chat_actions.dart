@@ -293,6 +293,11 @@ class ChatActions {
   /// not its full duration, before releasing this generation's resources.
   FutureOr<void> Function(ChatMessage message)? onAssistantMessageFinished;
 
+  /// Called only after a proactive assistant-only turn is successfully
+  /// persisted. Failed/cancelled attempts never reach this callback.
+  FutureOr<void> Function(ChatMessage message, String? eventKey)?
+  onProactiveAssistantMessageFinished;
+
   /// Called when file processing starts for the assistant message [messageId].
   void Function(String messageId)? onFileProcessingStarted;
 
@@ -371,6 +376,9 @@ class ChatActions {
       <String, stream_ctrl.StreamingState>{};
   final Map<String, Future<void>> _cancelStreamingFutures =
       <String, Future<void>>{};
+  final Map<String, String> _transientSystemPrompts = <String, String>{};
+  final Set<String> _proactiveMessageIds = <String>{};
+  final Map<String, String> _proactiveEventKeys = <String, String>{};
 
   /// Per-conversation send/regenerate claim, taken synchronously before the
   /// first await so a re-entrant call loses before persisting anything. The
@@ -603,6 +611,9 @@ class ChatActions {
     _generationCheckpointCursors.remove(message.id);
     _streamingToolEvents.remove(message.id);
     _streamingStates.remove(message.id);
+    _transientSystemPrompts.remove(message.id);
+    _proactiveMessageIds.remove(message.id);
+    _proactiveEventKeys.remove(message.id);
     _activeAssistantMessages.removeIfMatches(message);
   }
 
@@ -1509,6 +1520,9 @@ class ChatActions {
     bool scheduled = false,
     bool scheduledNotify = true,
     bool scheduledPreview = true,
+    String? ephemeralSystemPrompt,
+    bool requireIdleTail = false,
+    String? proactiveEventKey,
   }) async {
     final claimToken = ++_sendInFlightClaimSerial;
     if (isSendInFlight(conversation.id)) {
@@ -1516,6 +1530,26 @@ class ChatActions {
     }
     _sendInFlightClaims[conversation.id] = claimToken;
     try {
+      if (requireIdleTail) {
+        if (chatController.isConversationLoading(conversation.id) ||
+            activeStreamingMessageId(conversation.id) != null) {
+          return ChatActionResult.inFlight();
+        }
+        final current = await chatService.loadSelectedMessageProjections(
+          conversation.id,
+        );
+        if (current.isEmpty || current.last.id != message.id) {
+          return ChatActionResult.error('proactive_context_changed');
+        }
+        final persistedTail = await chatService.chatRepositoryOrNull?.getMessage(
+          current.last.id,
+        );
+        if (persistedTail == null ||
+            persistedTail.role != 'assistant' ||
+            persistedTail.isStreaming) {
+          return ChatActionResult.error('proactive_context_changed');
+        }
+      }
       return await _regenerateAtMessageClaimed(
         message: message,
         conversation: conversation,
@@ -1528,6 +1562,9 @@ class ChatActions {
         scheduled: scheduled,
         scheduledNotify: scheduledNotify,
         scheduledPreview: scheduledPreview,
+        ephemeralSystemPrompt: ephemeralSystemPrompt,
+        requireIdleTail: requireIdleTail,
+        proactiveEventKey: proactiveEventKey,
       );
     } finally {
       if (_sendInFlightClaims[conversation.id] == claimToken) {
@@ -1548,6 +1585,9 @@ class ChatActions {
     bool scheduled = false,
     bool scheduledNotify = true,
     bool scheduledPreview = true,
+    String? ephemeralSystemPrompt,
+    bool requireIdleTail = false,
+    String? proactiveEventKey,
   }) async {
     // Avoid using BuildContext across async gaps (this class holds a BuildContext).
     final settings = contextProvider.read<SettingsProvider>();
@@ -1667,6 +1707,17 @@ class ChatActions {
       );
     }
     final assistantMessage = begin.assistantMessage;
+    final transientPrompt = ephemeralSystemPrompt?.trim();
+    if (transientPrompt != null && transientPrompt.isNotEmpty) {
+      _transientSystemPrompts[assistantMessage.id] = transientPrompt;
+    }
+    if (requireIdleTail) {
+      _proactiveMessageIds.add(assistantMessage.id);
+      final eventKey = proactiveEventKey?.trim();
+      if (eventKey != null && eventKey.isNotEmpty) {
+        _proactiveEventKeys[assistantMessage.id] = eventKey;
+      }
+    }
     _registerGenerationRun(assistantMessage.id, begin.runId);
     _activeAssistantMessages.put(assistantMessage);
 
@@ -1746,6 +1797,8 @@ class ChatActions {
               approvalService: regenApprovalService,
               askUserService: regenAskUserService,
               processingMessageId: assistantMessage.id,
+              ephemeralSystemPrompt:
+                  _transientSystemPrompts[assistantMessage.id],
             );
 
         // Build user image paths
@@ -1908,6 +1961,8 @@ class ChatActions {
             approvalService: approvalService,
             askUserService: askUserService,
             processingMessageId: streamingMessage.id,
+            ephemeralSystemPrompt:
+                _transientSystemPrompts[streamingMessage.id],
           );
 
       final userImagePaths = messageGenerationService.buildUserImagePaths(
@@ -2603,6 +2658,8 @@ class ChatActions {
     state.finishRequestTiming();
     final messageId = state.messageId;
     final conversationId = state.conversationId;
+    final wasProactive = _proactiveMessageIds.contains(messageId);
+    final proactiveEventKey = _proactiveEventKeys[messageId];
 
     // Mark streaming as ended to allow UI rebuilds again
     streamController.markStreamingEnded(messageId);
@@ -2695,6 +2752,12 @@ class ChatActions {
       );
       state.terminalPersisted = true;
 
+      if (wasProactive) {
+        await onProactiveAssistantMessageFinished?.call(
+          finalizedMessage,
+          proactiveEventKey,
+        );
+      }
       await onAssistantMessageFinished?.call(finalizedMessage);
 
       if (shouldGenerateTitle) {

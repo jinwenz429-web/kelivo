@@ -55,6 +55,11 @@ class Assistant {
   final bool searchEnabled; // per-assistant external web search switch
   final List<String> mcpServerIds; // bound MCP server IDs
   final List<String> localToolIds; // enabled local tool IDs
+
+  /// Enables the private companion runtime for this assistant: local reality
+  /// sensing, ambient reality context, and proactive assistant-only turns.
+  final bool companionAgencyEnabled;
+
   /// Default workspace for new conversations started with this assistant.
   final String? defaultWorkspaceId;
 
@@ -120,6 +125,7 @@ class Assistant {
     this.searchEnabled = false,
     this.mcpServerIds = const <String>[],
     this.localToolIds = const <String>[],
+    this.companionAgencyEnabled = false,
     this.defaultWorkspaceId,
     this.defaultWorkspaceSetup = DefaultWorkspaceSetup.automatic,
     this.defaultWorkspaceChangeToken,
@@ -169,6 +175,7 @@ class Assistant {
     bool? searchEnabled,
     List<String>? mcpServerIds,
     List<String>? localToolIds,
+    bool? companionAgencyEnabled,
     String? defaultWorkspaceId,
     DefaultWorkspaceSetup? defaultWorkspaceSetup,
     List<String>? skillIds,
@@ -230,6 +237,8 @@ class Assistant {
       searchEnabled: searchEnabled ?? this.searchEnabled,
       mcpServerIds: mcpServerIds ?? this.mcpServerIds,
       localToolIds: localToolIds ?? this.localToolIds,
+      companionAgencyEnabled:
+          companionAgencyEnabled ?? this.companionAgencyEnabled,
       defaultWorkspaceId: clearDefaultWorkspaceId
           ? null
           : (defaultWorkspaceId ?? this.defaultWorkspaceId),
@@ -301,6 +310,7 @@ class Assistant {
     'searchEnabled': searchEnabled,
     'mcpServerIds': mcpServerIds,
     'localToolIds': localToolIds,
+    'companionAgencyEnabled': companionAgencyEnabled,
     'defaultWorkspaceId': defaultWorkspaceId,
     'defaultWorkspaceSetup': defaultWorkspaceSetup.name,
     'skillIds': skillIds,
@@ -363,6 +373,8 @@ class Assistant {
         (json['mcpServerIds'] as List?)?.cast<String>() ?? const <String>[],
     localToolIds:
         (json['localToolIds'] as List?)?.cast<String>() ?? const <String>[],
+    companionAgencyEnabled:
+        json['companionAgencyEnabled'] as bool? ?? false,
     defaultWorkspaceId: json['defaultWorkspaceId'] as String?,
     defaultWorkspaceSetup:
         DefaultWorkspaceSetup.values
