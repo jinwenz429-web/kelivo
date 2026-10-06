@@ -1,0 +1,41 @@
+name: Android Debug
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+            - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.9"
+          channel: stable
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Android debug APKs
+        env:
+          PROOT_VERSION: "5.1.107.96"
+        run: flutter build apk --debug --split-per-abi
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apks
+          path: build/app/outputs/flutter-apk/*-debug.apk
+          if-no-files-found: error
