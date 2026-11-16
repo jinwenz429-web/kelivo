@@ -2,6 +2,8 @@ name: Android Release (companion)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [companion-apk]
 
 permissions:
   contents: read
