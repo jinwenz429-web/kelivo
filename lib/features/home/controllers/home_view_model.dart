@@ -479,9 +479,7 @@ class HomeViewModel extends ChangeNotifier {
     final anchor = await _chatService.chatRepositoryOrNull?.getMessage(
       projectedTail.id,
     );
-    if (anchor == null ||
-        anchor.role != 'assistant' ||
-        anchor.isStreaming) {
+    if (anchor == null || anchor.role != 'assistant' || anchor.isStreaming) {
       return ChatActionResult.error('proactive_requires_assistant_tail');
     }
     final instruction = agencyInstruction.trim();

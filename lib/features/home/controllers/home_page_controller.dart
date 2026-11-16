@@ -8,12 +8,10 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../core/database/chat_database_repository.dart';
-import '../../../core/database/business_preferences.dart';
 import '../../../core/agency/agency_coordinator.dart';
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
 import '../../../core/agency/agency_intention_gate.dart';
-import '../../../core/agency/agency_world_state.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
 import '../../../core/models/message_part.dart';
@@ -164,8 +162,7 @@ class HomePageController extends ChangeNotifier {
   late FileUploadService _fileUploadService;
   late scroll_ctrl.ChatScrollController _scrollCtrl;
   final AgencyRealitySampler _agencyRealitySampler = AgencyRealitySampler();
-  static const AgencyIntentionGate _agencyIntentionGate =
-      AgencyIntentionGate();
+  static const AgencyIntentionGate _agencyIntentionGate = AgencyIntentionGate();
 
   McpProvider? _mcpProvider;
   StreamSubscription<ChatAction>? _chatActionSub;
@@ -174,9 +171,7 @@ class HomePageController extends ChangeNotifier {
   StreamSubscription<DeviceRealitySignal>? _deviceRealitySignalSub;
   Timer? _agencyForegroundTimer;
 
-  static const Duration _agencyForegroundSampleInterval = Duration(
-    minutes: 15,
-  );
+  static const Duration _agencyForegroundSampleInterval = Duration(minutes: 15);
 
   // ============================================================================
   // Animation Controllers
@@ -393,13 +388,6 @@ class HomePageController extends ChangeNotifier {
     _initializeScrollController();
     _initializeServices();
     _initializeViewModel();
-    AgencyWorldState.instance.start();
-    unawaited(
-      AgencyCoordinator.instance.start(
-        busy: () => ChatActions.hasAnyActiveGeneration,
-        preferences: _context.read<BusinessPreferences>(),
-      ),
-    );
     _agencyConsiderationSub = AgencyCoordinator.instance.considerations.listen(
       (consideration) => unawaited(_handleAgencyConsideration(consideration)),
     );
@@ -2911,16 +2899,15 @@ class HomePageController extends ChangeNotifier {
       return;
     }
     if (_agencyForegroundTimer?.isActive ?? false) return;
-    _agencyForegroundTimer = Timer.periodic(
-      _agencyForegroundSampleInterval,
-      (_) {
-        if (_canSampleAgencyReality) {
-          unawaited(_sampleAgencyReality());
-        } else {
-          _syncAgencyForegroundSampling();
-        }
-      },
-    );
+    _agencyForegroundTimer = Timer.periodic(_agencyForegroundSampleInterval, (
+      _,
+    ) {
+      if (_canSampleAgencyReality) {
+        unawaited(_sampleAgencyReality());
+      } else {
+        _syncAgencyForegroundSampling();
+      }
+    });
   }
 
   Future<void> _sampleAgencyReality() async {
@@ -2948,9 +2935,7 @@ class HomePageController extends ChangeNotifier {
     );
   }
 
-  Future<void> _handleDeviceRealitySignal(
-    DeviceRealitySignal signal,
-  ) async {
+  Future<void> _handleDeviceRealitySignal(DeviceRealitySignal signal) async {
     if (!_chatInitialized || !_context.mounted) return;
     final conversation = currentConversation;
     if (conversation == null ||
@@ -3319,7 +3304,6 @@ class HomePageController extends ChangeNotifier {
     unawaited(_agencyConsiderationSub?.cancel());
     unawaited(_deviceRealitySignalSub?.cancel());
     unawaited(DeviceLocalTools.stopRealitySignals());
-    unawaited(AgencyCoordinator.instance.stop());
     if (_scheduledExecutor case final executor?) {
       _scheduledPreparation?.dispose();
       ScheduledTasksService.instance.detach(executor);

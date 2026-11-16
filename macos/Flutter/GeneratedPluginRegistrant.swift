@@ -17,7 +17,7 @@ import hotkey_manager_macos
 import irondash_engine_context
 import mobile_scanner
 import package_info_plus
-import record_macos
+import record_darwin
 import restart_app
 import screen_retriever_macos
 import share_plus
@@ -43,7 +43,7 @@ func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
   IrondashEngineContextPlugin.register(with: registry.registrar(forPlugin: "IrondashEngineContextPlugin"))
   MobileScannerPlugin.register(with: registry.registrar(forPlugin: "MobileScannerPlugin"))
   FPPPackageInfoPlusPlugin.register(with: registry.registrar(forPlugin: "FPPPackageInfoPlusPlugin"))
-  RecordMacOsPlugin.register(with: registry.registrar(forPlugin: "RecordMacOsPlugin"))
+  RecordDarwinPlugin.register(with: registry.registrar(forPlugin: "RecordDarwinPlugin"))
   RestartAppPlugin.register(with: registry.registrar(forPlugin: "RestartAppPlugin"))
   ScreenRetrieverMacosPlugin.register(with: registry.registrar(forPlugin: "ScreenRetrieverMacosPlugin"))
   SharePlusMacosPlugin.register(with: registry.registrar(forPlugin: "SharePlusMacosPlugin"))

@@ -68,6 +68,10 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            // Separate package so this build installs next to the official Kelivo.
+            applicationIdSuffix = ".companion"
+        }
         getByName("release") {
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")

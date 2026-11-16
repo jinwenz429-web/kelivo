@@ -1541,9 +1541,8 @@ class ChatActions {
         if (current.isEmpty || current.last.id != message.id) {
           return ChatActionResult.error('proactive_context_changed');
         }
-        final persistedTail = await chatService.chatRepositoryOrNull?.getMessage(
-          current.last.id,
-        );
+        final persistedTail = await chatService.chatRepositoryOrNull
+            ?.getMessage(current.last.id);
         if (persistedTail == null ||
             persistedTail.role != 'assistant' ||
             persistedTail.isStreaming) {
@@ -1961,8 +1960,7 @@ class ChatActions {
             approvalService: approvalService,
             askUserService: askUserService,
             processingMessageId: streamingMessage.id,
-            ephemeralSystemPrompt:
-                _transientSystemPrompts[streamingMessage.id],
+            ephemeralSystemPrompt: _transientSystemPrompts[streamingMessage.id],
           );
 
       final userImagePaths = messageGenerationService.buildUserImagePaths(

@@ -72,7 +72,7 @@ class AgencyAppraiser {
 
     var score = _baseWeight(event.kind);
     score = score < event.urgency ? event.urgency : score;
-    reasons.add('base:' + event.kind.name);
+    reasons.add('base:${event.kind.name}');
 
     final lastProactive = context.lastProactiveMessageAt;
     if (lastProactive != null &&

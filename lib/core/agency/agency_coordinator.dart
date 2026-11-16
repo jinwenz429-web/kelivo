@@ -9,10 +9,7 @@ import 'agency_event.dart';
 import 'agency_event_bus.dart';
 
 class AgencyConsideration {
-  const AgencyConsideration({
-    required this.event,
-    required this.appraisal,
-  });
+  const AgencyConsideration({required this.event, required this.appraisal});
 
   final AgencyEvent event;
   final AgencyAppraisal appraisal;
@@ -25,11 +22,9 @@ class AgencyConsideration {
 class AgencyCoordinator {
   AgencyCoordinator({
     AgencyEventBus? bus,
-    AgencyAppraiser appraiser = const AgencyAppraiser(),
-    BusinessPreferences? preferences,
-  }) : _bus = bus ?? AgencyEventBus.instance,
-       _appraiser = appraiser,
-       _preferences = preferences;
+    this._appraiser = const AgencyAppraiser(),
+    this._preferences,
+  }) : _bus = bus ?? AgencyEventBus.instance;
 
   static final AgencyCoordinator instance = AgencyCoordinator();
   static const String _deliveryStateKey = 'agency_delivery_state_v1';

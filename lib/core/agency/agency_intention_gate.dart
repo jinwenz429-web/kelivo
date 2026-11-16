@@ -5,10 +5,7 @@ import 'agency_event.dart';
 enum AgencyIntentionAction { rest, retain, message }
 
 class AgencyIntention {
-  const AgencyIntention({
-    required this.action,
-    required this.reason,
-  });
+  const AgencyIntention({required this.action, required this.reason});
 
   final AgencyIntentionAction action;
   final String reason;

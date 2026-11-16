@@ -105,6 +105,8 @@ import 'dart:io'
         stderr; // kept for global override usage inside provider
 import 'core/services/mobile_background.dart';
 import 'core/services/notification_service.dart';
+import 'core/agency/agency_coordinator.dart';
+import 'core/agency/agency_world_state.dart';
 import 'features/home/controllers/chat_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -334,6 +336,15 @@ Future<void> main() async {
       // Desktop exit hook: drain queued preference writes before process exit.
       _installExitFlush(businessPreferences);
       ScheduledTasksService.configureDevice(businessPreferences);
+      // Companion agency is process-wide: it lives for the whole app, not for
+      // one home page, so it starts here next to the preferences it persists to.
+      AgencyWorldState.instance.start();
+      unawaited(
+        AgencyCoordinator.instance.start(
+          busy: () => ChatActions.hasAnyActiveGeneration,
+          preferences: businessPreferences,
+        ),
+      );
       // Best-effort trim of archived restore runs after a few cold starts.
       unawaited(_pruneRestoreArchive(appDataDirectory));
       unawaited(ModelCatalogService.instance.maybeAutoRefresh());

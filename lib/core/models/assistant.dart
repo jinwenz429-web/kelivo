@@ -373,8 +373,7 @@ class Assistant {
         (json['mcpServerIds'] as List?)?.cast<String>() ?? const <String>[],
     localToolIds:
         (json['localToolIds'] as List?)?.cast<String>() ?? const <String>[],
-    companionAgencyEnabled:
-        json['companionAgencyEnabled'] as bool? ?? false,
+    companionAgencyEnabled: json['companionAgencyEnabled'] as bool? ?? false,
     defaultWorkspaceId: json['defaultWorkspaceId'] as String?,
     defaultWorkspaceSetup:
         DefaultWorkspaceSetup.values
