@@ -30,7 +30,7 @@ jobs:
 
       - name: Build Android debug APKs
         env:
-          PROOT_VERSION: "5.1.107.96"
+          PROOT_VERSION: "5.1.107.102"
         run: flutter build apk --debug --split-per-abi
 
       - name: Upload APKs
