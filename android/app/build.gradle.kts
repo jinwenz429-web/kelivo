@@ -73,8 +73,13 @@ android {
             applicationIdSuffix = ".companion"
         }
         getByName("release") {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            applicationIdSuffix = ".companion"
+            // Without key.properties (no signing secrets in CI) fall back to the
+            // debug key so the release APK is still installable.
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
         }
     }
