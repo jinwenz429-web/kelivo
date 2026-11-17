@@ -12131,6 +12131,20 @@ class AppLocalizationsEn extends AppLocalizations {
       'Generates another answer to the selected question using its original context. Existing answers and later messages are kept.';
 
   @override
+  String get scheduledTasksCompanionWake => 'Let it decide';
+
+  @override
+  String get scheduledTasksCompanionWakeTip =>
+      'At this time the assistant wakes on its own and decides whether to message you. Your prompt is never shown as a message; if it would rather not disturb you, nothing is posted and no notification is sent.';
+
+  @override
+  String get scheduledTasksWakeNote => 'What it should keep in mind';
+
+  @override
+  String get scheduledTasksWakeNoteHint =>
+      'Optional. For example: check whether I\'ve eaten; don\'t wake me before 9.';
+
+  @override
   String get scheduledTasksSaving => 'Saving…';
 
   @override

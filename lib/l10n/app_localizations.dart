@@ -21753,6 +21753,30 @@ abstract class AppLocalizations {
   /// **'Generates another answer to the selected question using its original context. Existing answers and later messages are kept.'**
   String get scheduledTasksRegenerateDetail;
 
+  /// No description provided for @scheduledTasksCompanionWake.
+  ///
+  /// In en, this message translates to:
+  /// **'Let it decide'**
+  String get scheduledTasksCompanionWake;
+
+  /// No description provided for @scheduledTasksCompanionWakeTip.
+  ///
+  /// In en, this message translates to:
+  /// **'At this time the assistant wakes on its own and decides whether to message you. Your prompt is never shown as a message; if it would rather not disturb you, nothing is posted and no notification is sent.'**
+  String get scheduledTasksCompanionWakeTip;
+
+  /// No description provided for @scheduledTasksWakeNote.
+  ///
+  /// In en, this message translates to:
+  /// **'What it should keep in mind'**
+  String get scheduledTasksWakeNote;
+
+  /// No description provided for @scheduledTasksWakeNoteHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Optional. For example: check whether I\'ve eaten; don\'t wake me before 9.'**
+  String get scheduledTasksWakeNoteHint;
+
   /// No description provided for @scheduledTasksSaving.
   ///
   /// In en, this message translates to:

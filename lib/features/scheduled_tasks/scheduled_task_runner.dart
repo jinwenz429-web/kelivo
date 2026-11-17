@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
+import '../../core/agency/companion_wake.dart';
 import '../../core/database/generation_run.dart';
 import '../../core/models/chat_input_data.dart';
 import '../../core/models/conversation.dart';
@@ -13,6 +14,7 @@ import '../../core/providers/workspace_provider.dart';
 import '../../core/providers/world_book_provider.dart';
 import '../../core/services/chat/chat_service.dart';
 import '../../core/services/scheduled_tasks_service.dart';
+import '../chat/utils/thinking_tag_parser.dart';
 import '../home/controllers/chat_actions.dart';
 import '../home/controllers/home_view_model.dart';
 import '../home/services/ask_user_interaction_service.dart';
@@ -131,6 +133,30 @@ Future<Map<String, Object?>> runScheduledTask(
       scheduledNotify: task.notify,
       scheduledPreview: task.showPreview,
     );
+  } else if (task.isCompanionWake) {
+    final history = await chat.loadSelectedMessageProjections(conversation.id);
+    cancellation.check();
+    final lastUser = history.where((m) => m.role == 'user').lastOrNull;
+    final wake = await viewModel.sendProactiveAssistantMessage(
+      conversation: conversation,
+      assistant: assistant,
+      agencyInstruction: companionWakeInstruction(
+        now: DateTime.now(),
+        note: task.prompt,
+        lastMessageAt: history.lastOrNull?.timestamp,
+        lastUserMessageAt: lastUser?.timestamp,
+      ),
+      modelOverride: modelOverride,
+      onGenerationStarted: onStarted,
+      notify: task.notify,
+      showPreview: task.showPreview,
+    );
+    // An unanswered user turn or a reply still streaming is not a moment to
+    // interrupt; the wake simply passes.
+    if (!wake.success && _wakePassesQuietly.contains(wake.errorMessage)) {
+      return {'conversationId': conversation.id, 'status': 'skipped'};
+    }
+    result = wake;
   } else {
     result = await viewModel.sendScheduledMessage(
       input: ChatInputData(text: task.prompt),
@@ -157,6 +183,16 @@ Future<Map<String, Object?>> runScheduledTask(
     if (run == null) throw StateError('generation_run_missing');
     if (run.state.isTerminal) {
       final message = await repository.getMessage(result.assistantMessage!.id);
+      if (task.isCompanionWake &&
+          run.state == GenerationRunState.completed &&
+          (message == null ||
+              isCompanionSilence(
+                ThinkingTagParser.parseWithRanges(
+                  message.content,
+                ).visibleContent,
+              ))) {
+        return {'conversationId': conversation.id, 'status': 'skipped'};
+      }
       return {
         'conversationId': conversation.id,
         'status': run.state == GenerationRunState.completed
@@ -181,3 +217,10 @@ Future<Map<String, Object?>> runScheduledTask(
     await Future<void>.delayed(const Duration(milliseconds: 500));
   }
 }
+
+const _wakePassesQuietly = {
+  'in_flight',
+  'proactive_requires_assistant_tail',
+  'proactive_empty_conversation',
+  'proactive_context_changed',
+};

@@ -136,6 +136,7 @@ class HomeViewModel extends ChangeNotifier {
     _chatActions.onAssistantMessageFinished = _onAssistantMessageFinished;
     _chatActions.onProactiveAssistantMessageFinished =
         _onProactiveAssistantMessageFinished;
+    _chatActions.onProactiveSilence = _onProactiveSilence;
     _chatActions.onFileProcessingStarted = _onFileProcessingStarted;
     _chatActions.onFileProcessingFinished = _onFileProcessingFinished;
   }
@@ -714,6 +715,15 @@ class HomeViewModel extends ChangeNotifier {
   ///
   /// Returns the list of message IDs to clean up UI state for.
   /// The UI layer should handle confirmation dialog before calling this.
+  /// A companion wake that chose silence leaves only its marker reply; it is
+  /// a fresh single-version reply, so removing it touches nothing else.
+  Future<void> _onProactiveSilence(ChatMessage message) => deleteMessage(
+    message: message,
+    byGroup: {
+      message.groupId ?? message.id: [message],
+    },
+  );
+
   Future<void> deleteMessage({
     required ChatMessage message,
     required Map<String, List<ChatMessage>> byGroup,

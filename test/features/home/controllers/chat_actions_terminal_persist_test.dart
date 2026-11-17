@@ -237,6 +237,94 @@ void main() {
     );
   }
 
+  for (final silent in [true, false]) {
+    testWidgets('proactive turn ${silent ? "stays silent" : "is delivered"}', (
+      tester,
+    ) async {
+      final service = _ThrowingFinalizeChatService(failCompletion: false);
+      final settings = SettingsProvider(createBusinessTestPreferences());
+      final background = MobileBackgroundCoordinator(
+        platform: TargetPlatform.linux,
+      );
+      addTearDown(settings.dispose);
+      addTearDown(background.dispose);
+      late ChatActions actions;
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SettingsProvider>.value(
+          value: settings,
+          child: MaterialApp(
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Builder(
+              builder: (context) {
+                actions = _actionsFor(
+                  context,
+                  service,
+                  settings,
+                  background,
+                ).actions;
+                return const SizedBox.shrink();
+              },
+            ),
+          ),
+        ),
+      );
+      addTearDown(actions.streamController.dispose);
+      final silenced = <String>[];
+      final delivered = <String>[];
+      actions.onProactiveSilence = (message) => silenced.add(message.id);
+      actions.onProactiveAssistantMessageFinished = (message, _) =>
+          delivered.add(message.id);
+      actions.onAssistantMessageFinished = (message) =>
+          delivered.add('finished:${message.id}');
+      actions.debugMarkProactive('assistant-wake');
+      final state = StreamingState(
+        GenerationContext(
+          assistantMessage: ChatMessage(
+            id: 'assistant-wake',
+            role: 'assistant',
+            conversationId: 'conversation-1',
+            isStreaming: true,
+          ),
+          apiMessages: const [],
+          userImagePaths: const [],
+          allowImagesApiRouting: false,
+          providerKey: 'test',
+          modelId: 'test',
+          assistant: null,
+          settings: settings,
+          config: ProviderConfig(
+            id: 'test',
+            enabled: true,
+            name: 'test',
+            apiKey: '',
+            baseUrl: '',
+          ),
+          toolDefs: const [],
+          supportsReasoning: false,
+          enableReasoning: false,
+          streamOutput: true,
+          generateTitleOnFinish: false,
+        ),
+      );
+      await actions.debugHandleStreamChunk(
+        TextDelta(id: 'text', text: silent ? '[静默]' : '醒了吗'),
+        state,
+      );
+      await tester.pump(const Duration(milliseconds: 500));
+      await actions.debugFinishStreaming(state);
+
+      expect(service.terminalStates, [GenerationRunState.completed]);
+      if (silent) {
+        expect(silenced, ['assistant-wake']);
+        expect(delivered, isEmpty);
+      } else {
+        expect(silenced, isEmpty);
+        expect(delivered, ['assistant-wake', 'finished:assistant-wake']);
+      }
+    });
+  }
+
   testWidgets('OAuth 失效保留部分回复并持久化恢复入口，不触发普通错误提示', (tester) async {
     final service = _ThrowingFinalizeChatService(failCompletion: false);
     final settings = SettingsProvider(createBusinessTestPreferences());

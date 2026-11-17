@@ -25,6 +25,7 @@ import '../../../l10n/app_localizations.dart';
 import '../../../utils/assistant_regex.dart';
 import '../../../core/models/assistant_regex.dart';
 import '../services/ask_user_interaction_service.dart';
+import '../../../core/agency/companion_wake.dart';
 import '../../chat/utils/thinking_tag_parser.dart';
 import '../services/context_usage_service.dart';
 import '../services/message_generation_service.dart';
@@ -297,6 +298,11 @@ class ChatActions {
   /// persisted. Failed/cancelled attempts never reach this callback.
   FutureOr<void> Function(ChatMessage message, String? eventKey)?
   onProactiveAssistantMessageFinished;
+
+  /// Called after a proactive turn chose to stay silent (companion wake). The
+  /// persisted reply is only the marker and should be removed; no completion
+  /// callback or notification fires for it.
+  FutureOr<void> Function(ChatMessage message)? onProactiveSilence;
 
   /// Called when file processing starts for the assistant message [messageId].
   void Function(String messageId)? onFileProcessingStarted;
@@ -858,6 +864,10 @@ class ChatActions {
   Future<void> debugFinishStreaming(stream_ctrl.StreamingState state) {
     return _finishStreaming(state);
   }
+
+  @visibleForTesting
+  void debugMarkProactive(String messageId) =>
+      _proactiveMessageIds.add(messageId);
 
   @visibleForTesting
   Future<void> debugHandleStreamError(
@@ -2743,12 +2753,20 @@ class ChatActions {
         ),
       );
     }
+    final silent =
+        wasProactive &&
+        isCompanionSilence(
+          ThinkingTagParser.parseWithRanges(
+            finalizedMessage.content,
+          ).visibleContent,
+        );
     try {
       await _finalizeStreamingCheckpoint(
         finalizedMessage,
         terminalState: GenerationRunState.completed,
       );
       state.terminalPersisted = true;
+      if (silent) return;
 
       if (wasProactive) {
         await onProactiveAssistantMessageFinished?.call(
@@ -2773,7 +2791,9 @@ class ChatActions {
       if (state.terminalPersisted) {
         await _background.finish(
           _backgroundTaskId(state.ctx),
-          BackgroundTaskOutcome.completed,
+          silent
+              ? BackgroundTaskOutcome.cancelled
+              : BackgroundTaskOutcome.completed,
           replyPreview: ThinkingTagParser.parseWithRanges(
             finalizedMessage.content,
           ).visibleContent,
@@ -2789,6 +2809,11 @@ class ChatActions {
       // once more after isGenerating becomes false so layout-phase follow
       // does not miss that height change.
       onStreamFinished?.call(conversationId);
+      // The early return above skips completion callbacks; removal of the
+      // silent marker reply must still happen once the message is persisted.
+      if (silent && state.terminalPersisted) {
+        await onProactiveSilence?.call(finalizedMessage);
+      }
     }
   }
 

@@ -11605,6 +11605,19 @@ class AppLocalizationsZh extends AppLocalizations {
       '使用原有上下文，为所选问题生成新的回答，保留已有回答和后续消息。';
 
   @override
+  String get scheduledTasksCompanionWake => '让它自己决定';
+
+  @override
+  String get scheduledTasksCompanionWakeTip =>
+      '到点时它自己醒来，看看对话，决定要不要来找你。下面这段话不会出现在对话里；它不想打扰时什么都不留，也不发通知。';
+
+  @override
+  String get scheduledTasksWakeNote => '醒来时它会想到的';
+
+  @override
+  String get scheduledTasksWakeNoteHint => '可以不填。比如：看看我吃饭没有；九点前别吵我。';
+
+  @override
   String get scheduledTasksSaving => '正在保存…';
 
   @override
@@ -23734,6 +23747,19 @@ class AppLocalizationsZhHans extends AppLocalizationsZh {
   @override
   String get scheduledTasksRegenerateDetail =>
       '使用原有上下文，为所选问题生成新的回答，保留已有回答和后续消息。';
+
+  @override
+  String get scheduledTasksCompanionWake => '让它自己决定';
+
+  @override
+  String get scheduledTasksCompanionWakeTip =>
+      '到点时它自己醒来，看看对话，决定要不要来找你。下面这段话不会出现在对话里；它不想打扰时什么都不留，也不发通知。';
+
+  @override
+  String get scheduledTasksWakeNote => '醒来时它会想到的';
+
+  @override
+  String get scheduledTasksWakeNoteHint => '可以不填。比如：看看我吃饭没有；九点前别吵我。';
 
   @override
   String get scheduledTasksSaving => '正在保存…';
@@ -35944,6 +35970,19 @@ class AppLocalizationsZhHant extends AppLocalizationsZh {
   @override
   String get scheduledTasksRegenerateDetail =>
       '使用原有上下文，為所選問題產生新的回答，保留已有回答和後續訊息。';
+
+  @override
+  String get scheduledTasksCompanionWake => '讓它自己決定';
+
+  @override
+  String get scheduledTasksCompanionWakeTip =>
+      '到點時它自己醒來，看看對話，決定要不要來找你。下面這段話不會出現在對話裡；它不想打擾時什麼都不留，也不發通知。';
+
+  @override
+  String get scheduledTasksWakeNote => '醒來時它會想到的';
+
+  @override
+  String get scheduledTasksWakeNoteHint => '可以不填。比如：看看我吃飯沒有；九點前別吵我。';
 
   @override
   String get scheduledTasksSaving => '正在儲存…';
