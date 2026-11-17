@@ -35,8 +35,8 @@ Widget _harness({
   required Widget child,
   SettingsProvider? settings,
   double textScale = 1,
-  EdgeInsets padding = EdgeInsets.zero,
-  EdgeInsets viewInsets = EdgeInsets.zero,
+  EdgeInsets? padding,
+  EdgeInsets? viewInsets,
 }) {
   return ChangeNotifierProvider<SettingsProvider>.value(
     value: settings ?? SettingsProvider(createBusinessTestPreferences()),
@@ -64,6 +64,7 @@ const _fullStats = TokenDisplayWidget(
   reasoningTokens: 500,
   cacheWriteTokens: 100,
   durationMs: 5000,
+  firstResponseMs: 500,
   firstTokenMs: 1250,
   providerId: 'openai',
   modelId: 'priced-model',
@@ -71,6 +72,123 @@ const _fullStats = TokenDisplayWidget(
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets(
+    'iOS popup stays open across repeated window metrics notifications',
+    (tester) async {
+      final settings = _PricedSettings();
+      addTearDown(settings.dispose);
+      await tester.pumpWidget(
+        _harness(
+          settings: settings,
+          child: const Center(child: _fullStats),
+        ),
+      );
+
+      await tester.tap(find.byType(TokenDisplayWidget));
+      await tester.pump();
+      expect(find.byType(TokenDetailPopup), findsOneWidget);
+
+      // iOS can send a metrics notification just after the opening tap,
+      // without changing the window geometry.
+      tester.binding.handleMetricsChanged();
+      await tester.pumpAndSettle();
+      expect(find.byType(TokenDetailPopup), findsOneWidget);
+
+      tester.binding.handleMetricsChanged();
+      await tester.pumpAndSettle();
+      expect(find.byType(TokenDetailPopup), findsOneWidget);
+
+      await tester.tapAt(const Offset(10, 10));
+      await tester.pumpAndSettle();
+      expect(find.byType(TokenDetailPopup), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+  );
+
+  testWidgets('open popup adapts to window resize and keyboard insets', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(400, 700);
+    tester.view.padding = const FakeViewPadding(top: 30, bottom: 20);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetPadding);
+    addTearDown(tester.view.resetViewInsets);
+    final settings = _PricedSettings();
+    addTearDown(settings.dispose);
+    await tester.pumpWidget(
+      _harness(
+        settings: settings,
+        child: const Padding(
+          padding: EdgeInsets.all(16),
+          child: Align(alignment: Alignment.bottomRight, child: _fullStats),
+        ),
+      ),
+    );
+    await tester.tap(find.byType(TokenDisplayWidget));
+    await tester.pumpAndSettle();
+    final initialPopup = tester.getRect(find.byType(TokenDetailPopup));
+
+    tester.view.physicalSize = const Size(700, 400);
+    await tester.pumpAndSettle();
+    expect(find.byType(TokenDetailPopup), findsOneWidget);
+    final resizedPopup = tester.getRect(find.byType(TokenDetailPopup));
+    final resizedAnchor = tester.getRect(find.byType(TokenDisplayWidget));
+    expect(resizedPopup, isNot(initialPopup));
+    expect(resizedAnchor.top - resizedPopup.bottom, closeTo(8, 0.01));
+    expect(resizedPopup.top, greaterThanOrEqualTo(38));
+    expect(resizedPopup.bottom, lessThanOrEqualTo(372));
+    expect(resizedPopup.left, greaterThanOrEqualTo(8));
+    expect(resizedPopup.right, lessThanOrEqualTo(692));
+
+    tester.view.viewInsets = const FakeViewPadding(bottom: 180);
+    await tester.pumpAndSettle();
+    expect(find.byType(TokenDetailPopup), findsOneWidget);
+    final keyboardPopup = tester.getRect(find.byType(TokenDetailPopup));
+    expect(keyboardPopup.top, greaterThanOrEqualTo(38));
+    expect(keyboardPopup.bottom, lessThanOrEqualTo(192));
+    expect(keyboardPopup.left, greaterThanOrEqualTo(8));
+    expect(keyboardPopup.right, lessThanOrEqualTo(692));
+    expect(tester.takeException(), isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+
+  testWidgets('popup updates keyboard bounds without moving its anchor', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(400, 700);
+    tester.view.viewInsets = const FakeViewPadding(bottom: 180);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetViewInsets);
+    final settings = _PricedSettings();
+    addTearDown(settings.dispose);
+    await tester.pumpWidget(
+      _harness(
+        settings: settings,
+        child: const Stack(
+          children: [Positioned(top: 170, right: 16, child: _fullStats)],
+        ),
+      ),
+    );
+    await tester.tap(find.byType(TokenDisplayWidget));
+    await tester.pumpAndSettle();
+    final anchor = tester.getRect(find.byType(TokenDisplayWidget));
+    final beforePopup = tester.getRect(find.byType(TokenDetailPopup));
+    expect(beforePopup.bottom, greaterThan(332));
+
+    tester.view.viewInsets = const FakeViewPadding(bottom: 360);
+    await tester.pumpAndSettle();
+    expect(tester.getRect(find.byType(TokenDisplayWidget)), anchor);
+    expect(find.byType(TokenDetailPopup), findsOneWidget);
+    final popup = tester.getRect(find.byType(TokenDetailPopup));
+    expect(popup.top, greaterThanOrEqualTo(8));
+    expect(popup.bottom, lessThanOrEqualTo(332));
+    expect(tester.takeException(), isNull);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
 
   testWidgets(
     'popup follows message layout changes without rebuilding the token label',
@@ -331,31 +449,34 @@ void main() {
     );
   }
 
-  testWidgets('shows first-token latency and speed for the whole generation', (
-    tester,
-  ) async {
-    final settings = SettingsProvider(createBusinessTestPreferences());
-    addTearDown(settings.dispose);
-    await tester.pumpWidget(
-      _harness(
-        settings: settings,
-        child: const TokenDetailPopup(
-          completionTokens: 30,
-          reasoningTokens: 20,
-          totalCompletionTokens: 50,
-          durationMs: 5000,
-          firstTokenMs: 1250,
+  testWidgets(
+    'shows distinct response and output latencies and generation speed',
+    (tester) async {
+      final settings = SettingsProvider(createBusinessTestPreferences());
+      addTearDown(settings.dispose);
+      await tester.pumpWidget(
+        _harness(
+          settings: settings,
+          child: const TokenDetailPopup(
+            completionTokens: 30,
+            reasoningTokens: 20,
+            totalCompletionTokens: 50,
+            durationMs: 5000,
+            firstResponseMs: 500,
+            firstTokenMs: 1250,
+          ),
         ),
-      ),
-    );
-    await tester.pump();
+      );
+      await tester.pump();
 
-    expect(find.text('1.25s (first token)'), findsOneWidget);
-    expect(find.text('10.0 tok/s'), findsOneWidget);
-    expect(find.text('5.0s'), findsOneWidget);
-    expect(find.text('30 tokens'), findsOneWidget);
-    expect(tester.takeException(), isNull);
-  });
+      expect(find.text('0.50s (first response)'), findsOneWidget);
+      expect(find.text('1.25s (first output)'), findsOneWidget);
+      expect(find.text('10.0 tok/s'), findsOneWidget);
+      expect(find.text('5.0s'), findsOneWidget);
+      expect(find.text('30 tokens'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('omits unknown latency and speed without positive duration', (
     tester,
@@ -370,13 +491,14 @@ void main() {
     );
     await tester.pump();
 
-    expect(find.textContaining('(first token)'), findsNothing);
+    expect(find.textContaining('(first response)'), findsNothing);
+    expect(find.textContaining('(first output)'), findsNothing);
     expect(find.textContaining('tok/s'), findsNothing);
     expect(find.text('30 tokens'), findsOneWidget);
   });
 
   testWidgets(
-    'tap or hover opens the popup even with only a zero-ms first token',
+    'tap or hover opens the popup with only a zero-ms first response',
     (tester) async {
       final settings = SettingsProvider(createBusinessTestPreferences());
       addTearDown(settings.dispose);
@@ -384,7 +506,7 @@ void main() {
         _harness(
           settings: settings,
           child: const Center(
-            child: TokenDisplayWidget(totalTokens: 0, firstTokenMs: 0),
+            child: TokenDisplayWidget(totalTokens: 0, firstResponseMs: 0),
           ),
         ),
       );
@@ -401,7 +523,8 @@ void main() {
       }
       await tester.pumpAndSettle();
 
-      expect(find.text('0.00s (first token)'), findsOneWidget);
+      expect(find.text('0.00s (first response)'), findsOneWidget);
+      expect(find.textContaining('(first output)'), findsNothing);
       expect(tester.takeException(), isNull);
     },
     variant: TargetPlatformVariant({TargetPlatform.iOS, TargetPlatform.macOS}),

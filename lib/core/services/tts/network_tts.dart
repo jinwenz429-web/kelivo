@@ -6,8 +6,11 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:uuid/uuid.dart';
 
+import '../network/deepseek_endpoint.dart';
+
 enum NetworkTtsKind {
   openai,
+  deepseek,
   gemini,
   azure,
   minimax,
@@ -25,6 +28,8 @@ String networkTtsKindDisplayName(NetworkTtsKind k) {
   switch (k) {
     case NetworkTtsKind.openai:
       return 'OpenAI';
+    case NetworkTtsKind.deepseek:
+      return 'DeepSeek';
     case NetworkTtsKind.gemini:
       return 'Gemini';
     case NetworkTtsKind.azure:
@@ -95,6 +100,17 @@ abstract class TtsServiceOptions {
           baseUrl: (json['baseUrl'] ?? 'https://api.openai.com/v1').toString(),
           model: (json['model'] ?? 'gpt-4o-mini-tts').toString(),
           voice: (json['voice'] ?? 'alloy').toString(),
+        );
+      case 'deepseek':
+        return DeepSeekTtsOptions(
+          id: id.isEmpty ? null : id,
+          enabled: enabled,
+          name: name.isEmpty ? 'DeepSeek TTS' : name,
+          apiKey: (json['apiKey'] ?? '').toString(),
+          baseUrl: (json['baseUrl'] ?? DeepSeekTtsOptions.defaultBaseUrl)
+              .toString(),
+          voiceId: (json['voiceId'] ?? DeepSeekTtsOptions.defaultVoiceId)
+              .toString(),
         );
       case 'gemini':
         return GeminiTtsOptions(
@@ -308,6 +324,36 @@ class OpenAiTtsOptions extends TtsServiceOptions {
     'baseUrl': baseUrl,
     'model': model,
     'voice': voice,
+  };
+}
+
+class DeepSeekTtsOptions extends TtsServiceOptions {
+  static const defaultBaseUrl = deepSeekApiBaseUrl;
+  static const defaultVoiceId = 'stella';
+  static const voiceIds = [defaultVoiceId, 'tide'];
+
+  final String apiKey;
+  final String baseUrl;
+  final String voiceId;
+
+  DeepSeekTtsOptions({
+    super.id,
+    required super.enabled,
+    required super.name,
+    required this.apiKey,
+    this.baseUrl = defaultBaseUrl,
+    this.voiceId = defaultVoiceId,
+  }) : super(kind: NetworkTtsKind.deepseek);
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'enabled': enabled,
+    'name': name,
+    'kind': kind.name,
+    'apiKey': apiKey,
+    'baseUrl': baseUrl,
+    'voiceId': voiceId,
   };
 }
 
@@ -802,6 +848,13 @@ class NetworkTtsService {
             c,
             cancelled,
           );
+        case NetworkTtsKind.deepseek:
+          return await _deepSeekSpeech(
+            options as DeepSeekTtsOptions,
+            text,
+            c,
+            cancelled,
+          );
         case NetworkTtsKind.gemini:
           return await _geminiSpeech(
             options as GeminiTtsOptions,
@@ -920,6 +973,61 @@ class NetworkTtsService {
       bytes: Uint8List.fromList(bytes),
       mime: 'audio/mpeg',
     );
+  }
+
+  static Future<NetworkTtsResult> _deepSeekSpeech(
+    DeepSeekTtsOptions opt,
+    String text,
+    http.Client client,
+    FutureOr<bool> Function()? cancelled,
+  ) async {
+    if (cancelled != null && await cancelled()) throw _Cancelled();
+    final uri = deepSeekToolEndpoint(Uri.parse(opt.baseUrl.trim()), 'tts');
+    final abort = Completer<void>();
+    final request =
+        http.AbortableRequest('POST', uri, abortTrigger: abort.future)
+          ..headers['Authorization'] = 'Bearer ${opt.apiKey}'
+          ..headers['Content-Type'] = 'application/json'
+          ..body = jsonEncode({
+            'text': text,
+            'voice_id': opt.voiceId,
+            'format': 'pcm',
+            'filter_markdown': false,
+          });
+    try {
+      final response = await _waitWithCancellation(
+        client.send(request).then(http.Response.fromStream),
+        cancelled,
+      );
+      if (response.statusCode != 200) {
+        throw Exception(
+          'DeepSeek TTS failed: ${response.statusCode} ${response.body}',
+        );
+      }
+      final type = response.headers['content-type']
+          ?.split(';')
+          .first
+          .trim()
+          .toLowerCase();
+      if (type != 'audio/pcm' && type != 'application/octet-stream') {
+        throw FormatException(
+          'DeepSeek TTS returned an unexpected content type: $type',
+        );
+      }
+      final pcm = response.bodyBytes;
+      if (pcm.isEmpty || pcm.length.isOdd) {
+        throw const FormatException(
+          'DeepSeek TTS returned incomplete 16-bit PCM audio.',
+        );
+      }
+      return NetworkTtsResult(
+        bytes: _pcmToWav(pcm, sampleRate: 24000),
+        mime: 'audio/wav',
+        sampleRate: 24000,
+      );
+    } finally {
+      abort.complete();
+    }
   }
 
   static Future<NetworkTtsResult> _geminiSpeech(
@@ -1237,12 +1345,30 @@ class NetworkTtsService {
       if (dataB64.isEmpty) continue;
       buf.add(base64Decode(dataB64));
     }
-    final pcm = buf.takeBytes();
-    if (pcm.isEmpty) {
+    final audioBytes = buf.takeBytes();
+    if (audioBytes.isEmpty) {
       throw Exception('Qwen TTS returned no audio data');
     }
+    if (audioBytes.lengthInBytes >= 4 &&
+        ByteData.sublistView(audioBytes).getUint32(0, Endian.little) ==
+            _riffFourCc) {
+      final wav = _parseWav(audioBytes, allowStreamingLengths: true);
+      final normalized = _encodeWav(wav.formatData, wav.audioData);
+      return NetworkTtsResult(
+        bytes: normalized,
+        mime: 'audio/wav',
+        sampleRate: ByteData.sublistView(
+          wav.formatData,
+        ).getUint32(4, Endian.little),
+      );
+    }
+    if (audioBytes.lengthInBytes.isOdd) {
+      throw const FormatException(
+        'Qwen PCM data is not aligned to 16-bit samples.',
+      );
+    }
     return NetworkTtsResult(
-      bytes: _pcmToWav(Uint8List.fromList(pcm), sampleRate: 24000),
+      bytes: _pcmToWav(audioBytes, sampleRate: 24000),
       mime: 'audio/wav',
       sampleRate: 24000,
     );
@@ -1942,18 +2068,24 @@ Future<bool> _moveNextWithCancellation<T>(
   }
 }
 
-Future<void> _waitWithCancellation(
-  Future<void> future,
+Future<T> _waitWithCancellation<T>(
+  Future<T> future,
   FutureOr<bool> Function()? cancelled,
 ) async {
   if (cancelled == null) return future;
-  while (true) {
-    final completed = await Future.any<bool>([
-      future.then((_) => true),
-      Future<bool>.delayed(const Duration(milliseconds: 50), () => false),
-    ]);
-    if (completed) return;
-    if (await cancelled()) throw _Cancelled();
+  var finished = false;
+  Future<T> watchCancellation() async {
+    while (!finished) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      if (!finished && await cancelled()) throw _Cancelled();
+    }
+    return future;
+  }
+
+  try {
+    return await Future.any([future, watchCancellation()]);
+  } finally {
+    finished = true;
   }
 }
 
@@ -2103,21 +2235,37 @@ Uint8List combineWavAudio(List<Uint8List> wavFiles) {
   }
   if (parsed.length == 1) return Uint8List.fromList(wavFiles.single);
 
+  return _encodeWav(format, parsed.expand((wav) => wav.audioData));
+}
+
+Uint8List _encodeWav(Uint8List format, Iterable<Uint8List> audioData) {
+  final formatTag = _supportedWavFormatTag(format);
+  final view = ByteData.sublistView(format);
+  final channels = view.getUint16(2, Endian.little);
+  final sampleRate = view.getUint32(4, Endian.little);
+  final byteRate = view.getUint32(8, Endian.little);
+  final blockAlign = view.getUint16(12, Endian.little);
+  final bitsPerSample = view.getUint16(14, Endian.little);
+  if (channels == 0 ||
+      sampleRate == 0 ||
+      bitsPerSample == 0 ||
+      bitsPerSample % 8 != 0 ||
+      blockAlign != channels * (bitsPerSample ~/ 8) ||
+      byteRate != sampleRate * blockAlign ||
+      (formatTag == 3 && bitsPerSample != 32 && bitsPerSample != 64)) {
+    throw const FormatException('Invalid WAV audio format.');
+  }
+
   final combinedData = BytesBuilder(copy: false);
-  for (final wav in parsed) {
-    for (final data in wav.audioData) {
-      combinedData.add(data);
+  for (final data in audioData) {
+    if (data.lengthInBytes % blockAlign != 0) {
+      throw const FormatException('Invalid WAV block alignment.');
     }
+    combinedData.add(data);
   }
   final audioBytes = combinedData.takeBytes();
   if (audioBytes.isEmpty) {
     throw const FormatException('WAV data chunk is empty.');
-  }
-
-  final formatTag = _supportedWavFormatTag(format);
-  final blockAlign = ByteData.sublistView(format).getUint16(12, Endian.little);
-  if (blockAlign == 0 || audioBytes.lengthInBytes % blockAlign != 0) {
-    throw const FormatException('Invalid WAV block alignment.');
   }
 
   final body = BytesBuilder(copy: false)..add(utf8.encode('WAVE'));
@@ -2143,7 +2291,10 @@ const int _waveFourCc = 0x45564157;
 const int _fmtFourCc = 0x20746d66;
 const int _dataFourCc = 0x61746164;
 
-({Uint8List formatData, List<Uint8List> audioData}) _parseWav(Uint8List bytes) {
+({Uint8List formatData, List<Uint8List> audioData}) _parseWav(
+  Uint8List bytes, {
+  bool allowStreamingLengths = false,
+}) {
   if (bytes.lengthInBytes < 12) {
     throw const FormatException('WAV file is too short.');
   }
@@ -2153,8 +2304,14 @@ const int _dataFourCc = 0x61746164;
     throw const FormatException('Invalid RIFF/WAVE header.');
   }
 
-  final riffEnd = 8 + view.getUint32(4, Endian.little);
-  if (riffEnd < 12 || riffEnd > bytes.lengthInBytes) {
+  final declaredSize = view.getUint32(4, Endian.little);
+  final declaredEnd = 8 + declaredSize;
+  final streamingRiff =
+      allowStreamingLengths &&
+      declaredEnd > bytes.lengthInBytes &&
+      _isStreamingWavLength(declaredSize);
+  final riffEnd = streamingRiff ? bytes.lengthInBytes : declaredEnd;
+  if (riffEnd < 12 || riffEnd != bytes.lengthInBytes) {
     throw const FormatException('Invalid RIFF size.');
   }
 
@@ -2168,8 +2325,17 @@ const int _dataFourCc = 0x61746164;
     final id = view.getUint32(offset, Endian.little);
     final size = view.getUint32(offset + 4, Endian.little);
     final dataStart = offset + 8;
-    final dataEnd = dataStart + size;
-    final paddedEnd = dataEnd + (size.isOdd ? 1 : 0);
+    // Streaming WAV writers may use a sentinel for data, or derive its size
+    // from the placeholder RIFF end (for example 0x7fffff9b in Qwen responses).
+    // Only the audio chunk may consume the remaining response in this case.
+    final streamingData =
+        allowStreamingLengths &&
+        id == _dataFourCc &&
+        dataStart + size > riffEnd &&
+        (_isStreamingWavLength(size) ||
+            (streamingRiff && dataStart + size == declaredEnd));
+    final dataEnd = streamingData ? riffEnd : dataStart + size;
+    final paddedEnd = dataEnd + (!streamingData && size.isOdd ? 1 : 0);
     if (dataEnd > riffEnd || paddedEnd > riffEnd) {
       throw const FormatException('Truncated WAV chunk data.');
     }
@@ -2191,6 +2357,9 @@ const int _dataFourCc = 0x61746164;
   }
   return (formatData: formatData, audioData: audioData);
 }
+
+bool _isStreamingWavLength(int size) =>
+    size == 0xffffffff || size == 0x7fffffff || size == 0x7fffffbf;
 
 int _supportedWavFormatTag(Uint8List format) {
   if (format.lengthInBytes < 16) {

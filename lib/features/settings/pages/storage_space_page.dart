@@ -1,22 +1,34 @@
+import '../widgets/custom_theme_widgets.dart';
+import '../widgets/attachment_cleanup_button.dart';
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:provider/provider.dart';
 
+import '../../../desktop/macos_window_drag_area.dart';
+import '../../../core/database/business_repository.dart';
 import '../../../core/services/chat/chat_service.dart';
 import '../../../core/services/haptics.dart';
+import '../../../core/services/logging/flutter_logger.dart';
+import '../../../core/services/logging/log_redactor.dart';
 import '../../../core/services/native_file_save.dart';
+import '../../../core/services/storage/attachment_file_lock.dart';
 import '../../../core/services/storage/storage_usage_service.dart';
+import '../../../core/services/storage/storage_attachment_usage.dart';
 import '../../../icons/lucide_adapter.dart';
 import '../../../l10n/app_localizations.dart';
 import '../../../shared/widgets/ios_checkbox.dart';
 import '../../../shared/widgets/ios_tactile.dart';
 import '../../../shared/widgets/ios_tile_button.dart';
+import '../../../shared/widgets/selection_back_scope.dart';
 import '../../../shared/widgets/snackbar.dart';
 import '../../../theme/app_font_weights.dart';
 import '../../../utils/platform_utils.dart';
+import '../../../utils/safe_resize_image.dart';
 import '../../backup/pages/local_snapshots_page.dart';
 import '../../chat/pages/image_viewer_page.dart';
 import '../../workspace/pages/environment_page.dart';
@@ -24,6 +36,7 @@ import '../../workspace/pages/skills_page.dart';
 import '../../workspace/pages/workspaces_page.dart';
 import 'log_viewer_page.dart';
 import '../widgets/storage_contents_list.dart';
+import '../widgets/windows_data_directory_tile.dart';
 import 'package:Kelivo/theme/app_semantic_colors.dart';
 import 'package:Kelivo/shared/widgets/section_card.dart';
 
@@ -40,9 +53,14 @@ Set<String>? _conversationIdsOrNull(BuildContext context) {
 }
 
 class StorageSpacePage extends StatefulWidget {
-  const StorageSpacePage({super.key, this.embedded = false});
+  const StorageSpacePage({
+    super.key,
+    this.embedded = false,
+    this.active = true,
+  });
 
   final bool embedded;
+  final bool active;
 
   @override
   State<StorageSpacePage> createState() => _StorageSpacePageState();
@@ -50,6 +68,8 @@ class StorageSpacePage extends StatefulWidget {
 
 class _StorageSpacePageState extends State<StorageSpacePage> {
   StorageUsageReport? _report;
+  late final StorageUploadSession _uploads;
+  int _reportRequest = 0;
   bool _loading = false;
   bool _clearing = false;
   StorageUsageCategoryKey _selected = StorageUsageCategoryKey.images;
@@ -57,16 +77,43 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
   @override
   void initState() {
     super.initState();
-    _refreshReport();
+    _uploads = StorageUploadSession(
+      readVersion: context
+          .read<BusinessRepository?>()
+          ?.readStorageChangeVersion,
+    );
+    if (widget.active) _refreshReport();
+  }
+
+  @override
+  void didUpdateWidget(covariant StorageSpacePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active != oldWidget.active) {
+      _reportRequest++;
+      _loading = false;
+      _report = null;
+      _uploads.reset(const StorageUploadFiles());
+      if (widget.active) _refreshReport();
+    }
+  }
+
+  @override
+  void dispose() {
+    _uploads.reset(const StorageUploadFiles());
+    super.dispose();
   }
 
   Future<StorageUsageReport?> _refreshReport() async {
     if (_loading) return _report;
+    final request = ++_reportRequest;
     setState(() => _loading = true);
     try {
-      final rep = await StorageUsageService.computeReport();
-      if (!mounted) return rep;
+      final rep = await StorageUsageService.computeReport(
+        includeUploadFiles: true,
+      );
+      if (!mounted || request != _reportRequest) return null;
       setState(() {
+        _uploads.reset(rep.uploads);
         _report = rep;
         _loading = false;
         final keys = rep.categories.map((c) => c.key).toSet();
@@ -76,7 +123,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       });
       return rep;
     } catch (_) {
-      if (!mounted) return null;
+      if (!mounted || request != _reportRequest) return null;
       setState(() => _loading = false);
       return null;
     }
@@ -108,7 +155,6 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       StorageUsageCategoryKey.restoreTraces,
       StorageUsageCategoryKey.displacedDatabases,
       StorageUsageCategoryKey.localSnapshots,
-      StorageUsageCategoryKey.assistantData,
       StorageUsageCategoryKey.cache,
       StorageUsageCategoryKey.logs,
       StorageUsageCategoryKey.workspaceFiles,
@@ -136,8 +182,6 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
         return Lucide.Database;
       case StorageUsageCategoryKey.localSnapshots:
         return Lucide.Shield;
-      case StorageUsageCategoryKey.assistantData:
-        return Lucide.Bot;
       case StorageUsageCategoryKey.cache:
         return Lucide.Boxes;
       case StorageUsageCategoryKey.logs:
@@ -171,8 +215,6 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
         return l10n.storageSpaceCategoryDisplacedDatabases;
       case StorageUsageCategoryKey.localSnapshots:
         return l10n.localSnapshotSectionTitle;
-      case StorageUsageCategoryKey.assistantData:
-        return l10n.storageSpaceCategoryAssistantData;
       case StorageUsageCategoryKey.cache:
         return l10n.storageSpaceCategoryCache;
       case StorageUsageCategoryKey.logs:
@@ -214,12 +256,11 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
         return l10n.storageSpaceCategoryFonts;
       case 'local_models':
         return l10n.storageSpaceCategoryLocalModels;
+      case 'retained_data':
+        return l10n.recoveryRetainedData;
+      case 'app_documents':
       case 'app':
         return l10n.storageSpaceSubOtherApp;
-      case 'avatars':
-        return l10n.storageSpaceSubAssistantAvatars;
-      case 'images':
-        return l10n.storageSpaceSubAssistantImages;
       case 'avatar_cache':
         return l10n.storageSpaceSubCacheAvatars;
       case 'other_cache':
@@ -280,7 +321,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -314,7 +355,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -348,7 +389,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -382,7 +423,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -416,7 +457,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearLegacyChatDataConfirmMessage,
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -450,7 +491,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearRestoreTracesConfirmMessage,
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -484,7 +525,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearDisplacedDatabasesConfirmMessage,
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -518,7 +559,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -552,7 +593,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -592,7 +633,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       ),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -628,6 +669,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
     await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => _StorageCategoryPage(
+          uploads: _uploads,
           title: title,
           categoryKey: key,
           initialReport: report,
@@ -641,6 +683,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
 
   @override
   Widget build(BuildContext context) {
+    if (!widget.active) return const SizedBox.shrink();
     final cs = Theme.of(context).colorScheme;
     final l10n = AppLocalizations.of(context)!;
     final isDesktop = PlatformUtils.isDesktopTarget;
@@ -684,6 +727,11 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
         ),
         title: Text(l10n.storageSpacePageTitle),
         actions: [
+          AttachmentCleanupButton(
+            onChanged: () async {
+              await _refreshReport();
+            },
+          ),
           IosIconButton(
             icon: Lucide.RefreshCw,
             size: 20,
@@ -727,6 +775,13 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
             ),
           ),
           const Spacer(),
+          AttachmentCleanupButton(
+            size: 18,
+            minSize: 32,
+            onChanged: () async {
+              await _refreshReport();
+            },
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 8, top: 2),
             child: IosIconButton(
@@ -750,6 +805,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              if (PlatformUtils.isWindows) const WindowsDataDirectoryTile(),
               Row(
                 children: [
                   Text(
@@ -794,6 +850,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
                     ),
                     Expanded(
                       child: _CategoryDetail(
+                        uploads: _uploads,
                         category: selectedCat,
                         title: _titleFor(selectedCat.key, l10n),
                         fmtBytes: _fmtBytes,
@@ -839,7 +896,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          topBar,
+          MacosWindowDragArea(child: topBar),
           Expanded(child: content),
         ],
       );
@@ -931,6 +988,7 @@ class _StorageSpacePageState extends State<StorageSpacePage> {
 
 class _StorageCategoryPage extends StatefulWidget {
   const _StorageCategoryPage({
+    required this.uploads,
     required this.title,
     required this.categoryKey,
     required this.initialReport,
@@ -940,6 +998,7 @@ class _StorageCategoryPage extends StatefulWidget {
   });
 
   final String title;
+  final StorageUploadSession uploads;
   final StorageUsageCategoryKey categoryKey;
   final StorageUsageReport initialReport;
   final String Function(int) fmtBytes;
@@ -1009,7 +1068,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1042,7 +1101,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1075,7 +1134,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1108,7 +1167,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1141,7 +1200,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearLegacyChatDataConfirmMessage,
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1181,7 +1240,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearDisplacedDatabasesConfirmMessage,
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1221,7 +1280,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearRestoreTracesConfirmMessage,
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1260,7 +1319,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1293,7 +1352,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       message: l10n.storageSpaceClearConfirmMessage(targetName),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1332,7 +1391,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       ),
       actionLabel: l10n.storageSpaceClearButton,
     );
-    if (!ok) return;
+    if (!ok || !mounted) return;
 
     setState(() => _clearing = true);
     try {
@@ -1391,6 +1450,7 @@ class _StorageCategoryPageState extends State<_StorageCategoryPage> {
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: _CategoryDetail(
+          uploads: widget.uploads,
           category: category,
           title: widget.title,
           fmtBytes: widget.fmtBytes,
@@ -1619,6 +1679,7 @@ class _CategoryMenu extends StatelessWidget {
 
 class _CategoryDetail extends StatelessWidget {
   const _CategoryDetail({
+    required this.uploads,
     required this.category,
     required this.title,
     required this.fmtBytes,
@@ -1638,6 +1699,7 @@ class _CategoryDetail extends StatelessWidget {
   });
 
   final StorageUsageCategory category;
+  final StorageUploadSession uploads;
   final String title;
   final String Function(int) fmtBytes;
   final String Function(String) subTitleFor;
@@ -1805,39 +1867,14 @@ class _CategoryDetail extends StatelessWidget {
 
     if (category.key == StorageUsageCategoryKey.images ||
         category.key == StorageUsageCategoryKey.files) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: TextStyle(fontSize: 16, fontWeight: AppFontWeights.emphasis),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            subtitle,
-            style: TextStyle(
-              fontSize: 12.5,
-              color: cs.onSurface.withValues(alpha: 0.7),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            hint,
-            style: TextStyle(
-              fontSize: 12.5,
-              color: cs.onSurface.withValues(alpha: 0.7),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Expanded(
-            child: _UploadManager(
-              key: ValueKey(category.key),
-              images: category.key == StorageUsageCategoryKey.images,
-              refreshReport: refreshReport,
-              fmtBytes: fmtBytes,
-            ),
-          ),
-        ],
+      return _UploadManager(
+        key: ValueKey(category.key),
+        uploads: uploads,
+        images: category.key == StorageUsageCategoryKey.images,
+        category: category,
+        title: title,
+        refreshReport: refreshReport,
+        fmtBytes: fmtBytes,
       );
     }
 
@@ -2062,12 +2099,18 @@ class _CategoryDetail extends StatelessWidget {
 class _UploadManager extends StatefulWidget {
   const _UploadManager({
     super.key,
+    required this.uploads,
     required this.images,
+    required this.category,
+    required this.title,
     required this.refreshReport,
     required this.fmtBytes,
   });
 
   final bool images;
+  final StorageUploadSession uploads;
+  final StorageUsageCategory category;
+  final String title;
   final Future<void> Function() refreshReport;
   final String Function(int) fmtBytes;
 
@@ -2075,72 +2118,182 @@ class _UploadManager extends StatefulWidget {
   State<_UploadManager> createState() => _UploadManagerState();
 }
 
-enum _StorageImageSourceFilter { all, userUpload, assistant }
+enum _StorageImageFilter { all, chat, tool, avatar }
 
 enum _StorageEntrySort { newest, oldest, largest, smallest }
 
 class _UploadManagerState extends State<_UploadManager> {
-  bool _loading = false;
+  ({String summary, String details})? _loadFailure;
+  bool _deleting = false;
   List<StorageFileEntry> _entries = const <StorageFileEntry>[];
   List<StorageFileEntry> _visibleEntries = const <StorageFileEntry>[];
   final Set<String> _selected = <String>{};
-  _StorageImageSourceFilter _sourceFilter = _StorageImageSourceFilter.all;
+  _StorageImageFilter _imageFilter = _StorageImageFilter.all;
   _StorageEntrySort _sort = _StorageEntrySort.newest;
 
-  bool get _selectMode => _selected.isNotEmpty;
+  bool get _selectMode => _usageReady && _selected.isNotEmpty;
+
+  bool get _usageReady => _entries.isNotEmpty && _entries.first.isInUse != null;
+  int _request = 0;
+  Timer? _changeTimer;
+  StreamSubscription<void>? _databaseChanges;
+  StreamSubscription<void>? _transientChanges;
 
   @override
   void initState() {
     super.initState();
+    _databaseChanges = context
+        .read<BusinessRepository?>()
+        ?.attachmentChanges
+        .listen(
+          (_) => _referencesChanged(),
+          onError: (Object error) {
+            if (_loadFailure == null) _referencesChanged();
+          },
+        );
+    _transientChanges = AttachmentFileLock.transientChanges.listen(
+      (_) => _referencesChanged(),
+    );
     _load();
   }
 
   @override
   void didUpdateWidget(covariant _UploadManager oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.images != widget.images) {
-      // When switching between Images <-> Files on desktop, ensure we reload with the new filter.
-      setState(() {
-        _selected.clear();
-        _entries = const <StorageFileEntry>[];
-        _visibleEntries = const <StorageFileEntry>[];
-        _loading = false;
-        _sourceFilter = _StorageImageSourceFilter.all;
-        _sort = _StorageEntrySort.newest;
-      });
+    if (widget.category != oldWidget.category ||
+        widget.uploads != oldWidget.uploads) {
       _load();
     }
   }
 
-  Future<void> _load() async {
-    if (_loading) return;
-    setState(() => _loading = true);
-    try {
-      final list = await StorageUsageService.listUploadEntries(
-        images: widget.images,
-      );
-      if (!mounted) return;
+  @override
+  void dispose() {
+    _changeTimer?.cancel();
+    // Changes during the gap between detail routes have no subscriber. A
+    // still-running directory walk must not become the next route's inventory.
+    widget.uploads.invalidateDirectory();
+    _databaseChanges?.cancel();
+    _transientChanges?.cancel();
+    super.dispose();
+  }
+
+  void _showFiles(StorageUploadFiles files) {
+    _entries = widget.images ? files.images : files.files;
+    _visibleEntries = _buildVisibleEntries();
+  }
+
+  void _referencesChanged() {
+    if (!mounted) return;
+    widget.uploads.invalidateDirectory();
+    _request++;
+    if (_usageReady || _loadFailure != null) {
       setState(() {
-        _entries = list;
-        _visibleEntries = _buildVisibleEntries();
-        final paths = _entries.map((e) => e.path).toSet();
-        _selected.removeWhere((p) => !paths.contains(p));
+        _loadFailure = null;
+        _showFiles(widget.uploads.directory);
       });
-    } finally {
-      if (mounted) setState(() => _loading = false);
     }
+    _changeTimer?.cancel();
+    // Streaming changes can arrive in bursts. Refresh once they settle.
+    _changeTimer = Timer(const Duration(milliseconds: 300), () {
+      _changeTimer = null;
+      if (mounted) _checkUsage(_request);
+    });
+  }
+
+  void _load() {
+    _changeTimer?.cancel();
+    _changeTimer = null;
+    final request = ++_request;
+    _selected.clear();
+    _loadFailure = null;
+    _showFiles(widget.uploads.directory);
+    // Paint the inventory already gathered by the overview before gathering
+    // any live chat references or starting the SQLite worker.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _request == request) _checkUsage(request);
+    });
+  }
+
+  Future<void> _checkUsage(int request) async {
+    try {
+      final session = widget.uploads;
+      final files = await session.refreshDirectory();
+      if (!mounted || _request != request) return;
+      if (files == null) {
+        _referencesChanged();
+        return;
+      }
+      if (!identical(_entries, widget.images ? files.images : files.files)) {
+        setState(() => _showFiles(files));
+      }
+      if (_entries.isEmpty) return;
+      final checked = await session.inspect();
+      if (mounted && _request == request) {
+        setState(() {
+          _loadFailure = null;
+          _showFiles(checked);
+          if (_selected.isNotEmpty) {
+            final selectable = _visibleEntries
+                .where((e) => e.canDelete)
+                .map((e) => e.path)
+                .toSet();
+            _selected.removeWhere((path) => !selectable.contains(path));
+          }
+        });
+        if (_entries.isNotEmpty && !_usageReady) _referencesChanged();
+      }
+    } catch (error, stack) {
+      if (!mounted || _request != request) return;
+      // A FormatException's source can contain the private message payload.
+      final message = error is FormatException
+          ? error.message
+          : error.toString();
+      final reason = LogRedactor.redactText(message.split('\n').first);
+      final type = error.runtimeType.toString();
+      final summary = reason.startsWith(type) ? reason : '$type: $reason';
+      final details = '$summary\n$stack';
+      FlutterLogger.log(details, tag: 'StorageAttachments');
+      setState(() {
+        _loadFailure = (summary: summary, details: details);
+        _selected.clear();
+        _showFiles(widget.uploads.directory);
+      });
+    }
+  }
+
+  Future<void> _copyLoadFailure(String details) async {
+    var copied = true;
+    try {
+      await Clipboard.setData(ClipboardData(text: details));
+    } on Exception {
+      copied = false;
+    }
+    if (!mounted) return;
+    final l10n = AppLocalizations.of(context)!;
+    showAppSnackBar(
+      context,
+      message: copied
+          ? l10n.chatMessageWidgetCopiedToClipboard
+          : l10n.storageSpaceCopyErrorFailed,
+      type: copied ? NotificationType.success : NotificationType.error,
+    );
   }
 
   List<StorageFileEntry> _buildVisibleEntries() {
     if (!widget.images) return _entries;
+    final filter = _usageReady ? _imageFilter : _StorageImageFilter.all;
+    if (filter == _StorageImageFilter.all &&
+        _sort == _StorageEntrySort.newest) {
+      return _entries;
+    }
 
     final entries = _entries.where((entry) {
-      return switch (_sourceFilter) {
-        _StorageImageSourceFilter.all => true,
-        _StorageImageSourceFilter.userUpload =>
-          entry.source == StorageFileSource.userUpload,
-        _StorageImageSourceFilter.assistant =>
-          entry.source == StorageFileSource.assistant,
+      return switch (filter) {
+        _StorageImageFilter.all => true,
+        _StorageImageFilter.chat => entry.imageKind == StorageImageKind.chat,
+        _StorageImageFilter.tool => entry.imageKind == StorageImageKind.tool,
+        _StorageImageFilter.avatar =>
+          entry.imageKind == StorageImageKind.avatar,
       };
     }).toList();
 
@@ -2156,10 +2309,10 @@ class _UploadManagerState extends State<_UploadManager> {
     return entries;
   }
 
-  void _setSourceFilter(_StorageImageSourceFilter filter) {
-    if (_sourceFilter == filter) return;
+  void _setImageFilter(_StorageImageFilter filter) {
+    if (!_usageReady || _imageFilter == filter) return;
     setState(() {
-      _sourceFilter = filter;
+      _imageFilter = filter;
       _visibleEntries = _buildVisibleEntries();
       _selected.clear();
     });
@@ -2174,6 +2327,9 @@ class _UploadManagerState extends State<_UploadManager> {
   }
 
   void _toggleSelect(String path) {
+    if (!_visibleEntries.any((e) => e.path == path && e.canDelete)) {
+      return;
+    }
     setState(() {
       if (_selected.contains(path)) {
         _selected.remove(path);
@@ -2187,7 +2343,7 @@ class _UploadManagerState extends State<_UploadManager> {
     setState(() {
       _selected
         ..clear()
-        ..addAll(entries.map((e) => e.path));
+        ..addAll(entries.where((e) => e.canDelete).map((e) => e.path));
     });
   }
 
@@ -2196,40 +2352,60 @@ class _UploadManagerState extends State<_UploadManager> {
   }
 
   Future<void> _deleteSelected() async {
-    if (_selected.isEmpty) return;
+    if (!_usageReady || _selected.isEmpty || _deleting) return;
     final l10n = AppLocalizations.of(context)!;
-    final count = _selected.length;
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) {
-        return AlertDialog(
-          title: Text(l10n.storageSpaceDeleteConfirmTitle),
-          content: Text(l10n.storageSpaceDeleteUploadsConfirmMessage(count)),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
-              child: Text(l10n.homePageCancel),
-            ),
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(true),
-              child: Text(l10n.homePageDelete),
-            ),
-          ],
-        );
-      },
+    // Back can clear or replace the selection while deletion awaits file I/O.
+    // Keep the targets shown in this confirmation independent of that UI state.
+    final pathsToDelete = _selected.toList(growable: false);
+    final count = pathsToDelete.length;
+    final ok = await showAppDialog<bool>(
+      context,
+      maxWidth: 420,
+      child: Builder(
+        builder: (ctx) => Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(l10n.storageAttachmentDeleteConfirm(count)),
+              const SizedBox(height: 20),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  IosTileButton(
+                    label: l10n.homePageCancel,
+                    icon: Lucide.X,
+                    onTap: () => Navigator.of(ctx).pop(false),
+                  ),
+                  IosTileButton(
+                    label: l10n.homePageDelete,
+                    icon: Lucide.Trash2,
+                    backgroundColor: Theme.of(ctx).colorScheme.error,
+                    onTap: () => Navigator.of(ctx).pop(true),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
     );
-    if (ok != true) return;
+    if (ok != true || !mounted || !_usageReady) return;
+    setState(() => _deleting = true);
 
     try {
       final deleted = await StorageUsageService.deleteUploadFiles(
-        _selected,
+        pathsToDelete,
         images: widget.images,
       );
       if (!mounted) return;
       _clearSelection();
       showAppSnackBar(
         context,
-        message: l10n.storageSpaceDeletedUploadsDone(deleted),
+        message: deleted < count
+            ? l10n.storageSpaceDeletedUploadsPartial(deleted, count - deleted)
+            : l10n.storageSpaceDeletedUploadsDone(deleted),
         type: NotificationType.success,
       );
     } catch (error) {
@@ -2240,7 +2416,7 @@ class _UploadManagerState extends State<_UploadManager> {
         type: NotificationType.error,
       );
     }
-    await _load();
+    if (mounted) setState(() => _deleting = false);
     await widget.refreshReport();
   }
 
@@ -2298,159 +2474,211 @@ class _UploadManagerState extends State<_UploadManager> {
     final cs = Theme.of(context).colorScheme;
     final l10n = AppLocalizations.of(context)!;
 
-    if (_loading && _entries.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    if (_entries.isEmpty) {
-      return Center(
-        child: Text(
-          l10n.storageSpaceNoUploads,
-          style: TextStyle(color: cs.onSurface.withValues(alpha: 0.7)),
-        ),
-      );
-    }
-
     final entries = _visibleEntries;
     final actions = Wrap(
       spacing: 10,
       runSpacing: 10,
       children: [
         IosTileButton(
+          label: l10n.storageAttachmentCleanUnused,
+          icon: Lucide.Trash2,
+          enabled: _usageReady && !_deleting && entries.any((e) => e.canDelete),
+          onTap: () {
+            _selectAll(entries);
+            _deleteSelected();
+          },
+        ),
+        IosTileButton(
           label: _selectMode
               ? l10n.storageSpaceClearSelection
               : l10n.storageSpaceSelectAll,
           icon: _selectMode ? Lucide.XCircle : Lucide.CheckSquare,
           backgroundColor: cs.primary,
-          enabled: entries.isNotEmpty,
+          enabled: _usageReady && !_deleting && entries.any((e) => e.canDelete),
           onTap: _selectMode ? _clearSelection : () => _selectAll(entries),
         ),
         IosTileButton(
           label: l10n.homePageDelete,
           icon: Lucide.Trash2,
           backgroundColor: cs.error,
-          enabled: _selected.isNotEmpty,
+          enabled: _usageReady && !_deleting && _selected.isNotEmpty,
           onTap: _deleteSelected,
         ),
       ],
     );
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        if (widget.images) ...[
-          _StorageImageOrganizer(
-            sourceFilter: _sourceFilter,
-            sort: _sort,
-            onSourceChanged: _setSourceFilter,
-            onSortChanged: _setSort,
-          ),
-          const SizedBox(height: 12),
-        ],
-        actions,
-        const SizedBox(height: 12),
-        Expanded(
-          child: CustomScrollView(
-            slivers: [
-              SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.only(bottom: 10),
-                  child: Text(
-                    _selectMode
-                        ? l10n.storageSpaceSelectedCount(_selected.length)
-                        : l10n.storageSpaceUploadsCount(entries.length),
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      color: cs.onSurface.withValues(alpha: 0.65),
-                    ),
-                  ),
+    final content = CustomScrollView(
+      slivers: [
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.title,
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: AppFontWeights.emphasis,
                 ),
               ),
-              if (entries.isEmpty)
-                SliverFillRemaining(
-                  hasScrollBody: false,
-                  child: Center(
-                    child: Text(
-                      l10n.storageSpaceNoUploads,
-                      style: TextStyle(
-                        color: cs.onSurface.withValues(alpha: 0.7),
-                      ),
-                    ),
-                  ),
-                )
-              else if (widget.images)
-                SliverPadding(
-                  padding: const EdgeInsets.only(bottom: 16),
-                  sliver: SliverGrid(
-                    gridDelegate:
-                        const SliverGridDelegateWithMaxCrossAxisExtent(
-                          maxCrossAxisExtent: 140,
-                          mainAxisSpacing: 10,
-                          crossAxisSpacing: 10,
-                          childAspectRatio: 1,
-                        ),
-                    delegate: SliverChildBuilderDelegate((context, index) {
-                      final e = entries[index];
-                      final selected = _selected.contains(e.path);
-                      return _ImageTile(
-                        path: e.path,
-                        selected: selected,
-                        onToggle: () => _toggleSelect(e.path),
-                        onTap: () {
-                          if (_selectMode) {
-                            _toggleSelect(e.path);
-                          } else {
-                            _openImageViewer(entries, index);
-                          }
-                        },
-                        onLongPress: () => _toggleSelect(e.path),
-                      );
-                    }, childCount: entries.length),
-                  ),
-                )
-              else
-                SliverList(
-                  delegate: SliverChildBuilderDelegate((context, index) {
-                    final e = entries[index];
-                    final selected = _selected.contains(e.path);
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: _FileRow(
-                        entry: e,
-                        selected: selected,
-                        fmtBytes: widget.fmtBytes,
-                        onTap: () {
-                          if (_selectMode) {
-                            _toggleSelect(e.path);
-                          } else {
-                            _openFile(e.path);
-                          }
-                        },
-                        onLongPress: () => _toggleSelect(e.path),
-                        onToggle: () => _toggleSelect(e.path),
-                      ),
-                    );
-                  }, childCount: entries.length),
+              const SizedBox(height: 6),
+              Text(
+                widget.fmtBytes(
+                  entries.fold<int>(0, (sum, entry) => sum + entry.bytes),
                 ),
+                key: const ValueKey('storage-visible-bytes'),
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: cs.onSurface.withValues(alpha: 0.7),
+                ),
+              ),
+              const SizedBox(height: 8),
+              if (_loadFailure case final failure?) ...[
+                Text(
+                  _entries.isEmpty
+                      ? l10n.storageSpaceLoadFailed
+                      : l10n.storageAttachmentCheckFailed,
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  failure.summary,
+                  style: Theme.of(context).textTheme.bodySmall,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 8),
+                IosTileButton(
+                  icon: Lucide.Copy,
+                  label: l10n.storageSpaceCopyErrorDetails,
+                  onTap: () => _copyLoadFailure(failure.details),
+                ),
+              ] else if (_entries.isNotEmpty)
+                Text(
+                  _usageReady
+                      ? l10n.storageAttachmentProtectedHint
+                      : l10n.storageAttachmentChecking,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: cs.onSurface.withValues(alpha: 0.7),
+                  ),
+                ),
+              const SizedBox(height: 12),
+              if (widget.images) ...[
+                _StorageImageOrganizer(
+                  imageFilter: _usageReady
+                      ? _imageFilter
+                      : _StorageImageFilter.all,
+                  sort: _sort,
+                  onImageChanged: _usageReady ? _setImageFilter : null,
+                  onSortChanged: _setSort,
+                ),
+                const SizedBox(height: 12),
+              ],
+              if (entries.isNotEmpty && _loadFailure == null) ...[
+                actions,
+                const SizedBox(height: 12),
+              ],
             ],
           ),
         ),
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Text(
+              _selectMode
+                  ? l10n.storageSpaceSelectedCount(_selected.length)
+                  : l10n.storageSpaceUploadsCount(entries.length),
+              style: TextStyle(
+                fontSize: 12.5,
+                color: cs.onSurface.withValues(alpha: 0.65),
+              ),
+            ),
+          ),
+        ),
+        if (entries.isEmpty)
+          SliverFillRemaining(
+            hasScrollBody: false,
+            child: Center(
+              child: Text(
+                l10n.storageSpaceNoUploads,
+                style: TextStyle(color: cs.onSurface.withValues(alpha: 0.7)),
+              ),
+            ),
+          )
+        else if (widget.images)
+          SliverPadding(
+            padding: const EdgeInsets.only(bottom: 16),
+            sliver: SliverGrid(
+              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 140,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
+                childAspectRatio: 1,
+              ),
+              delegate: SliverChildBuilderDelegate((context, index) {
+                final e = entries[index];
+                final selected = _selectMode && _selected.contains(e.path);
+                return _ImageTile(
+                  key: ValueKey('storage-image-${e.path}'),
+                  entry: e,
+                  selected: selected,
+                  onToggle: () => _toggleSelect(e.path),
+                  onTap: () {
+                    if (_selectMode && e.canDelete) {
+                      _toggleSelect(e.path);
+                    } else {
+                      _openImageViewer(entries, index);
+                    }
+                  },
+                  onLongPress: () => _toggleSelect(e.path),
+                );
+              }, childCount: entries.length),
+            ),
+          )
+        else
+          SliverList(
+            delegate: SliverChildBuilderDelegate((context, index) {
+              final e = entries[index];
+              final selected = _selectMode && _selected.contains(e.path);
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: _FileRow(
+                  entry: e,
+                  selected: selected,
+                  fmtBytes: widget.fmtBytes,
+                  onTap: () {
+                    if (_selectMode && e.canDelete) {
+                      _toggleSelect(e.path);
+                    } else {
+                      _openFile(e.path);
+                    }
+                  },
+                  onLongPress: () => _toggleSelect(e.path),
+                  onToggle: () => _toggleSelect(e.path),
+                ),
+              );
+            }, childCount: entries.length),
+          ),
       ],
+    );
+    return SelectionBackScope(
+      selecting: _selectMode,
+      onCancel: _clearSelection,
+      child: content,
     );
   }
 }
 
 class _StorageImageOrganizer extends StatelessWidget {
   const _StorageImageOrganizer({
-    required this.sourceFilter,
+    required this.imageFilter,
     required this.sort,
-    required this.onSourceChanged,
+    required this.onImageChanged,
     required this.onSortChanged,
   });
 
-  final _StorageImageSourceFilter sourceFilter;
+  final _StorageImageFilter imageFilter;
   final _StorageEntrySort sort;
-  final ValueChanged<_StorageImageSourceFilter> onSourceChanged;
+  final ValueChanged<_StorageImageFilter>? onImageChanged;
   final ValueChanged<_StorageEntrySort> onSortChanged;
 
   @override
@@ -2458,21 +2686,16 @@ class _StorageImageOrganizer extends StatelessWidget {
     final l10n = AppLocalizations.of(context)!;
     return Column(
       children: [
-        _StorageChoiceRow<_StorageImageSourceFilter>(
-          label: l10n.storageSpaceSourceLabel,
-          value: sourceFilter,
+        _StorageChoiceRow<_StorageImageFilter>(
+          label: l10n.storageSpaceImageTypeLabel,
+          value: imageFilter,
           options: [
-            (_StorageImageSourceFilter.all, l10n.storageSpaceSourceAll),
-            (
-              _StorageImageSourceFilter.userUpload,
-              l10n.storageSpaceSourceUserUpload,
-            ),
-            (
-              _StorageImageSourceFilter.assistant,
-              l10n.storageSpaceSourceAssistant,
-            ),
+            (_StorageImageFilter.all, l10n.storageSpaceImageTypeAll),
+            (_StorageImageFilter.chat, l10n.storageSpaceImageTypeChat),
+            (_StorageImageFilter.tool, l10n.storageSpaceImageTypeTool),
+            (_StorageImageFilter.avatar, l10n.storageSpaceImageTypeAvatar),
           ],
-          onChanged: onSourceChanged,
+          onChanged: onImageChanged,
         ),
         const SizedBox(height: 8),
         _StorageChoiceRow<_StorageEntrySort>(
@@ -2502,7 +2725,7 @@ class _StorageChoiceRow<T> extends StatelessWidget {
   final String label;
   final T value;
   final List<(T, String)> options;
-  final ValueChanged<T> onChanged;
+  final ValueChanged<T>? onChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -2543,9 +2766,12 @@ class _StorageChoiceRow<T> extends StatelessWidget {
                     for (int index = 0; index < options.length; index++) ...[
                       Semantics(
                         button: true,
+                        enabled: onChanged != null,
                         selected: options[index].$1 == value,
                         child: IosCardPress(
-                          onTap: () => onChanged(options[index].$1),
+                          onTap: onChanged == null
+                              ? null
+                              : () => onChanged!(options[index].$1),
                           haptics: false,
                           pressedScale: 1.0,
                           borderRadius: BorderRadius.circular(8),
@@ -2584,14 +2810,18 @@ class _StorageChoiceRow<T> extends StatelessWidget {
 
 class _ImageTile extends StatelessWidget {
   const _ImageTile({
-    required this.path,
+    super.key,
+    required this.entry,
     required this.selected,
     required this.onToggle,
     required this.onTap,
     required this.onLongPress,
   });
 
-  final String path;
+  static const _maxTileEdge = 1024;
+  static const _maxDecodeEdge = 4096;
+
+  final StorageFileEntry entry;
   final bool selected;
   final VoidCallback onToggle;
   final VoidCallback onTap;
@@ -2607,7 +2837,7 @@ class _ImageTile extends StatelessWidget {
         final side = constraints.maxWidth.isFinite && constraints.maxWidth > 0
             ? constraints.maxWidth
             : 140.0;
-        final int cachePx = (side * dpr).clamp(64.0, 1024.0).round();
+        final cachePx = (side * dpr).clamp(64, _maxTileEdge).round();
 
         return Container(
           decoration: BoxDecoration(
@@ -2628,11 +2858,16 @@ class _ImageTile extends StatelessWidget {
             child: Stack(
               fit: StackFit.expand,
               children: [
-                Image.file(
-                  File(path),
+                Image(
+                  image: SafeResizeImage.wrap(
+                    FileImage(File(entry.path)),
+                    width: cachePx,
+                    height: cachePx,
+                    fit: SafeResizeFit.cover,
+                    maxEdge: _maxDecodeEdge,
+                    maxPixels: _maxTileEdge * _maxTileEdge,
+                  ),
                   fit: BoxFit.cover,
-                  cacheWidth: cachePx,
-                  cacheHeight: cachePx,
                   filterQuality: FilterQuality.low,
                   errorBuilder: (_, __, ___) {
                     return Container(
@@ -2646,25 +2881,122 @@ class _ImageTile extends StatelessWidget {
                     );
                   },
                 ),
-                Positioned(
-                  top: 6,
-                  right: 6,
-                  child: IosCheckbox(
-                    value: selected,
-                    size: 20,
-                    hitTestSize: 22,
-                    borderWidth: 1.6,
-                    activeColor: cs.primary,
-                    borderColor: cs.primary.withValues(alpha: 0.55),
-                    onChanged: (_) => onToggle(),
-                    enableHaptics: false,
+                if (entry.canDelete || entry.conversations.isNotEmpty)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: ColoredBox(
+                      color: cs.surface.withValues(alpha: 0.94),
+                      child: Padding(
+                        padding: const EdgeInsets.all(6),
+                        child: _AttachmentStatus(entry: entry),
+                      ),
+                    ),
                   ),
-                ),
+                if (entry.isInUse != null)
+                  Positioned(
+                    top: 6,
+                    right: 6,
+                    child: entry.isInUse == true
+                        ? const _StorageInUseLabel()
+                        : IosCheckbox(
+                            value: selected,
+                            size: 20,
+                            hitTestSize: 22,
+                            borderWidth: 1.6,
+                            activeColor: cs.primary,
+                            borderColor: cs.primary.withValues(alpha: 0.55),
+                            onChanged: (_) => onToggle(),
+                            enableHaptics: false,
+                          ),
+                  ),
               ],
             ),
           ),
         );
       },
+    );
+  }
+}
+
+class _AttachmentStatus extends StatelessWidget {
+  const _AttachmentStatus({required this.entry});
+  final StorageFileEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = AppLocalizations.of(context)!;
+    final pending = entry.pendingDeletionAt;
+    final text = entry.conversations.isNotEmpty
+        ? l10n.storageAttachmentConversations(
+            entry.conversations.values.join(', '),
+          )
+        : entry.isInUse == true
+        ? l10n.storageSpaceImageInUse
+        : pending != null
+        ? l10n.storageAttachmentPending(
+            MaterialLocalizations.of(
+              context,
+            ).formatMediumDate(pending.toLocal()),
+          )
+        : l10n.storageAttachmentUnused;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => showAppDialog<void>(
+        context,
+        maxWidth: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AppDialogHeader(title: l10n.storageAttachmentDetailsTitle),
+            ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * .5,
+              ),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+                child: Text(text),
+              ),
+            ),
+          ],
+        ),
+      ),
+      child: Tooltip(
+        message: text,
+        child: Text(
+          text,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 11,
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _StorageInUseLabel extends StatelessWidget {
+  const _StorageInUseLabel();
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: AppLocalizations.of(context)!.storageAttachmentProtectedHint,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        decoration: BoxDecoration(
+          color: cs.surface.withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(
+          AppLocalizations.of(context)!.storageSpaceImageInUse,
+          style: TextStyle(fontSize: 11, color: cs.onSurface),
+        ),
+      ),
     );
   }
 }
@@ -2707,16 +3039,19 @@ class _FileRow extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         child: Row(
           children: [
-            IosCheckbox(
-              value: selected,
-              size: 20,
-              hitTestSize: 22,
-              borderWidth: 1.6,
-              activeColor: cs.primary,
-              borderColor: cs.primary.withValues(alpha: 0.55),
-              onChanged: (_) => onToggle(),
-              enableHaptics: false,
-            ),
+            if (entry.isInUse == true)
+              const _StorageInUseLabel()
+            else if (entry.canDelete)
+              IosCheckbox(
+                value: selected,
+                size: 20,
+                hitTestSize: 22,
+                borderWidth: 1.6,
+                activeColor: cs.primary,
+                borderColor: cs.primary.withValues(alpha: 0.55),
+                onChanged: (_) => onToggle(),
+                enableHaptics: false,
+              ),
             const SizedBox(width: 10),
             Icon(
               Lucide.Paperclip,
@@ -2746,6 +3081,9 @@ class _FileRow extends StatelessWidget {
                       color: cs.onSurface.withValues(alpha: 0.65),
                     ),
                   ),
+                  const SizedBox(height: 4),
+                  if (entry.canDelete || entry.conversations.isNotEmpty)
+                    _AttachmentStatus(entry: entry),
                 ],
               ),
             ),

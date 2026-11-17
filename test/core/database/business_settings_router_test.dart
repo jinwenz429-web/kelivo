@@ -103,6 +103,8 @@ void main() {
           'pinned_models_v1': jsonEncode(['first/model-a']),
           'plugin_future_key_v1': <String>['one', 'two'],
           'flutter_log_enabled_v1': true,
+          'ollama_model_metadata_v1': '{"local-model":{}}',
+          'desktop_autostart_hidden_v1': true,
           'window_physical_pos_x_v1': -3600.0,
           'window_physical_pos_y_v1': 200.0,
           'pinned_chat_ids': <String>['chat-1'],
@@ -123,6 +125,8 @@ void main() {
         expect(exported['pinned_models_v1'], <String>['first/model-a']);
         expect(exported['plugin_future_key_v1'], <String>['one', 'two']);
         expect(exported['flutter_log_enabled_v1'], isNull);
+        expect(exported, isNot(contains('ollama_model_metadata_v1')));
+        expect(exported, isNot(contains('desktop_autostart_hidden_v1')));
         expect(exported['window_physical_pos_x_v1'], isNull);
         expect(exported['window_physical_pos_y_v1'], isNull);
         expect(exported['pinned_chat_ids'], isNull);
@@ -664,7 +668,7 @@ void main() {
           },
         ]),
         'search_services_v1': jsonEncode([
-          {'id': 'search-1', 'type': 'bing_local', 'acceptLanguage': 'en-US'},
+          {'id': 'search-1', 'type': 'bing_local'},
         ]),
         'tts_services_v1': jsonEncode([
           {
@@ -745,6 +749,17 @@ void main() {
       }
     });
 
+    test('rejects a non-string OAuth model cache version', () {
+      expect(
+        () => BusinessSettingsRouter.normalizeAndRoute({
+          'provider_configs_v1': jsonEncode({
+            'account': {'oauthModelsClientVersion': 159},
+          }),
+        }),
+        throwsFormatException,
+      );
+    });
+
     test('rejects entity fields that runtime models cannot decode', () {
       final invalidBySourceKey = <String, Object>{
         'assistants_v1': [
@@ -805,6 +820,37 @@ void main() {
           ),
         ),
       );
+    });
+
+    test('accepts and preserves DeepSeek search credentials', () {
+      final service = {
+        'id': 'deepseek-1',
+        'type': 'deepseek',
+        'apiKey': 'primary-key',
+        'apiKeys': ['backup-key'],
+      };
+      final snapshot = BusinessSettingsRouter.normalizeAndRoute({
+        'search_services_v1': jsonEncode([service]),
+      });
+      final exported = BusinessSettingsRouter.exportSnapshot(snapshot);
+      expect(jsonDecode(exported['search_services_v1']! as String), [service]);
+
+      for (final invalid in [
+        {'apiKey': 123},
+        {'apiKeys': 'not-a-list'},
+        {
+          'apiKeys': [123],
+        },
+      ]) {
+        expect(
+          () => BusinessSettingsRouter.normalizeAndRoute({
+            'search_services_v1': jsonEncode([
+              {...service, ...invalid},
+            ]),
+          }),
+          throwsA(isA<FormatException>()),
+        );
+      }
     });
 
     test('accepts and preserves Kagi search credentials', () {

@@ -5,6 +5,7 @@ import '../../core/agency/companion_wake.dart';
 import '../../core/database/generation_run.dart';
 import '../../core/models/chat_input_data.dart';
 import '../../core/models/conversation.dart';
+import '../../core/models/conversation_mcp_settings.dart';
 import '../../core/models/workspace_binding.dart';
 import '../../core/models/scheduled_task.dart';
 import '../../core/providers/assistant_provider.dart';
@@ -13,6 +14,7 @@ import '../../core/providers/mcp_provider.dart';
 import '../../core/providers/workspace_provider.dart';
 import '../../core/providers/world_book_provider.dart';
 import '../../core/services/chat/chat_service.dart';
+import '../../core/services/chat/document_text_extractor.dart';
 import '../../core/services/scheduled_tasks_service.dart';
 import '../chat/utils/thinking_tag_parser.dart';
 import '../home/controllers/chat_actions.dart';
@@ -73,11 +75,14 @@ Future<Map<String, Object?>> runScheduledTask(
       : null;
   if (modelOverride != null) {
     final config = settings.getProviderConfig(modelOverride.providerKey);
-    if (!config.enabled || !config.models.contains(modelOverride.modelId)) {
+    if (!config.enabled || !config.isModelEnabled(modelOverride.modelId)) {
       throw StateError('model_missing');
     }
   }
-  for (final id in assistant.mcpServerIds) {
+  for (final id in ConversationMcpSettings.effectiveServerIds(
+    assistant,
+    targetConversation,
+  )) {
     cancellation.check();
     final server = mcp.getById(id);
     if (server == null || !server.enabled) continue;
@@ -171,7 +176,8 @@ Future<Map<String, Object?>> runScheduledTask(
   if (cancellation.cancelled) await cancellation.cancel();
   cancellation.check();
   if (!result.success) {
-    throw StateError(result.errorMessage ?? 'generation_failed');
+    final error = result.errorMessage ?? 'generation_failed';
+    throw AttachmentReadError.fromMessage(error) ?? StateError(error);
   }
   final repository = chat.chatRepositoryOrNull!;
   final runId = result.generationRunId;

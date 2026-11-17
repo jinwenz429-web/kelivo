@@ -5,9 +5,31 @@ import 'dart:typed_data';
 
 import 'package:Kelivo/core/services/tts/network_tts.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 
 void main() {
   group('TtsServiceOptions', () {
+    test('DeepSeek restores its defaults and round-trips custom settings', () {
+      final defaults =
+          TtsServiceOptions.fromJson({'kind': 'deepseek'})
+              as DeepSeekTtsOptions;
+      expect(defaults.baseUrl, 'https://api.deepseek.com/v1');
+      expect(defaults.voiceId, 'stella');
+      final options = DeepSeekTtsOptions(
+        id: 'saved-voice',
+        enabled: true,
+        name: 'My voice',
+        apiKey: 'test-key',
+        baseUrl: 'https://example.com/proxy/v1',
+        voiceId: 'tide',
+      );
+      expect(
+        TtsServiceOptions.fromJson(options.toJson()).toJson(),
+        options.toJson(),
+      );
+    });
+
     test('deserializes RikkaHub-aligned provider defaults', () {
       final qwen = TtsServiceOptions.fromJson({
         'kind': 'qwen',
@@ -231,6 +253,166 @@ void main() {
   });
 
   group('NetworkTtsService', () {
+    test(
+      'DeepSeek sends the selected voice and returns a playable WAV',
+      () async {
+        const text = '你好，[原文](https://example.com)！';
+        final targets = <String>[];
+        final server = await _bindServer((request) async {
+          targets.add(request.uri.toString());
+          expect(request.method, 'POST');
+          expect(
+            request.headers.value(HttpHeaders.authorizationHeader),
+            'Bearer test-key',
+          );
+          expect(request.headers.contentType?.mimeType, 'application/json');
+          expect(jsonDecode(await utf8.decoder.bind(request).join()), {
+            'text': text,
+            'voice_id': 'tide',
+            'format': 'pcm',
+            'filter_markdown': false,
+          });
+          request.response.headers.contentType = ContentType('audio', 'pcm');
+          request.response.add([1]);
+          await request.response.flush();
+          request.response.add([2, 3, 4]);
+          await request.response.close();
+        });
+        addTearDown(() => server.close(force: true));
+
+        for (final base in [
+          _hostOnlyBaseUrl(server),
+          '${_baseUrl(server)}/?tenant=voice',
+          '${_baseUrl(server)}/tools/tts?tenant=voice',
+        ]) {
+          final result = await NetworkTtsService.synthesize(
+            options: DeepSeekTtsOptions(
+              enabled: true,
+              name: 'DeepSeek',
+              apiKey: 'test-key',
+              baseUrl: base,
+              voiceId: 'tide',
+            ),
+            text: text,
+          );
+          expect(result.mime, 'audio/wav');
+          expect(
+            result.bytes,
+            _buildWav([
+              ('fmt ', _pcmFormat(24000)),
+              ('data', [1, 2, 3, 4]),
+            ]),
+          );
+        }
+        expect(targets, [
+          '/v1/tools/tts',
+          '/api/v1/tools/tts?tenant=voice',
+          '/api/v1/tools/tts?tenant=voice',
+        ]);
+      },
+    );
+
+    test(
+      'DeepSeek rejects failed, interrupted and malformed responses',
+      () async {
+        final options = DeepSeekTtsOptions(
+          enabled: true,
+          name: 'DeepSeek',
+          apiKey: 'k',
+        );
+        Future<NetworkTtsResult> synthesize(http.StreamedResponse response) {
+          return NetworkTtsService.synthesize(
+            options: options,
+            text: 'Hello',
+            client: MockClient.streaming((request, _) async {
+              expect(
+                request.url.toString(),
+                'https://api.deepseek.com/v1/tools/tts',
+              );
+              return response;
+            }),
+          );
+        }
+
+        await expectLater(
+          synthesize(
+            http.StreamedResponse(
+              Stream.value(utf8.encode('invalid key')),
+              401,
+            ),
+          ),
+          throwsA(predicate((e) => e.toString().contains('401 invalid key'))),
+        );
+        Stream<List<int>> interrupted() async* {
+          yield [1, 2];
+          throw const HttpException(
+            'Connection closed before response completed',
+          );
+        }
+
+        const pcmHeaders = {'content-type': 'audio/pcm'};
+        await expectLater(
+          synthesize(
+            http.StreamedResponse(interrupted(), 200, headers: pcmHeaders),
+          ),
+          throwsA(isA<HttpException>()),
+        );
+        for (final bytes in [
+          <int>[],
+          [1],
+        ]) {
+          await expectLater(
+            synthesize(
+              http.StreamedResponse(
+                Stream.value(bytes),
+                200,
+                headers: pcmHeaders,
+              ),
+            ),
+            throwsFormatException,
+          );
+        }
+      },
+    );
+
+    test(
+      'DeepSeek stops waiting for audio when playback is cancelled',
+      () async {
+        final bodyStarted = Completer<void>();
+        final release = Completer<void>();
+        final server = await _bindServer((request) async {
+          await request.drain<void>();
+          request.response.headers.contentType = ContentType('audio', 'pcm');
+          request.response.add([1, 2]);
+          await request.response.flush();
+          bodyStarted.complete();
+          await release.future;
+          await request.response.close();
+        });
+        addTearDown(() async {
+          release.complete();
+          await server.close(force: true);
+        });
+        var cancelled = false;
+        final synthesis = NetworkTtsService.synthesize(
+          options: DeepSeekTtsOptions(
+            enabled: true,
+            name: 'DeepSeek',
+            apiKey: 'k',
+            baseUrl: _hostOnlyBaseUrl(server),
+          ),
+          text: 'Hello',
+          cancelled: () => cancelled,
+        );
+        await bodyStarted.future.timeout(const Duration(seconds: 2));
+        cancelled = true;
+        await expectLater(
+          synthesis,
+          throwsA(isA<Exception>()),
+        ).timeout(const Duration(seconds: 2));
+      },
+    );
+
     test('Azure sends escaped SSML and returns MP3 audio', () async {
       late HttpRequest captured;
       late String requestBody;
@@ -459,6 +641,151 @@ void main() {
       expect(result.mime, 'audio/wav');
       expect(result.sampleRate, 24000);
       expect(utf8.decode(result.bytes.take(4).toList()), 'RIFF');
+      expect(_riffChunkData(result.bytes, 'data'), pcm);
+    });
+
+    test('Qwen keeps PCM samples split across SSE events', () async {
+      final result = await _synthesizeQwenAudio([
+        [0, 1, 2],
+        [3, 4, 5],
+      ]);
+      expect(_riffChunkData(result.bytes, 'data'), [0, 1, 2, 3, 4, 5]);
+      expect(result.sampleRate, 24000);
+    });
+
+    test('Qwen extracts WAV chunks and preserves the actual format', () async {
+      final format = _pcmFormat(16000);
+      ByteData.sublistView(format)
+        ..setUint16(2, 2, Endian.little)
+        ..setUint32(8, 64000, Endian.little)
+        ..setUint16(12, 4, Endian.little);
+      final samples = <int>[1, 2, 3, 4, ...ascii.encode('RIFF'), 5, 6, 7, 8];
+      final upstream = _buildWav([
+        ('JUNK', [9, 8, 7]),
+        ('fmt ', format),
+        ('LIST', [1, 2]),
+        ('data', samples.sublist(0, 4)),
+        ('data', samples.sublist(4)),
+      ]);
+      final result = await _synthesizeQwenAudio([upstream]);
+
+      expect(result.mime, 'audio/wav');
+      expect(result.sampleRate, 16000);
+      expect(_riffChunkData(result.bytes, 'fmt '), format);
+      expect(_riffChunkData(result.bytes, 'data'), samples);
+      expect(result.bytes.length, 44 + samples.length);
+    });
+
+    for (final sizes in <(int?, int?)>[
+      (null, null),
+      (0x7fffffbf, 0x7fffff9b), // Header reported in issue #1232.
+      (0x7fffffff, 0x7fffffff),
+      (0xffffffff, 0xffffffff),
+      (0x7fffffff, 0x7fffffdb),
+      (0xffffffff, 0xffffffdb),
+      (0xffffffff, null),
+      (null, 0xffffffff),
+    ]) {
+      test('Qwen normalizes WAV lengths $sizes across SSE events', () async {
+        final samples = Uint8List(480);
+        final upstream = _buildWav([
+          ('fmt ', _pcmFormat(24000)),
+          ('data', samples),
+        ]);
+        final view = ByteData.sublistView(upstream);
+        if (sizes.$1 != null) view.setUint32(4, sizes.$1!, Endian.little);
+        if (sizes.$2 != null) view.setUint32(40, sizes.$2!, Endian.little);
+        final result = await _synthesizeQwenAudio([
+          upstream.sublist(0, 2),
+          upstream.sublist(2, 9),
+          upstream.sublist(9, 39),
+          upstream.sublist(39),
+        ]);
+
+        expect(result.sampleRate, 24000);
+        expect(_riffChunkData(result.bytes, 'data'), samples);
+        expect(
+          ByteData.sublistView(result.bytes).getUint32(4, Endian.little),
+          result.bytes.length - 8,
+        );
+        final exported = combineWavAudio(List.filled(5, result.bytes));
+        expect(_riffChunkData(exported, 'data'), Uint8List(5 * samples.length));
+        expect(exported.length, 44 + 5 * samples.length);
+      });
+    }
+
+    test('Qwen preserves odd-sized 8-bit WAV data with RIFF padding', () async {
+      final format = _pcmFormat(8000);
+      ByteData.sublistView(format)
+        ..setUint32(8, 8000, Endian.little)
+        ..setUint16(12, 1, Endian.little)
+        ..setUint16(14, 8, Endian.little);
+      final result = await _synthesizeQwenAudio([
+        _buildWav([
+          ('fmt ', format),
+          ('data', [128, 129, 127]),
+        ]),
+      ]);
+      expect(_riffChunkData(result.bytes, 'data'), [128, 129, 127]);
+      expect(result.bytes.length, 48);
+      expect(result.sampleRate, 8000);
+    });
+
+    final validQwenWav = _buildWav([
+      ('fmt ', _pcmFormat(24000)),
+      ('data', [0, 1, 2, 3]),
+    ]);
+    final invalidQwenAudio = <String, List<int>>{
+      'odd PCM byte count': [1, 2, 3],
+      'truncated RIFF header': ascii.encode('RIFF'),
+      'wrong RIFF form': _replaceWavUint32(validQwenWav, 8, 0),
+      'truncated RIFF body': _replaceWavUint32(validQwenWav, 4, 100),
+      'bytes outside RIFF': [...validQwenWav, 0, 0],
+      'truncated chunk header': _replaceWavUint32(
+        Uint8List.fromList([..._buildWav([]), ...ascii.encode('fmt ')]),
+        4,
+        8,
+      ),
+      'truncated data chunk': _replaceWavUint32(validQwenWav, 40, 6),
+      'unknown fmt length': _replaceWavUint32(validQwenWav, 16, 0xffffffff),
+      'missing fmt': _buildWav([
+        ('data', [0, 0]),
+      ]),
+      'missing data': _buildWav([('fmt ', _pcmFormat(24000))]),
+      'empty data': _buildWav([('fmt ', _pcmFormat(24000)), ('data', [])]),
+      'short fmt': _buildWav([
+        ('fmt ', [1, 0]),
+        ('data', [0, 0]),
+      ]),
+      'zero sample rate': _replaceWavUint32(validQwenWav, 24, 0),
+      'wrong byte rate': _replaceWavUint32(validQwenWav, 28, 100),
+      'zero block alignment': _replaceWavUint32(validQwenWav, 32, 16 << 16),
+      'wrong block alignment': _replaceWavUint32(
+        validQwenWav,
+        32,
+        (16 << 16) | 4,
+      ),
+      'unsupported format': _replaceWavUint32(validQwenWav, 20, (1 << 16) | 2),
+      'unaligned individual data chunks': _buildWav([
+        ('fmt ', _pcmFormat(24000)),
+        ('data', [1]),
+        ('data', [2]),
+      ]),
+    };
+    for (final entry in invalidQwenAudio.entries) {
+      test('Qwen rejects ${entry.key}', () async {
+        await expectLater(
+          _synthesizeQwenAudio([entry.value]),
+          throwsFormatException,
+        );
+      });
+    }
+
+    test('WAV concatenation still rejects streaming placeholder lengths', () {
+      expect(
+        () => combineWavAudio([_replaceWavUint32(validQwenWav, 4, 0x7fffffbf)]),
+        throwsFormatException,
+      );
     });
 
     test('synthesizes Groq audio speech response as wav', () async {
@@ -1335,6 +1662,48 @@ Future<HttpServer> _bindServer(
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   server.listen(handler);
   return server;
+}
+
+Future<NetworkTtsResult> _synthesizeQwenAudio(
+  List<List<int>> audioParts,
+) async {
+  final server = await _bindServer((request) async {
+    await request.drain<void>();
+    request.response.headers.contentType = ContentType('text', 'event-stream');
+    for (final part in audioParts) {
+      request.response.write(
+        'data: ${jsonEncode({
+          'output': {
+            'audio': {'data': base64Encode(part)},
+          },
+        })}\n\n',
+      );
+    }
+    request.response.write('data: [DONE]\n\n');
+    await request.response.close();
+  });
+  try {
+    return await NetworkTtsService.synthesize(
+      options: QwenTtsOptions(
+        enabled: true,
+        name: 'Qwen',
+        apiKey: 'qwen-key',
+        baseUrl: _baseUrl(server),
+        model: 'qwen3-tts-flash',
+        voice: 'Cherry',
+        languageType: 'Chinese',
+      ),
+      text: '你好',
+    );
+  } finally {
+    await server.close(force: true);
+  }
+}
+
+Uint8List _replaceWavUint32(Uint8List wav, int offset, int value) {
+  final bytes = Uint8List.fromList(wav);
+  ByteData.sublistView(bytes).setUint32(offset, value, Endian.little);
+  return bytes;
 }
 
 String _baseUrl(HttpServer server) {

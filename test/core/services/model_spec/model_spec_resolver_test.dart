@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -6,6 +7,7 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:Kelivo/core/models/model_spec.dart';
+import 'package:Kelivo/core/models/provider_oauth.dart';
 import 'package:Kelivo/core/providers/settings_provider.dart';
 import 'package:Kelivo/core/services/api/reasoning/reasoning_dialects.dart';
 import 'package:Kelivo/core/services/model_catalog/catalog_entry.dart';
@@ -75,6 +77,135 @@ void main() {
         ]);
       },
     );
+
+    group('GPT-5 reasoning', () {
+      const ids = ['gpt-5', 'gpt-5-mini', 'gpt-5-nano'];
+      const defaultLevels = [
+        ReasoningLevel.minimal,
+        ReasoningLevel.low,
+        ReasoningLevel.medium,
+        ReasoningLevel.high,
+      ];
+
+      void expectReasoning(
+        ResolvedModelSpec resolved, {
+        List<ReasoningLevel> levels = defaultLevels,
+        SpecSource source = SpecSource.guess,
+      }) {
+        final spec = resolved.spec;
+        expect(spec.supportsReasoning, isTrue, reason: spec.id);
+        expect(spec.reasoning.levels, levels, reason: spec.id);
+        expect(spec.reasoning.canDisable, isFalse, reason: spec.id);
+        expect(resolved.sources[ModelSpecField.reasoningLevels], source);
+        expect(resolved.sources[ModelSpecField.reasoningCanDisable], source);
+        expect(
+          applyReasoning(
+            <String, dynamic>{},
+            spec,
+            ReasoningRequest.off,
+            transport: ReasoningTransport.chatCompletions,
+          ),
+          {'reasoning_effort': levels.first.name},
+          reason: spec.id,
+        );
+        expect(
+          applyReasoning(
+            <String, dynamic>{},
+            spec,
+            ReasoningRequest.off,
+            transport: ReasoningTransport.responses,
+          ),
+          {
+            'reasoning': {'effort': levels.first.name, 'summary': 'auto'},
+          },
+          reason: spec.id,
+        );
+      }
+
+      test('uses minimal before the catalog loads', () async {
+        final pendingCatalog = ModelCatalogService(
+          loadBundledJson: () async => jsonEncode(_catalogData().toJson()),
+          cacheDirectory: () async => tempDir,
+          prefs: SharedPreferences.getInstance,
+        );
+        final pendingResolver = ModelSpecResolver(catalog: pendingCatalog);
+        try {
+          for (final id in ids) {
+            final resolved = pendingResolver.resolve(_openai(), id);
+            expect(resolved.catalog, isNull);
+            expectReasoning(resolved);
+          }
+          expect(pendingCatalog.isLoaded, isFalse);
+        } finally {
+          await pendingCatalog.ensureLoaded();
+          pendingCatalog.dispose();
+        }
+      });
+
+      test('uses minimal when the catalog has no matching model', () {
+        for (final id in ids) {
+          final resolved = resolver.resolve(_openai(), id);
+          expect(resolved.catalog, isNull);
+          expectReasoning(resolved);
+        }
+      });
+
+      for (final hasEffortOptions in [false, true]) {
+        test(
+          hasEffortOptions
+              ? 'provider effort options take precedence over defaults'
+              : 'uses minimal when the provider entry has no effort options',
+          () {
+            catalog.debugSetData(
+              ModelCatalogData(
+                schemaVersion: 1,
+                generatedAt: DateTime.utc(2026, 9, 15),
+                providers: {
+                  'abacus': _provider(
+                    'abacus',
+                    api: 'https://routellm.abacus.ai/v1',
+                    models: [
+                      for (final id in ids)
+                        _model(
+                          id,
+                          reasoning: true,
+                          reasoningOptions: hasEffortOptions
+                              ? const [
+                                  CatalogReasoningOption(
+                                    type: 'effort',
+                                    values: ['low', 'high'],
+                                  ),
+                                ]
+                              : const [],
+                        ),
+                    ],
+                  ),
+                },
+              ),
+            );
+            final cfg = _cfg(
+              id: 'abacus',
+              kind: ProviderKind.openai,
+              baseUrl: 'https://routellm.abacus.ai/v1',
+            );
+            for (final id in ids) {
+              final resolved = resolver.resolve(cfg, id);
+              expect(resolved.catalog?.provider.id, 'abacus');
+              expect(resolved.catalog?.kind, CatalogMatchKind.providerExact);
+              expectReasoning(
+                resolved,
+                levels: hasEffortOptions
+                    ? const [ReasoningLevel.low, ReasoningLevel.high]
+                    : defaultLevels,
+                source: hasEffortOptions
+                    ? SpecSource.catalog
+                    : SpecSource.guess,
+              );
+            }
+          },
+        );
+      }
+    });
 
     test('catalog beats guesser for gpt-5.1 levels and limits', () {
       final resolved = resolver.resolve(_openai(), 'gpt-5.1');
@@ -153,6 +284,102 @@ void main() {
       expect(resolved.spec.reasoning.canDisable, isTrue);
       expect(resolved.spec.pricing?.cacheWrite, 3.75);
     });
+
+    test(
+      'Claude 5.5 catalog capabilities retain native thinking request rules',
+      () {
+        const models = [
+          'claude-opus-5-5',
+          'claude-sonnet-5-5',
+          'claude-haiku-5-5',
+        ];
+        catalog.debugSetData(
+          ModelCatalogData(
+            schemaVersion: 1,
+            generatedAt: DateTime.utc(2026, 10, 26),
+            providers: {
+              'anthropic': _provider(
+                'anthropic',
+                models: [
+                  for (final id in models)
+                    _model(
+                      id,
+                      reasoning: true,
+                      temperature: false,
+                      contextLimit: 1000000,
+                      outputLimit: 128000,
+                      reasoningOptions: [
+                        if (id == 'claude-haiku-5-5')
+                          const CatalogReasoningOption(type: 'toggle'),
+                        const CatalogReasoningOption(
+                          type: 'effort',
+                          values: ['low', 'medium', 'high', 'xhigh', 'max'],
+                        ),
+                      ],
+                    ),
+                ],
+              ),
+            },
+          ),
+        );
+        final expectedOff = {
+          'claude-opus-5-5': {
+            'thinking': {'type': 'adaptive', 'display': 'summarized'},
+            'output_config': {'effort': 'low'},
+          },
+          'claude-sonnet-5-5': {
+            'thinking': {'type': 'between_tools'},
+          },
+          'claude-haiku-5-5': {
+            'thinking': {'type': 'disabled'},
+          },
+        };
+        for (final id in models) {
+          final resolved = resolver.resolve(_anthropic(), id);
+          expect(resolved.catalog, isNotNull, reason: id);
+          expect(
+            resolved.sources[ModelSpecField.abilities],
+            SpecSource.catalog,
+          );
+          expect(
+            resolved.sources[ModelSpecField.reasoningLevels],
+            SpecSource.catalog,
+          );
+          expect(
+            resolved.sources[ModelSpecField.maxOutput],
+            SpecSource.catalog,
+          );
+          expect(
+            resolved.sources[ModelSpecField.reasoningDialect],
+            SpecSource.guess,
+          );
+          expect(resolved.spec.sampling, SamplingPolicy.never);
+          expect(
+            applyReasoning(
+              {},
+              resolved.spec,
+              ReasoningRequest.off,
+              transport: ReasoningTransport.anthropicMessages,
+            ),
+            expectedOff[id],
+            reason: id,
+          );
+          expect(
+            applyReasoning(
+              {},
+              resolved.spec,
+              const ReasoningRequest(ReasoningLevel.medium),
+              transport: ReasoningTransport.anthropicMessages,
+            ),
+            {
+              'thinking': {'type': 'adaptive', 'display': 'summarized'},
+              'output_config': {'effort': 'medium'},
+            },
+            reason: id,
+          );
+        }
+      },
+    );
 
     test('guesser is used when the host has no catalog match', () {
       final cfg = _cfg(
@@ -243,7 +470,7 @@ void main() {
 
     test('replay comes from catalog interleavedField', () {
       final resolved = resolver.resolve(_anthropic(), 'claude-sonnet-4.6');
-      expect(resolved.spec.reasoning.replay, ReasoningReplayPolicy.toolTurns);
+      expect(resolved.spec.reasoning.replay, ReasoningReplayPolicy.all);
       expect(
         resolved.spec.reasoning.replayField,
         ReasoningReplayField.reasoningContent,
@@ -261,7 +488,7 @@ void main() {
         resolved.sources[ModelSpecField.reasoningDialect],
         SpecSource.vendor,
       );
-      expect(resolved.spec.reasoning.replay, ReasoningReplayPolicy.toolTurns);
+      expect(resolved.spec.reasoning.replay, ReasoningReplayPolicy.all);
       expect(
         resolved.spec.reasoning.replayField,
         ReasoningReplayField.reasoningContent,
@@ -271,6 +498,69 @@ void main() {
         SpecSource.guess,
       );
     });
+
+    test('supported replay defaults to all and explicit overrides win', () {
+      for (final target in [
+        (config: _deepseek(), model: 'deepseek-v4-pro'),
+        (config: _openai(), model: 'kimi-k2.6'),
+        (config: _openai(), model: 'glm-5.2'),
+        (config: _anthropic(), model: 'claude-sonnet-4.6'),
+        (config: _openai().copyWith(useResponseApi: true), model: 'gpt-5.1'),
+        (
+          config: _openai().copyWith(oauthProvider: OAuthProvider.chatgpt),
+          model: 'gpt-5.1',
+        ),
+      ]) {
+        for (final policy in [
+          ReasoningReplayPolicy.none,
+          ReasoningReplayPolicy.toolTurns,
+        ]) {
+          final config = target.config.copyWith(
+            modelOverrides: {
+              target.model: {
+                'reasoning': {'replay': policy.name},
+              },
+            },
+          );
+          final resolved = resolver.resolve(config, target.model);
+          expect(resolved.spec.reasoning.replay, policy);
+          expect(resolved.base.reasoning.replay, ReasoningReplayPolicy.all);
+          expect(
+            resolved.sources[ModelSpecField.reasoningReplay],
+            SpecSource.override,
+          );
+        }
+      }
+      // Chat Completions GPT does not accept the third-party reasoning field.
+      expect(
+        resolver.spec(_openai(), 'gpt-5.1').reasoning.replay,
+        ReasoningReplayPolicy.none,
+      );
+    });
+
+    test(
+      'Kimi OAuth protocol is resolved per model without changing saved config',
+      () {
+        final config = _openai().copyWith(
+          oauthProvider: OAuthProvider.kimi,
+          modelOverrides: {
+            'kimi-for-coding': {'oauthProtocol': 'anthropic'},
+            'kimi-k2.5': {'oauthProtocol': 'openai'},
+          },
+        );
+        expect(
+          resolver.spec(config, 'kimi-for-coding').reasoning.dialect,
+          ReasoningDialect.anthropicBudget,
+        );
+        expect(config.providerType, ProviderKind.openai);
+        expect(config.forModelProtocol('kimi-k2.5'), same(config));
+        expect(config.forModelProtocol('unknown'), same(config));
+        final ordinary = _openai().copyWith(
+          modelOverrides: config.modelOverrides,
+        );
+        expect(ordinary.forModelProtocol('kimi-for-coding'), same(ordinary));
+      },
+    );
 
     test('sparse reasoning override leaves catalog levels intact', () {
       final ov = <String, dynamic>{
@@ -297,7 +587,7 @@ void main() {
         resolved.sources[ModelSpecField.reasoningLevels],
         SpecSource.catalog,
       );
-      expect(resolved.base.reasoning.replay, ReasoningReplayPolicy.toolTurns);
+      expect(resolved.base.reasoning.replay, ReasoningReplayPolicy.all);
     });
 
     test('base has no override while spec does', () {

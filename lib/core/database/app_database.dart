@@ -1,3 +1,4 @@
+import '../models/message_part.dart';
 import 'dart:io';
 import 'dart:isolate';
 
@@ -5,8 +6,11 @@ import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
 import 'package:sqlite3/common.dart' show AllowedArgumentCount, CommonDatabase;
 
+import '../../features/intelligent_ui/catalog/ui_budgets.dart';
 import '../../utils/app_directories.dart';
+import '../../utils/utf16_safe_cut.dart';
 import 'schema_versions.dart';
+import 'gen_ui_derived_schema.dart';
 
 part 'app_database.g.dart';
 
@@ -722,7 +726,55 @@ class ExtensionEntityRows extends Table {
   Set<Column<Object>> get primaryKey => {kind, id};
 }
 
+/// Per-revision UI overrides; the composite primary-key index also serves
+/// owner lookups. The FTS rowid is derived and never part of durable identity.
+class GenUiSurfaceStateRows extends Table {
+  TextColumn get revisionId =>
+      text().references(MessageRows, #id, onDelete: KeyAction.cascade)();
+  TextColumn get surfaceKey =>
+      text()
+      // ignore: recursive_getters
+      .check(surfaceKey.isNotValue(''))();
+  TextColumn get sourceHash =>
+      text()
+      // ignore: recursive_getters
+      .check(sourceHash.isNotValue(''))();
+  IntColumn get stateVersion => integer()
+      .check(
+        const CustomExpression<bool>(
+          "typeof(state_version) = 'integer' AND state_version > 0",
+        ),
+      )
+      .withDefault(const Constant(1))();
+  TextColumn get stateJson => text()
+      // IS rejects missing keys instead of NULL, which SQLite CHECK accepts.
+      // CASE prevents JSON functions from inspecting malformed input.
+      .check(
+        const CustomExpression<bool>(
+          'length(CAST(state_json AS BLOB)) <= ${UiBudgets.stateBytes} AND '
+          'CASE WHEN json_valid(state_json) THEN '
+          "json_type(state_json) IS 'object' AND "
+          "json_type(state_json, '\$.inputs') IS 'object' AND "
+          "json_type(state_json, '\$.view') IS 'object' ELSE 0 END",
+        ),
+      )
+      .withDefault(const Constant('{"inputs":{},"view":{}}'))();
+  TextColumn get searchText => text()
+      .check(
+        const CustomExpression<bool>(
+          'length(CAST(search_text AS BLOB)) <= ${UiBudgets.searchTextBytes}',
+        ),
+      )
+      .withDefault(const Constant(''))();
+  IntColumn get updatedAt =>
+      integer().map(const MicrosecondDateTimeConverter())();
+
+  @override
+  Set<Column<Object>> get primaryKey => {revisionId, surfaceKey};
+}
+
 @DriftDatabase(
+  include: {'gen_ui_search.drift'},
   tables: [
     ConversationRows,
     MessageRows,
@@ -753,6 +805,7 @@ class ExtensionEntityRows extends Table {
     MessagePromptRows,
     TombstoneRows,
     ExtensionEntityRows,
+    GenUiSurfaceStateRows,
   ],
 )
 class AppDatabase extends _$AppDatabase {
@@ -764,13 +817,15 @@ class AppDatabase extends _$AppDatabase {
   // per-conversation model override; schema 3 lays the extension groundwork
   // (extras_json columns, message updated_at/sender_id, tombstone_rows,
   // extension_entity_rows) so later features can ship without further
-  // migrations. Every version outside [publishedSchemaVersions] belongs to an
-  // unpublished or future format and is rejected.
-  static const currentSchemaVersion = 3;
+  // migrations. Schema 5 adds isolated GenUI state and its derived search index;
+  // schema 4 was never published. Every version outside
+  // [publishedSchemaVersions] belongs to an unpublished or future format and
+  // is rejected.
+  static const currentSchemaVersion = 5;
 
   /// Every schema that has ever shipped. A file at any of these can be
   /// upgraded by `SchemaMigrations`; anything else is rejected outright.
-  static const publishedSchemaVersions = <int>{1, 2, 3};
+  static const publishedSchemaVersions = <int>{1, 2, 3, 5};
 
   /// Whether a live application connection may use a file as-is: either freshly
   /// created (0) or already at the current schema.
@@ -796,10 +851,12 @@ class AppDatabase extends _$AppDatabase {
       'kelivo_sqlite_on_opening_isolate';
   static const _maxExecutionIsolateProbeSamples = 1000;
 
-  factory AppDatabase.open({File? file}) {
+  factory AppDatabase.open({File? file, bool requireExisting = false}) {
     final databaseFile = file;
     if (databaseFile != null) {
-      return AppDatabase(_openExecutor(databaseFile));
+      return AppDatabase(
+        _openExecutor(databaseFile, requireExisting: requireExisting),
+      );
     }
     return AppDatabase(
       LazyDatabase(() async {
@@ -807,16 +864,30 @@ class AppDatabase extends _$AppDatabase {
         if (!await dir.exists()) {
           await dir.create(recursive: true);
         }
-        return _openExecutor(File('${dir.path}/$databaseFileName'));
+        return _openExecutor(
+          File('${dir.path}/$databaseFileName'),
+          requireExisting: requireExisting,
+        );
       }),
     );
   }
 
-  static QueryExecutor _openExecutor(File file) {
+  static QueryExecutor _openExecutor(
+    File file, {
+    bool requireExisting = false,
+  }) {
+    if (requireExisting &&
+        FileSystemEntity.typeSync(file.path, followLinks: false) !=
+            FileSystemEntityType.file) {
+      throw StateError('database_missing_with_prior_data');
+    }
     final openingIsolatePort = Isolate.current.controlPort;
     return NativeDatabase.createInBackground(
       file,
       setup: (database) {
+        if (requireExisting && database.userVersion == 0) {
+          throw StateError('database_missing_with_prior_data');
+        }
         if (!AppDatabase.acceptsLiveSchema(database.userVersion)) {
           throw StateError('database_schema_version');
         }
@@ -830,6 +901,56 @@ class AppDatabase extends _$AppDatabase {
           directOnly: true,
           function: (_) =>
               Isolate.current.controlPort == openingIsolatePort ? 1 : 0,
+        );
+        // Range previews receive lengths and presence flags, never text bodies.
+        // Dart's UTF-16 length and trim semantics match in-memory selection.
+        database.createFunction(
+          functionName: 'kelivo_text_length',
+          argumentCount: const AllowedArgumentCount(1),
+          deterministic: true,
+          directOnly: true,
+          function: (args) => (args.single as String).length,
+        );
+        // Background prompts consume a trimmed prefix. Clip on this worker
+        // before transferring text and keep the last Unicode scalar intact.
+        database.createFunction(
+          functionName: 'kelivo_trimmed_prefix',
+          argumentCount: const AllowedArgumentCount(2),
+          deterministic: true,
+          directOnly: true,
+          function: (args) {
+            final text = (args[0] as String? ?? '').trim();
+            final limit = args[1] as int;
+            return text.length <= limit
+                ? text
+                : text.substring(0, utf16SafeTailStart(text, limit));
+          },
+        );
+        database.createFunction(
+          functionName: 'kelivo_timestamp_micros',
+          argumentCount: const AllowedArgumentCount(1),
+          deterministic: true,
+          directOnly: true,
+          function: (args) =>
+              DateTime.parse(args.single as String).microsecondsSinceEpoch,
+        );
+        database.createFunction(
+          functionName: 'kelivo_has_context_content',
+          argumentCount: const AllowedArgumentCount(2),
+          deterministic: true,
+          directOnly: true,
+          function: (args) {
+            final kind = args[0] as String;
+            final payload = args[1] as String;
+            if (kind == 'text') return payload.trim().isNotEmpty ? 1 : 0;
+            if (kind != 'image' && kind != 'file') return 0;
+            try {
+              MessagePart.fromRow(kind, payload);
+              return 1;
+            } on FormatException {
+              return 0;
+            }
+          },
         );
         database.execute('PRAGMA journal_mode = WAL;');
         database.execute('PRAGMA foreign_keys = ON;');
@@ -940,6 +1061,19 @@ FROM probe;
         await m.createTable(schema.extensionEntityRows);
         // stepByStep does not create new indexes automatically.
         await m.create(schema.idxExtensionEntitiesKindOrder);
+      },
+      // v4 was never published: migrate directly between the frozen snapshots.
+      from3To5: (m, schema) async {
+        await m.createTable(schema.genUiSurfaceStateRows);
+        await customStatement(
+          'DELETE FROM chat_storage_meta_rows WHERE key = ?',
+          [GenUiDerivedSchema.searchBackfillKey],
+        );
+        // The composite PK creates the ordinary owner index with the table.
+        await m.create(schema.genUiSurfaceSearch);
+        await m.create(schema.genUiStateSearchInsert);
+        await m.create(schema.genUiStateSearchUpdate);
+        await m.create(schema.genUiStateSearchDelete);
       },
     ),
     beforeOpen: (details) async {

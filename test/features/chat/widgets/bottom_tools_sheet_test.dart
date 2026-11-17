@@ -72,6 +72,7 @@ class _FakeChatService extends ChatService {
     String? title,
     String? assistantId,
     bool temporary = false,
+    bool reuseNewEntry = false,
   }) async {
     final draft = Conversation(
       title: title ?? 'New Chat',
@@ -200,6 +201,16 @@ void main() {
     await tester.pump();
     return AppLocalizations.of(tester.element(find.byType(Scaffold)))!;
   }
+
+  testWidgets('more sheet retains browser entry with a window icon', (
+    tester,
+  ) async {
+    await pumpSheet(tester);
+    final row = tester.widget<ToolsSheetRow>(
+      find.byKey(const ValueKey('bottom-tools-browser')),
+    );
+    expect(row.icon, Lucide.AppWindow);
+  });
 
   testWidgets('hides camera and photos when those callbacks are null', (
     tester,

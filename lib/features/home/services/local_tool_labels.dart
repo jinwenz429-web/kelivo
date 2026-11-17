@@ -36,6 +36,8 @@ IconData localToolIcon(String id) {
       return Lucide.Smartphone;
     case LocalToolNames.phoneControl:
       return Lucide.Smartphone;
+    case LocalToolNames.browser:
+      return Lucide.AppWindow;
     case LocalToolNames.weather:
       return Lucide.CloudSun;
     case LocalToolNames.healthSummary:
@@ -75,6 +77,8 @@ String localToolTitle(AppLocalizations l10n, String id) {
       return 'Bluetooth LE';
     case LocalToolNames.phoneControl:
       return l10n.phoneControlTitle;
+    case LocalToolNames.browser:
+      return l10n.browserToolTitle;
     case LocalToolNames.weather:
       return l10n.assistantEditLocalToolWeatherTitle;
     case LocalToolNames.healthSummary:

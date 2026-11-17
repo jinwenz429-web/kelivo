@@ -6,17 +6,20 @@ import 'package:path/path.dart' as p;
 /// call can report which files it created or modified.
 class FileSnapshot {
   static const int defaultMaxEntries = 20000;
+  static const _ignoredDirectories = {'build', 'node_modules', '__pycache__'};
 
-  /// Returns host path → mtime milliseconds. Skips dot-directories and
-  /// `.l2s.*` overlay files. Caps at [maxEntries].
+  /// Returns host path → mtime milliseconds. Skips dot-directories, build/cache
+  /// directories and `.l2s.*` overlay files. Caps at [maxEntries].
   static Future<Map<String, int>> snapshot(
     List<Directory> roots, {
     int maxEntries = defaultMaxEntries,
+    void Function()? checkCancelled,
   }) async {
     final out = <String, int>{};
     for (final root in roots) {
+      checkCancelled?.call();
       if (!await root.exists()) continue;
-      await _walk(root, out, maxEntries);
+      await _walk(root, out, maxEntries, checkCancelled);
       if (out.length >= maxEntries) break;
     }
     return out;
@@ -41,15 +44,18 @@ class FileSnapshot {
     Directory dir,
     Map<String, int> out,
     int maxEntries,
+    void Function()? checkCancelled,
   ) async {
-    final children = await dir.list(followLinks: false).toList();
-    for (final entity in children) {
+    await for (final entity in dir.list(followLinks: false)) {
+      checkCancelled?.call();
       if (out.length >= maxEntries) return;
       final name = p.basename(entity.path);
       if (name.startsWith('.l2s.')) continue;
       if (entity is Directory) {
-        if (name.startsWith('.')) continue;
-        await _walk(entity, out, maxEntries);
+        if (name.startsWith('.') || _ignoredDirectories.contains(name)) {
+          continue;
+        }
+        await _walk(entity, out, maxEntries, checkCancelled);
         continue;
       }
       try {

@@ -1,3 +1,5 @@
+import 'package:Kelivo/core/services/chat/chat_service.dart';
+import '../../../support/mcp_presentation_harness.dart';
 import 'dart:convert';
 
 import 'package:Kelivo/core/providers/asr_provider.dart';
@@ -9,6 +11,8 @@ import 'package:Kelivo/core/providers/mcp_provider.dart';
 import 'package:Kelivo/core/providers/quick_phrase_provider.dart';
 import 'package:Kelivo/core/providers/settings_provider.dart';
 import 'package:Kelivo/core/providers/world_book_provider.dart';
+import 'package:Kelivo/desktop/tools_popover.dart';
+import 'package:Kelivo/features/home/services/local_tools_service.dart';
 import 'package:Kelivo/features/home/widgets/chat_input_bar.dart';
 import 'package:Kelivo/features/home/widgets/chat_input_section.dart';
 import 'package:Kelivo/l10n/app_localizations.dart';
@@ -28,13 +32,19 @@ void main() {
 
   late BusinessPreferences preferences;
 
-  setUp(() {
+  setUp(() async {
     preferences = createBusinessTestPreferences();
+    await preferences.setStringList('display_chat_tools_expanded_groups_v1', [
+      'mcp',
+    ]);
   });
 
   /// Loads the provider outside the fake clock: it reads through drift, and a
   /// widget test's timers never advance on their own.
-  Future<AssistantProvider> loadAssistantWithMcp(WidgetTester tester) async {
+  Future<AssistantProvider> loadAssistantWithMcp(
+    WidgetTester tester, {
+    List<String> localToolIds = const [],
+  }) async {
     late AssistantProvider provider;
     await tester.runAsync(() async {
       await preferences.setString(
@@ -44,15 +54,13 @@ void main() {
             'id': 'assistant-1',
             'name': 'Assistant',
             'mcpServerIds': ['server-1'],
+            'localToolIds': localToolIds,
           },
         ]),
       );
       await preferences.setString('current_assistant_id_v1', 'assistant-1');
       provider = AssistantProvider(preferences: preferences);
-      for (var i = 0; i < 100; i++) {
-        if (provider.currentAssistant != null) break;
-        await Future<void>.delayed(const Duration(milliseconds: 10));
-      }
+      await provider.loaded;
     });
     return provider;
   }
@@ -62,42 +70,87 @@ void main() {
     required AssistantProvider assistants,
     required bool isConversationOverride,
     SettingsProvider? settingsOverride,
+    McpProvider? mcpOverride,
     bool supportsReasoning = false,
+    String? providerKey = 'SomeProvider',
+    String? modelId = 'no-tools-model',
+    bool supportsTools = false,
+    bool desktopTools = false,
+    double composerWidth = 800,
+    VoidCallback? openBrowser,
+    GlobalKey? reasoningButtonKey,
   }) async {
     final settings = settingsOverride ?? SettingsProvider(preferences);
+    final inputBarKey = GlobalKey();
     await tester.pumpWidget(
       MultiProvider(
         providers: [
+          Provider<BusinessPreferences>.value(value: preferences),
           ChangeNotifierProvider.value(value: settings),
           ChangeNotifierProvider.value(value: assistants),
           ChangeNotifierProvider(create: (_) => AsrProvider()),
           ChangeNotifierProvider(
-            create: (_) => McpProvider(preferences: preferences),
+            create: (_) => WorldBookProvider(preferences: preferences),
           ),
+          ChangeNotifierProvider(
+            create: (_) =>
+                InstructionInjectionProvider(preferences: preferences),
+          ),
+          ChangeNotifierProvider(create: (_) => ChatService()),
+          if (mcpOverride != null)
+            ChangeNotifierProvider<McpProvider>.value(value: mcpOverride)
+          else
+            ChangeNotifierProvider(
+              create: (_) => McpProvider(preferences: preferences),
+            ),
           ChangeNotifierProvider(
             create: (_) => QuickPhraseProvider(preferences: preferences),
           ),
         ],
         child: MaterialApp(
+          theme: desktopTools
+              ? ThemeData(platform: TargetPlatform.macOS)
+              : null,
           localizationsDelegates: AppLocalizations.localizationsDelegates,
           supportedLocales: AppLocalizations.supportedLocales,
           home: Scaffold(
-            body: ChatInputSection(
-              inputBarKey: GlobalKey(),
-              chatModelProviderKey: 'SomeProvider',
-              chatModelId: 'no-tools-model',
-              chatModelIsConversationOverride: isConversationOverride,
-              inputFocus: FocusNode(),
-              inputController: TextEditingController(),
-              mediaController: ChatInputBarController(),
-              isTablet: false,
-              isLoading: false,
-              // The model in play supports neither tools nor reasoning, which
-              // is what triggers the enforcement under test.
-              isToolModel: (_, _) => false,
-              isReasoningModel: (_, _) => supportsReasoning,
-              isReasoningEnabled: (request) =>
-                  request.level != ReasoningLevel.off,
+            body: Builder(
+              builder: (context) {
+                final section = ChatInputSection(
+                  inputBarKey: inputBarKey,
+                  reasoningButtonKey: reasoningButtonKey,
+                  chatModelProviderKey: providerKey,
+                  chatModelId: modelId,
+                  chatModelIsConversationOverride: isConversationOverride,
+                  inputFocus: FocusNode(),
+                  inputController: TextEditingController(),
+                  mediaController: ChatInputBarController(),
+                  isTablet: desktopTools,
+                  isLoading: false,
+                  isToolModel: (_, _) => supportsTools,
+                  isReasoningModel: (_, _) => supportsReasoning,
+                  isReasoningEnabled: (request) =>
+                      request.level != ReasoningLevel.off,
+                  onOpenBrowser: desktopTools ? openBrowser ?? () {} : null,
+                  onOpenTools: desktopTools
+                      ? () => showDesktopToolsPopover(
+                          context,
+                          anchorKey: inputBarKey,
+                          assistantId: assistants.currentAssistant!.id,
+                          supportsModelTools:
+                              providerKey != null &&
+                              modelId != null &&
+                              supportsTools,
+                        )
+                      : null,
+                );
+                return desktopTools
+                    ? Align(
+                        alignment: Alignment.bottomCenter,
+                        child: SizedBox(width: composerWidth, child: section),
+                      )
+                    : section;
+              },
             ),
           ),
         ),
@@ -106,6 +159,126 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 50));
   }
+
+  for (final scenario in [
+    (name: 'no model', providerKey: null, modelId: null, supportsTools: false),
+    (
+      name: 'a model without tools',
+      providerKey: 'SomeProvider',
+      modelId: 'no-tools-model',
+      supportsTools: false,
+    ),
+    (
+      name: 'a tool-capable model',
+      providerKey: 'SomeProvider',
+      modelId: 'tool-model',
+      supportsTools: true,
+    ),
+  ]) {
+    testWidgets(
+      'reasoning anchor follows the toolbar button and its overflow entry',
+      (tester) async {
+        final assistants = await loadAssistantWithMcp(tester);
+        final key = GlobalKey();
+        for (final width in [800.0, 180.0]) {
+          await pumpComposer(
+            tester,
+            assistants: assistants,
+            isConversationOverride: false,
+            supportsReasoning: true,
+            desktopTools: true,
+            composerWidth: width,
+            reasoningButtonKey: key,
+          );
+          await tester.pumpAndSettle();
+          expect(key.currentContext, isNotNull);
+          final box = key.currentContext!.findRenderObject() as RenderBox;
+          expect(box.size.width, lessThan(80));
+          expect(box.size.height, lessThan(60));
+        }
+      },
+    );
+
+    testWidgets('desktop browser entry stays available with ${scenario.name}', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1000, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final assistants = await loadAssistantWithMcp(
+        tester,
+        localToolIds: const [LocalToolNames.browser],
+      );
+      await pumpComposer(
+        tester,
+        assistants: assistants,
+        isConversationOverride: true,
+        providerKey: scenario.providerKey,
+        modelId: scenario.modelId,
+        supportsTools: scenario.supportsTools,
+        desktopTools: true,
+      );
+      final bar = tester.widget<ChatInputBar>(find.byType(ChatInputBar));
+      expect(bar.showToolsButton, scenario.supportsTools);
+      expect(bar.toolsActive, scenario.supportsTools);
+      expect(bar.onOpenBrowser, isNotNull);
+      expect(find.byTooltip('Open browser'), findsOneWidget);
+      if (scenario.supportsTools) {
+        await tester.tap(find.byTooltip('Tools'));
+        await tester.pumpAndSettle();
+        expect(find.text('Open browser'), findsNothing);
+        expect(find.text('Local Tools'), findsOneWidget);
+        await tester.scrollUntilVisible(
+          find.text('Browser control'),
+          200,
+          scrollable: find
+              .descendant(
+                of: find.byType(ListView).last,
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
+        expect(find.text('Browser control'), findsOneWidget);
+      } else {
+        expect(find.byTooltip('Tools'), findsNothing);
+      }
+      expect(assistants.currentAssistant!.localToolIds, [
+        LocalToolNames.browser,
+      ]);
+      expect(assistants.currentAssistant!.mcpServerIds, ['server-1']);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
+  testWidgets(
+    'narrow desktop moves browser action into More without model tools',
+    (tester) async {
+      tester.view.physicalSize = const Size(1000, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      var opened = false;
+      final assistants = await loadAssistantWithMcp(tester);
+      await pumpComposer(
+        tester,
+        assistants: assistants,
+        isConversationOverride: true,
+        desktopTools: true,
+        composerWidth: 220,
+        openBrowser: () => opened = true,
+      );
+      expect(find.byTooltip('Tools'), findsNothing);
+      await tester.tap(find.byTooltip('Add'));
+      await tester.pumpAndSettle();
+      expect(find.text('Open browser'), findsOneWidget);
+      await tester.tap(find.text('Open browser'));
+      await tester.pumpAndSettle();
+      expect(opened, isTrue);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('a conversation-pinned model leaves the assistant alone', (
     tester,
@@ -217,6 +390,66 @@ void main() {
     );
 
     expect(assistants.currentAssistant?.mcpServerIds, isEmpty);
+  });
+
+  testWidgets(
+    'conversation MCP mode keeps assistant defaults when the model lacks tools',
+    (tester) async {
+      final assistants = await loadAssistantWithMcp(tester);
+      await tester.runAsync(
+        () => assistants.updateAssistant(
+          assistants.currentAssistant!.copyWith(allowConversationMcp: true),
+        ),
+      );
+      await pumpComposer(
+        tester,
+        assistants: assistants,
+        isConversationOverride: false,
+      );
+      expect(assistants.currentAssistant!.mcpServerIds, ['server-1']);
+      expect(
+        tester.widget<ChatInputBar>(find.byType(ChatInputBar)).toolsActive,
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets('selected offline MCP stays selected and marks the tools entry', (
+    tester,
+  ) async {
+    final assistants = await loadAssistantWithMcp(tester);
+    final mcp = (await tester.runAsync(() async {
+      final provider = PresentationMcpProvider(preferences: preferences);
+      await provider.loaded;
+      return provider;
+    }))!;
+    mcp.items = [presentationServer('server-1', 'Offline')];
+    mcp.statuses['server-1'] = McpStatus.error;
+    addTearDown(mcp.dispose);
+    await pumpComposer(
+      tester,
+      assistants: assistants,
+      isConversationOverride: true,
+      supportsTools: true,
+      mcpOverride: mcp,
+    );
+    expect(
+      tester.widget<ChatInputBar>(find.byType(ChatInputBar)).toolsActive,
+      isTrue,
+    );
+    expect(
+      find.byKey(const ValueKey('chat-tools-connection-issue')),
+      findsOneWidget,
+    );
+    expect(assistants.getById('assistant-1')!.mcpServerIds, ['server-1']);
+    mcp.statuses['server-1'] = McpStatus.connected;
+    mcp.notifyListeners();
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('chat-tools-connection-issue')),
+      findsNothing,
+    );
+    expect(assistants.getById('assistant-1')!.mcpServerIds, ['server-1']);
   });
 
   Future<void> pumpTabletComposer(

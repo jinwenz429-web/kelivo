@@ -244,9 +244,12 @@ final class Annotations extends StreamChunk {
 }
 
 final class Usage extends StreamChunk {
-  const Usage(this.usage, {this.startsRequest = false});
+  const Usage(this.usage, {this.startsRequest = false, this.estimated = false});
 
   final TokenUsage usage;
+
+  /// Local size estimates are not provider-reported, billable usage.
+  final bool estimated;
 
   /// The first usage snapshot of another API request in this turn.
   /// Later snapshots replace counters within that request; they are not deltas.
@@ -259,6 +262,13 @@ final class Finish extends StreamChunk {
   final String? finishReason;
   final String? responseId;
   final String? model;
+}
+
+/// One response is complete; its client tool results precede the next response.
+final class AssistantRoundEnd extends StreamChunk {
+  const AssistantRoundEnd({this.reasoningDetails});
+
+  final List<dynamic>? reasoningDetails;
 }
 
 /// Emitted between attempts while auto-retry is waiting to try again.

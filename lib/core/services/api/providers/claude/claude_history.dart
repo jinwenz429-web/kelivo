@@ -1,7 +1,11 @@
+import '../../request_history_context.dart';
+import '../../request_image_context.dart';
 import 'dart:convert';
 
+import '../../../../models/model_spec.dart';
 import '../../../../utils/multimodal_input_utils.dart';
 import '../../../../../utils/sandbox_path_resolver.dart';
+import '../../../../../utils/utf16_safe_cut.dart';
 import '../../chat_api_helpers.dart';
 import '../../native_input_attachments.dart';
 import '../../tool_result_content.dart';
@@ -15,15 +19,24 @@ import 'claude_container.dart';
 /// message with the client results between them — so the boundary is
 /// recorded here rather than inferred from the blocks later.
 ///
-/// Written after every response once the turn has called a tool, so a turn
-/// cut short still replays up to the last response that completed. A turn
-/// without one replays from its text alone and stores nothing. It travels
-/// into the next request under [multimodalInternalClaudeTurnKey], on the
-/// assistant message that holds the turn's tool calls.
+/// Written after every response, so a turn cut short still replays up to the
+/// last response that completed. It travels into the next request under
+/// [multimodalInternalClaudeTurnKey], on the assistant message that holds the
+/// turn's tool calls, or on the ordinary assistant message without tools.
 const String claudeTurnArtifactKind = 'claude_turn';
 
 String encodeClaudeTurn(List<List<Map<String, dynamic>>> responses) =>
     jsonEncode(responses);
+
+/// Append this request's cumulative responses to the message's pre-request
+/// snapshot. Repeated artifact writes must not append to the previous upsert.
+String appendClaudeTurn(String? prefix, String current) {
+  if (prefix == null) return current;
+  final previous = decodeClaudeTurn(prefix);
+  final next = decodeClaudeTurn(current);
+  if (previous == null || next == null) return current;
+  return encodeClaudeTurn([...previous, ...next]);
+}
 
 List<List<Map<String, dynamic>>>? decodeClaudeTurn(Object? payload) {
   if (payload is! String || payload.isEmpty) return null;
@@ -32,6 +45,53 @@ List<List<Map<String, dynamic>>>? decodeClaudeTurn(Object? payload) {
   } catch (_) {
     return null;
   }
+}
+
+/// A body edit retains native tool boundaries and opaque thinking. Redistribute
+/// text over its existing slots, as ChatMessage does for rendered parts. Later
+/// thinking whose prefix changed is handled by the normal signature recovery.
+String? editClaudeTurnText(
+  String payload,
+  String content, {
+  required String originalContent,
+}) {
+  final responses = decodeClaudeTurn(payload);
+  if (responses == null) return null;
+  final recordedText = joinedTextOfBlocks(responses.expand((blocks) => blocks));
+  if (originalContent.startsWith(recordedText) &&
+      originalContent.length > recordedText.length) {
+    // Cancellation can leave a later response's visible text outside the
+    // artifact. Give that tail its own slot after the recorded tool results,
+    // rather than moving it into the last completed response during editing.
+    responses.add([
+      {'type': 'text', 'text': originalContent.substring(recordedText.length)},
+    ]);
+  }
+  final textBlocks = responses
+      .expand((blocks) => blocks)
+      .where((block) => block['type'] == 'text')
+      .toList();
+  final texts = redistributeTextUtf16Safe(content, [
+    for (final block in textBlocks) (block['text'] ?? '').toString().length,
+  ]);
+  for (var i = 0; i < textBlocks.length; i++) {
+    final block = textBlocks[i];
+    final oldText = (block['text'] ?? '').toString();
+    final text = texts[i];
+    if (text != oldText) {
+      block['text'] = text;
+      // Citation offsets refer to the original text.
+      block.remove('citations');
+    }
+  }
+  // Empty slots still locate text relative to tools on the next edit. Keep
+  // them in the stored artifact; sanitize removes them from API requests.
+  if (textBlocks.isEmpty && content.isNotEmpty) {
+    responses.add([
+      {'type': 'text', 'text': content},
+    ]);
+  }
+  return encodeClaudeTurn(responses);
 }
 
 /// Block lists read off persisted JSON, empty ones dropped.
@@ -93,10 +153,12 @@ class ClaudeHistory {
   ClaudeHistory({
     required this.replayServerToolBlocks,
     required this.skipRedactedThinkingBlocks,
+    required this.reasoningReplay,
     required this.nativeInputs,
     this.skipImageParsing = false,
     this.canImageInput = true,
     this.userImagePaths,
+    this.downloadRemoteImage,
   });
 
   /// Only Anthropic runs a server tool or decrypts what one returned, so
@@ -104,10 +166,15 @@ class ClaudeHistory {
   /// synthesised client pair, exactly as it did before these tools existed.
   final bool replayServerToolBlocks;
   final bool skipRedactedThinkingBlocks;
+  final ReasoningReplayPolicy reasoningReplay;
   final bool skipImageParsing;
   final bool canImageInput;
   final NativeInputAttachments nativeInputs;
   final List<String>? userImagePaths;
+
+  /// Vertex requires base64 images, including authenticated Google media.
+  /// Other Messages endpoints retain remote references as text.
+  final Future<String> Function(String url)? downloadRemoteImage;
 
   /// The container the conversation's last code execution ran in, stored
   /// against that assistant message. The latest one wins. Set by [build].
@@ -127,12 +194,20 @@ class ClaudeHistory {
   final unseenDataFiles = <InternalDocumentRef>[];
   final turnDataFiles = <InternalDocumentRef>[];
 
-  /// The blocks of one response as this endpoint may be sent them.
-  List<Map<String, dynamic>> sanitize(Iterable<Map> blocks) {
+  /// The blocks of one response as this endpoint may be sent them. Current
+  /// tool continuations keep thinking; the replay setting filters history.
+  List<Map<String, dynamic>> sanitize(
+    Iterable<Map> blocks, {
+    bool replayThinking = true,
+  }) {
     return [
       for (final block in blocks)
-        if (_keepBlock((block['type'] ?? '').toString()))
-          block.map((key, value) => MapEntry(key.toString(), value)),
+        if (_keepBlock((block['type'] ?? '').toString()) &&
+            !(block['type'] == 'text' && block['text'] == ''))
+          if (replayThinking ||
+              (block['type'] != 'thinking' &&
+                  block['type'] != 'redacted_thinking'))
+            block.map((key, value) => MapEntry(key.toString(), value)),
     ];
   }
 
@@ -157,6 +232,10 @@ class ClaudeHistory {
     // here and open the following user message, so the model still sees them.
     final carriedImages = <Map<String, dynamic>>[];
     _ReplayedTurn? turn;
+    final turnSources = Expando<String>();
+    final resultSources = <String, String>{};
+    final lastUserIndex = lastUserInputIndex(messages);
+    final hasOwners = messages.any((m) => m.containsKey(imageContextOwnerKey));
 
     /// A result is sent only once the call it answers has been: the API
     /// rejects one pointing at a `tool_use` that is not in the history.
@@ -168,7 +247,15 @@ class ClaudeHistory {
         if (replayedClientCalls.contains(id)) taken.add(result);
         return true;
       });
-      if (taken.isNotEmpty) out.add({'role': 'user', 'content': taken});
+      if (taken.isNotEmpty) {
+        out.add({
+          'role': 'user',
+          'content': taken,
+          if (resultSources[taken.first['tool_use_id']]
+              case final String source)
+            historySourceKey: source,
+        });
+      }
     }
 
     /// Emits the next response of [turn], behind the client results of the
@@ -190,6 +277,8 @@ class ClaudeHistory {
         final message = <String, dynamic>{
           'role': 'assistant',
           'content': blocks,
+          if (turnSources[turn] case final String source)
+            historySourceKey: source,
         };
         out.add(message);
         turn.messages.add(message);
@@ -201,16 +290,31 @@ class ClaudeHistory {
     /// The persisted assistant message after a replayed turn aggregates the
     /// text of every response of it, which the replayed blocks already carry.
     /// Only what they stop short of — a snapshot cut mid-stream, or a last
-    /// response that had no card to record it — is still to be sent; on any
-    /// other disagreement the blocks win, being what the API produced.
+    /// response that had no card to record it — is still to be sent. An edit
+    /// replaces the recorded text in its first slot, like the message editor,
+    /// while leaving tool calls and their results in their original positions.
     void foldTurnText(_ReplayedTurn turn, Map<String, dynamic> m) {
-      final said = turn.text.trim();
-      final text = (m['content'] ?? '').toString().trim();
-      final rest = said.isEmpty
-          ? text
-          : text.startsWith(said)
-          ? text.substring(said.length).trim()
-          : '';
+      final said = turn.text;
+      final text = (m['content'] ?? '').toString();
+      if (said.isNotEmpty && !text.startsWith(said)) {
+        var replaced = false;
+        for (final message in turn.messages) {
+          final blocks = <Map<String, dynamic>>[];
+          for (final block
+              in (message['content'] as List).cast<Map<String, dynamic>>()) {
+            if (block['type'] != 'text') {
+              blocks.add(block);
+            } else if (!replaced) {
+              if (text.isNotEmpty) blocks.add({'type': 'text', 'text': text});
+              replaced = true;
+            }
+          }
+          message['content'] = blocks;
+          if (blocks.isEmpty) out.remove(message);
+        }
+        return;
+      }
+      final rest = said.isEmpty ? text : text.substring(said.length);
       // Nothing left to say. The results may now sit next to the user message
       // after them, which the API combines into the one turn they already were.
       if (rest.isEmpty) return;
@@ -219,7 +323,12 @@ class ClaudeHistory {
         (last['content'] as List).add({'type': 'text', 'text': rest});
       } else {
         flushResults();
-        out.add({'role': 'assistant', 'content': rest});
+        out.add({
+          'role': 'assistant',
+          'content': rest,
+          if (m[historySourceKey] != null)
+            historySourceKey: m[historySourceKey],
+        });
       }
     }
 
@@ -241,10 +350,13 @@ class ClaudeHistory {
         ).where((doc) => isSandboxDataFile(fileName: doc.name, mime: doc.mime));
         dataFiles.addAll(files);
         unseenDataFiles.addAll(files);
-        if (i == messages.length - 1) turnDataFiles.addAll(files);
+        if (i == lastUserIndex) turnDataFiles.addAll(files);
       }
       if (role == 'tool') {
         final id = (m['tool_call_id'] ?? '').toString();
+        if (m[historySourceKey] case final String source) {
+          resultSources[id] = source;
+        }
         // A server tool replayed as its own blocks already carries its result.
         if (id.isNotEmpty && !(turn?.serverToolIds.contains(id) ?? false)) {
           pendingResults.add({
@@ -254,6 +366,7 @@ class ClaudeHistory {
               (m['name'] ?? '').toString(),
               (m['content'] ?? '').toString(),
               metadata: (m['metadata'] as Map?)?.cast<String, dynamic>(),
+              toolCallId: m['tool_call_id']?.toString(),
               canImageInput: canImageInput,
             )).claudeContent,
           });
@@ -289,6 +402,9 @@ class ClaudeHistory {
         final toolCalls = m['tool_calls'] as List;
         turn = _readTurn(m, toolCalls);
         if (turn != null) {
+          if (m[historySourceKey] case final String source) {
+            turnSources[turn] = source;
+          }
           if (turn.responses.isNotEmpty) emitResponse(turn);
         } else {
           // Nothing recorded of the turn: rebuild it from the calls.
@@ -302,21 +418,42 @@ class ClaudeHistory {
             if (block != null) blocks.add(block);
           }
           if (blocks.isNotEmpty) {
-            out.add({'role': 'assistant', 'content': blocks});
+            out.add({
+              'role': 'assistant',
+              'content': blocks,
+              if (m[historySourceKey] != null)
+                historySourceKey: m[historySourceKey],
+            });
             replayedClientCalls.addAll(toolUseIdsInBlocks(blocks));
           }
         }
         continue;
       }
 
-      out.add(
-        await _plainMessage(
-          m,
-          role,
-          isLast: i == messages.lastIndexWhere((m) => m['role'] == 'user'),
-          carriedImages: carriedImages,
-        ),
+      if (role == 'assistant') {
+        final plainTurn = _readTurn(m, const []);
+        if (plainTurn != null) {
+          if (m[historySourceKey] case final String source) {
+            turnSources[plainTurn] = source;
+          }
+          while (plainTurn.emitted < plainTurn.responses.length) {
+            emitResponse(plainTurn);
+          }
+          foldTurnText(plainTurn, m);
+          continue;
+        }
+      }
+
+      final plainMessage = await _plainMessage(
+        m,
+        role,
+        isLast: i == lastUserIndex,
+        carriedImages: isUserInputMessage(m, hasOwners: hasOwners)
+            ? carriedImages
+            : <Map<String, dynamic>>[],
       );
+      RequestHistoryContext.mark(m, [plainMessage]);
+      out.add(plainMessage);
     }
 
     if (turn != null && turn.emitted < turn.responses.length) {
@@ -340,7 +477,7 @@ class ClaudeHistory {
     return out;
   }
 
-  /// The turn a persisted tool message records: the stored turn artifact, or
+  /// The turn a persisted assistant message records: the stored turn artifact, or
   /// for a message written before there was one, the fullest of its cards —
   /// each held the responses up to the one that last wrote it, so the last
   /// one written holds them all. Null when nothing recorded any.
@@ -356,6 +493,22 @@ class ClaudeHistory {
     }
     if (recorded == null) return null;
 
+    final recordedBlocks = recorded.expand((blocks) => blocks);
+    final recordedText = joinedTextOfBlocks(recordedBlocks);
+    if (m['tool_calls'] is! List &&
+        (toolUseIdsInBlocks(recordedBlocks, clientOnly: true).isNotEmpty ||
+            !(m['content'] ?? '').toString().startsWith(recordedText))) {
+      // An ordinary message cannot answer a recorded client tool call. An
+      // edited reply also owns its text, rather than reviving the old response.
+      return null;
+    }
+    final replayThinking = switch (reasoningReplay) {
+      ReasoningReplayPolicy.all => true,
+      ReasoningReplayPolicy.toolTurns =>
+        toolCalls.isNotEmpty || toolUseIdsInBlocks(recordedBlocks).isNotEmpty,
+      ReasoningReplayPolicy.none => false,
+    };
+
     final cards = <String, Map>{
       for (final tc in toolCalls.whereType<Map>())
         if ((tc['id'] ?? '').toString() case final id when id.isNotEmpty)
@@ -367,7 +520,7 @@ class ClaudeHistory {
     for (final raw in recorded) {
       // A `server_tool_use` whose result never arrived — the stream stopped
       // between the two — would replay as a call with no output.
-      final blocks = sanitize(raw)
+      final blocks = sanitize(raw, replayThinking: replayThinking)
         ..removeWhere(
           (block) =>
               block['type'] == 'server_tool_use' &&
@@ -388,14 +541,14 @@ class ClaudeHistory {
     // that made it — comes after everything that was recorded.
     for (final entry in cards.entries) {
       if (declared.contains(entry.key)) continue;
-      final block = _toolUseBlockFromToolCall(entry.value);
+      final block = _toolUseBlockFromToolCall(entry.value, recordedTurn: true);
       if (block != null) responses.last.add(block);
     }
     // A turn left with nothing to send still owns its `tool` messages.
     responses.removeWhere((blocks) => blocks.isEmpty);
     return _ReplayedTurn(
       responses: responses,
-      text: joinedTextOfBlocks(recorded.expand((blocks) => blocks)),
+      text: recordedText,
       serverToolIds: replayServerToolBlocks
           ? {
               for (final block in recorded.expand((blocks) => blocks))
@@ -419,11 +572,28 @@ class ClaudeHistory {
     );
   }
 
-  static Map<String, dynamic>? _toolUseBlockFromToolCall(Map? tc) {
+  static final _toolUseIdPattern = RegExp(r'^[a-zA-Z0-9_-]+$');
+
+  Map<String, dynamic>? _toolUseBlockFromToolCall(
+    Map? tc, {
+    bool recordedTurn = false,
+  }) {
     if (tc == null) return null;
     final id = (tc['id'] ?? '').toString();
     final fn = tc['function'];
-    if (id.isEmpty || fn is! Map) return null;
+    // Display-only ids (including citation cards in already stored messages)
+    // cannot declare an Anthropic tool call. Its unmatched result is dropped.
+    if (!_toolUseIdPattern.hasMatch(id) || fn is! Map) return null;
+    // A native recording owns server calls; its extra cards are only display.
+    // Without a recording, valid cards may come from a different provider and
+    // still carry useful tool history when the user switches to Claude.
+    final metadata = tc['metadata'];
+    if (replayServerToolBlocks &&
+        recordedTurn &&
+        metadata is Map &&
+        metadata['server'] == true) {
+      return null;
+    }
     Map<String, dynamic> input = const <String, dynamic>{};
     try {
       input = (jsonDecode((fn['arguments'] ?? '{}').toString()) as Map)
@@ -492,21 +662,37 @@ class ClaudeHistory {
     final text = <Map<String, dynamic>>[];
     final images = <Map<String, dynamic>>[];
     final seenSources = <String>{};
-    String normalizeSrc(String src) {
-      if (src.startsWith('http') || src.startsWith('data:')) return src;
-      try {
-        return SandboxPathResolver.fix(src);
-      } catch (_) {
-        return src;
-      }
-    }
+    String normalizeSrc(String src) => SandboxPathResolver.dedupeKey(src);
 
     Future<void> addClaudeImage(String source, {String? explicitMime}) async {
       final normalized = normalizeSrc(source);
       if (!seenSources.add(normalized)) return;
       if (source.startsWith('http://') || source.startsWith('https://')) {
-        // Preserve prior official-Claude behavior for remote URLs.
-        text.add({'type': 'text', 'text': source});
+        final download = downloadRemoteImage;
+        if (download == null) {
+          text.add({'type': 'text', 'text': source});
+          return;
+        }
+        try {
+          final mime = normalizeClaudeImageMime(
+            explicitMime?.trim().isNotEmpty == true
+                ? explicitMime!
+                : mimeFromPath(Uri.parse(source).path),
+          );
+          images.add({
+            'type': 'image',
+            'source': {
+              'type': 'base64',
+              'media_type': mime,
+              'data': await download(source),
+            },
+          });
+        } catch (_) {
+          text.add({
+            'type': 'text',
+            'text': '(image failed to download) $source',
+          });
+        }
         return;
       }
       if (source.startsWith('data:')) {
@@ -543,6 +729,8 @@ class ClaudeHistory {
 
     final parsed = await parseTextAndImages(
       raw,
+      literalText: internalLiteralText(m),
+      imageReferences: internalImageReferences(m),
       allowRemoteImages: true,
       allowLocalImages: true,
       keepRemoteMarkdownText: true,
@@ -585,12 +773,6 @@ class ClaudeHistory {
   }
 }
 
-String normalizeClaudeImageMime(String mime) {
-  final normalized = mime.trim().toLowerCase();
-  if (normalized == 'image/jpg') return 'image/jpeg';
-  return normalized;
-}
-
 bool isClaudeSupportedImageMime(String mime) {
   switch (normalizeClaudeImageMime(mime)) {
     case 'image/jpeg':
@@ -603,7 +785,7 @@ bool isClaudeSupportedImageMime(String mime) {
   }
 }
 
-/// A persisted tool turn being replayed: its responses in the order the API
+/// A persisted turn being replayed: its responses in the order the API
 /// produced them, sanitised for this endpoint, and how far the replay got.
 class _ReplayedTurn {
   _ReplayedTurn({

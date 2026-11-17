@@ -94,8 +94,14 @@ void main() {
             bucket: 'backup-bucket',
             accessKeyId: 'test-access-key',
             secretAccessKey: 'test-secret-key',
-            includeChats: false,
-            includeFiles: false,
+            scope: BackupScope(
+              excluded: {
+                BackupCategory.chats,
+                BackupCategory.files,
+                BackupCategory.skills,
+                BackupCategory.workspaces,
+              },
+            ),
           ),
         );
         await provider.restoreFromItem(
@@ -111,7 +117,12 @@ void main() {
 
       expect(await relativeSentinel.readAsString(), 'keep relative');
       expect(await absoluteSentinel.readAsString(), 'keep absolute');
-      expect(await Directory('${root.path}/tmp').list().toList(), isEmpty);
+      expect(
+        await Directory(
+          '${root.path}/tmp/kelivo_backup_staging',
+        ).list().toList(),
+        isEmpty,
+      );
     });
   });
 }

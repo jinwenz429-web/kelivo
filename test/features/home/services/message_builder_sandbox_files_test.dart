@@ -1,3 +1,4 @@
+import 'package:Kelivo/core/services/chat/document_text_extractor.dart';
 import 'dart:io';
 
 import 'package:drift/drift.dart' show driftRuntimeOptions;
@@ -146,7 +147,7 @@ void main() {
   );
 
   test(
-    'native PDF bypasses extraction and workspace routing even from API refs',
+    'native PDF keeps its workspace path and native document ref without extraction',
     () async {
       final s = await setUpService();
       final uri = '${tempDir.path}/report.pdf';
@@ -169,7 +170,7 @@ void main() {
           name: 'report.pdf',
           sourceUri: uri,
           size: 8,
-          modelPath: '/chat/attachments/report.pdf',
+          modelPath: '/chat/attachments/report (2).pdf',
         ),
       };
       expect(
@@ -191,7 +192,12 @@ void main() {
         nativePdfInput: true,
         workspaceAttachments: workspace,
       );
-      expect(apiMessages.single['content'], 'Read this PDF');
+      expect(apiMessages.single['content'], contains('Read this PDF'));
+      expect(
+        apiMessages.single['content'],
+        contains('/chat/attachments/report (2).pdf'),
+      );
+      expect(apiMessages.single['content'], contains('8 bytes'));
       expect(
         parseInternalDocumentRefs(
           apiMessages.single[multimodalInternalDocumentPathsKey],
@@ -249,6 +255,143 @@ void main() {
     },
   );
 
+  test(
+    'regular chat sends decoded historical text and a localized notice after the truncated file only',
+    () async {
+      final s = await setUpService();
+      await s.settings.setAppLocale(const Locale('zh'));
+      notes.writeAsBytesSync([0xd6, 0xd0, 0xce, 0xc4]);
+      csv.writeAsStringSync('😀' * 100000 + '不应发送');
+      final api = s.service.buildApiMessages(
+        messages: [s.m],
+        versionSelections: const {},
+        currentConversation: Conversation(title: 'test'),
+      );
+      await s.service.processUserMessagesForApi(
+        api,
+        s.settings,
+        null,
+        sourceMessages: [s.m],
+      );
+      final content = api.single['content'] as String;
+      expect(content, contains('中文'));
+      expect(content, isNot(contains('不应发送')));
+      expect(
+        content,
+        contains(
+          '</content>\n文件过大，只读取了前 100000 字，建议拆分后再发送\n\n## user sent a file: notes.txt',
+        ),
+      );
+      expect('建议拆分'.allMatches(content), hasLength(1));
+    },
+  );
+
+  test(
+    'missing historical files do not block a later turn, but an unreadable current attachment is reported',
+    () async {
+      final s = await setUpService();
+      final current = ChatMessage(
+        id: 'new',
+        role: 'user',
+        conversationId: 'c1',
+        content: 'continue',
+      );
+      notes.deleteSync();
+      Future<String> prompt(List<ChatMessage> turns) async {
+        final api = s.service.buildApiMessages(
+          messages: turns,
+          versionSelections: const {},
+          currentConversation: Conversation(title: 'test'),
+        );
+        await s.service.processUserMessagesForApi(
+          api,
+          s.settings,
+          null,
+          sourceMessages: turns,
+        );
+        return api.map((m) => m['content']).join();
+      }
+
+      expect(await prompt([s.m, current]), contains('continue'));
+      await expectLater(
+        prompt([s.m]),
+        throwsA(
+          isA<AttachmentReadError>().having(
+            (error) => error.problem,
+            'reason',
+            AttachmentProblem.missing,
+          ),
+        ),
+      );
+      notes.writeAsBytesSync([0xd6, 0xd0, 0xce, 0xc4]);
+      expect(await prompt([s.m, current]), contains('中文'));
+    },
+  );
+
+  test(
+    'images stored as FileParts use the media path without a text probe',
+    () async {
+      final s = await setUpService();
+      final image = File('${tempDir.path}/image.png')
+        ..writeAsBytesSync([0, 0, 0, 1]);
+      final turn = ChatMessage(
+        id: 'old-image',
+        role: 'user',
+        conversationId: 'c1',
+        parts: [
+          const TextPart('view'),
+          FilePart(uri: image.path, name: 'image.png', mime: 'image/png'),
+        ],
+      );
+      final api = s.service.buildApiMessages(
+        messages: [turn],
+        versionSelections: const {},
+        currentConversation: Conversation(title: 'test'),
+      );
+      expect(
+        s.service.hasPendingAttachmentWork(
+          api,
+          s.settings,
+          sourceMessages: [turn],
+        ),
+        isFalse,
+      );
+      expect(
+        await s.service.processUserMessagesForApi(
+          api,
+          s.settings,
+          null,
+          sourceMessages: [turn],
+        ),
+        contains(image.path),
+      );
+      expect(api.single['content'], 'view');
+    },
+  );
+
+  test(
+    'truncated whitespace sends its notice without a huge empty content block',
+    () async {
+      final s = await setUpService();
+      await s.settings.setAppLocale(const Locale('en'));
+      notes.writeAsStringSync('\n' * 100001);
+      final api = s.service.buildApiMessages(
+        messages: [s.m],
+        versionSelections: const {},
+        currentConversation: Conversation(title: 'test'),
+      );
+      await s.service.processUserMessagesForApi(
+        api,
+        s.settings,
+        null,
+        sourceMessages: [s.m],
+      );
+      final prompt = api.single['content'] as String;
+      expect(prompt, contains('only the first 100000 characters were read'));
+      expect(prompt.length, lessThan(1000));
+    },
+  );
+
   test('with a sandbox the data file stays out of the prompt', () async {
     final s = await setUpService();
     final apiMessages = s.service.buildApiMessages(
@@ -273,6 +416,115 @@ void main() {
     );
     expect(refs.map((r) => r.name), contains('sales.csv'));
   });
+
+  for (final useSourceMessages in [false, true]) {
+    test(
+      'workspace paths follow only this message and deduplicate image/file refs '
+      '(source messages: $useSourceMessages)',
+      () async {
+        final s = await setUpService();
+        final imagePath = '${tempDir.path}/image.png';
+        final missingPath = '${tempDir.path}/unavailable.png';
+        final message = ChatMessage(
+          id: 'mixed',
+          role: 'user',
+          conversationId: 'c1',
+          parts: [
+            const TextPart('Compare these'),
+            ImagePart(uri: imagePath, mime: 'image/png'),
+            FilePart(uri: imagePath, name: 'image.png', mime: 'image/png'),
+            FilePart(uri: notes.path, name: 'notes.txt', mime: 'text/plain'),
+            ImagePart(uri: missingPath, mime: 'image/png', unavailable: true),
+          ],
+        );
+        final apiMessages = s.service.buildApiMessages(
+          messages: [message],
+          versionSelections: const {},
+          currentConversation: Conversation(title: 'test'),
+        );
+        await s.service.processUserMessagesForApi(
+          apiMessages,
+          s.settings,
+          const Assistant(id: 'a1', name: 'test'),
+          sourceMessages: useSourceMessages ? [message] : null,
+          workspaceAttachments: {
+            for (final path in [imagePath, notes.path, missingPath, csv.path])
+              path: AttachmentInfo(
+                name: path.split('/').last,
+                sourceUri: path,
+                size: 3,
+                modelPath: '/chat/attachments/${path.split('/').last}',
+              ),
+          },
+        );
+        final content = apiMessages.single['content'] as String;
+        expect('/chat/attachments/image.png'.allMatches(content), hasLength(1));
+        expect('/chat/attachments/notes.txt'.allMatches(content), hasLength(1));
+        expect(content, isNot(contains('unavailable.png')));
+        expect(content, isNot(contains('sales.csv')));
+        expect(content, isNot(contains('read me')));
+        expect(content, contains('Compare these'));
+        expect(
+          parseInternalMediaRefs(
+            apiMessages.single[multimodalInternalMediaPathsKey],
+          ).map((ref) => ref.uri),
+          [imagePath],
+        );
+      },
+    );
+  }
+
+  test(
+    'OCR keeps the workspace image path without resending image bytes',
+    () async {
+      final s = await setUpService();
+      await s.settings.setOcrModel('ocr-provider', 'ocr-model');
+      await s.settings.setOcrEnabled(true);
+      final imagePath = '${tempDir.path}/image.png';
+      final service = MessageBuilderService(
+        chatService: _FakeChatService(),
+        contextProvider: _FakeBuildContext(),
+        ocrHandler: (paths, {revisionId, session, requestId}) async {
+          expect(paths, [imagePath]);
+          return 'Recognized image text';
+        },
+      );
+      final message = ChatMessage(
+        id: 'ocr',
+        role: 'user',
+        conversationId: 'c1',
+        parts: [ImagePart(uri: imagePath, mime: 'image/png')],
+      );
+      final apiMessages = service.buildApiMessages(
+        messages: [message],
+        versionSelections: const {},
+        currentConversation: Conversation(title: 'test'),
+      );
+      await service.processUserMessagesForApi(
+        apiMessages,
+        s.settings,
+        null,
+        sourceMessages: [message],
+        workspaceAttachments: {
+          imagePath: AttachmentInfo(
+            name: 'image.png',
+            sourceUri: imagePath,
+            size: 3,
+            modelPath: '/chat/attachments/image.png',
+          ),
+        },
+      );
+      expect(apiMessages.single['content'], contains('Recognized image text'));
+      expect(
+        apiMessages.single['content'],
+        contains('/chat/attachments/image.png'),
+      );
+      expect(
+        apiMessages.single.containsKey(multimodalInternalMediaPathsKey),
+        isFalse,
+      );
+    },
+  );
 
   test('a lone data file is no pending extraction work', () async {
     final s = await setUpService();
@@ -403,6 +655,65 @@ void main() {
       expect(await replay(sandboxDataFiles: true), contains('region,amount'));
     });
 
+    for (final frozenBeforeBinding in [false, true]) {
+      test('image paths survive replay without entering the frozen prompt '
+          '(already frozen: $frozenBeforeBinding)', () async {
+        final image = File('${tempDir.path}/image.png')
+          ..writeAsBytesSync([1, 2, 3]);
+        stored = await chatService.addMessage(
+          conversationId: convo.id,
+          role: 'user',
+          content: '',
+          parts: [ImagePart(uri: image.path, mime: 'image/png')],
+        );
+        final local = {
+          image.path: AttachmentInfo(
+            name: 'image.png',
+            sourceUri: image.path,
+            size: 3,
+            modelPath: '/chat/attachments/image.png',
+          ),
+        };
+        if (frozenBeforeBinding) {
+          expect(await replay(sandboxDataFiles: false), isEmpty);
+        }
+        final first = await replay(
+          sandboxDataFiles: false,
+          workspaceAttachments: local,
+        );
+        expect(first, contains('/chat/attachments/image.png'));
+        expect(first, contains('3 bytes'));
+        expect((await repo.getMessagePrompt(stored.id))!.payload, isEmpty);
+
+        // A new builder must reconstruct the same request from persisted
+        // prompts, without relying on in-memory attachment state.
+        service = MessageBuilderService(
+          chatService: chatService,
+          contextProvider: _FakeBuildContext(),
+          chatRepository: repo,
+        );
+        expect(
+          await replay(sandboxDataFiles: false, workspaceAttachments: local),
+          first,
+        );
+        expect(await replay(sandboxDataFiles: false), isEmpty);
+        final relocated = await replay(
+          sandboxDataFiles: false,
+          workspaceAttachments: {
+            image.path: AttachmentInfo(
+              name: 'image.png',
+              sourceUri: image.path,
+              size: 3,
+              modelPath: '/new-session/attachments/image.png',
+            ),
+          },
+        );
+        expect(relocated, contains('/new-session/attachments/image.png'));
+        expect(relocated, isNot(contains('/chat/attachments/image.png')));
+        expect((await repo.getMessagePrompt(stored.id))!.payload, isEmpty);
+      });
+    }
+
     test(
       'PDF switches between native bytes and extraction without stale frozen text',
       () async {
@@ -467,9 +778,14 @@ void main() {
           sandboxDataFiles: false,
           workspaceAttachments: local,
         );
-        // Previously frozen ordinary prompts remain immutable; the workspace
-        // system prompt supplies file paths when binding existing history.
+        // Previously frozen ordinary prompts remain immutable; workspace
+        // paths are appended to the owning message only for this request.
         expect(rebound, contains('region,amount'));
+        expect(rebound, contains('/chat/attachments/sales.csv'));
+        expect(
+          (await repo.getMessagePrompt(stored.id))!.payload,
+          isNot(contains('/chat/attachments/sales.csv')),
+        );
         expect(
           await replay(sandboxDataFiles: false),
           contains('region,amount'),

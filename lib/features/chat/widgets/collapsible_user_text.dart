@@ -17,10 +17,12 @@ class CollapsibleUserText extends StatefulWidget {
     super.key,
     required this.child,
     required this.collapsedHeight,
+    this.reveal = false,
   });
 
   final Widget child;
   final double collapsedHeight;
+  final bool reveal;
 
   @override
   State<CollapsibleUserText> createState() => _CollapsibleUserTextState();
@@ -37,6 +39,18 @@ class _CollapsibleUserTextState extends State<CollapsibleUserText> {
   final GlobalKey _contentKey = GlobalKey();
 
   bool _expanded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _expanded = widget.reveal;
+  }
+
+  @override
+  void didUpdateWidget(CollapsibleUserText oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.reveal && !oldWidget.reveal) _expanded = true;
+  }
 
   /// Whether the clipped content actually spills past [collapsedHeight].
   ///
@@ -96,7 +110,7 @@ class _CollapsibleUserTextState extends State<CollapsibleUserText> {
   Widget _wrap(BuildContext context, Widget body) {
     return Column(
       mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         AnimatedSize(
           duration: const Duration(milliseconds: 200),
@@ -106,15 +120,12 @@ class _CollapsibleUserTextState extends State<CollapsibleUserText> {
         ),
         if (_overflowing || _expanded) ...[
           const SizedBox(height: 4),
-          Align(
-            alignment: AlignmentDirectional.centerStart,
-            child: Semantics(
-              button: true,
+          Semantics(
+            button: true,
+            expanded: _expanded,
+            child: _ToggleButton(
               expanded: _expanded,
-              child: _ToggleButton(
-                expanded: _expanded,
-                onTap: () => setState(() => _expanded = !_expanded),
-              ),
+              onTap: () => setState(() => _expanded = !_expanded),
             ),
           ),
         ],

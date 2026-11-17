@@ -1,3 +1,13 @@
+import '../../chat/controllers/conversation_find_controller.dart';
+import '../../chat/widgets/conversation_find_highlights.dart';
+import '../../intelligent_ui/host/ui_persistence_host.dart';
+import 'package:Kelivo/features/intelligent_ui/host/ui_runtime_registry.dart';
+import 'package:Kelivo/features/intelligent_ui/widgets/genui_control_region.dart';
+import '../../../core/models/context_operation.dart';
+import '../../../core/models/context_compression_task.dart';
+import '../../chat/widgets/context_compression_status.dart';
+import '../../chat/widgets/context_operation_widgets.dart';
+import '../../browser/models/browser_tool_presentation.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
@@ -14,9 +24,9 @@ import '../../../core/models/chat_message.dart';
 import '../../../core/models/message_part.dart';
 import '../../../core/models/assistant.dart';
 import '../../../core/models/assistant_regex.dart';
-import '../../../l10n/app_localizations.dart';
 import '../../../utils/assistant_regex.dart';
 import '../../../shared/widgets/ios_checkbox.dart';
+import '../../../shared/widgets/selection_scroll_container.dart';
 import '../../chat/widgets/chat_message_widget.dart';
 import '../../chat/widgets/timeline_projection.dart';
 import '../../chat/widgets/timeline_visibility.dart';
@@ -39,18 +49,8 @@ typedef OnResendMessage = void Function(ChatMessage message);
 typedef OnTranslateMessage = void Function(ChatMessage message);
 typedef OnEditMessage = void Function(ChatMessage message);
 typedef OnDeleteMessage =
-    Future<void> Function(
-      ChatMessage message,
-      Map<String, List<ChatMessage>> byGroup,
-    );
-typedef OnDeleteAllVersions =
-    Future<void> Function(
-      ChatMessage message,
-      Map<String, List<ChatMessage>> byGroup,
-    );
+    Future<void> Function(ChatMessage message, MessageVersionDeleteScope scope);
 typedef OnForkConversation = Future<void> Function(ChatMessage message);
-typedef OnShareMessage =
-    void Function(int messageIndex, List<ChatMessage> messages);
 typedef OnSelectMessages =
     void Function(int messageIndex, List<ChatMessage> messages);
 typedef OnSpeakMessage = Future<void> Function(ChatMessage message);
@@ -105,6 +105,13 @@ class MessageListView extends StatefulWidget {
     required this.byGroup,
     required this.versionSelections,
     this.truncCollapsedIndex = -1,
+    this.contextOperations = const [],
+    this.contextTask,
+    this.contextTaskRevision,
+    this.contextTaskWaitingForApproval = false,
+    this.onOpenContextTask,
+    this.onOpenContextOperation,
+    this.onUndoContextOperation,
     required this.reasoning,
     required this.reasoningSegments,
     required this.contentSplits,
@@ -120,18 +127,19 @@ class MessageListView extends StatefulWidget {
     this.isPinnedIndicatorActive = false,
     required this.processingFilesMessageId,
     this.streamingContentNotifier,
+    this.conversationFind,
     this.spotlightMessageId,
     this.spotlightToken = 0,
     this.removingSlotIds = const <String>{},
     this.onVersionChange,
     this.onRegenerateMessage,
+    this.onRetryWithoutImages,
+    this.onSetContextStart,
     this.onResendMessage,
     this.onTranslateMessage,
     this.onEditMessage,
     this.onDeleteMessage,
-    this.onDeleteAllVersions,
     this.onForkConversation,
-    this.onShareMessage,
     this.onSelectMessages,
     this.onSpeakMessage,
     this.suggestions = const <String>[],
@@ -156,6 +164,7 @@ class MessageListView extends StatefulWidget {
     this.showProducedFiles = true,
     this.showToolResultSummary = false,
     this.hideToolResultImages = false,
+    this.showBrowserPageCards = true,
     this.collapsedCodeLines,
     this.wrapCodeBlocks = false,
     this.showModelIcon = true,
@@ -181,6 +190,14 @@ class MessageListView extends StatefulWidget {
 
   /// Pre-computed truncate index in collapsed message space (-1 = none).
   final int truncCollapsedIndex;
+  final List<ContextOperation> contextOperations;
+  final ContextCompressionTask? contextTask;
+  final String? contextTaskRevision;
+  final bool contextTaskWaitingForApproval;
+  final void Function(ContextCompressionTask task, Offset anchor)?
+  onOpenContextTask;
+  final ValueChanged<ContextOperation>? onOpenContextOperation;
+  final ValueChanged<ContextOperation>? onUndoContextOperation;
 
   final Map<String, stream_ctrl.ReasoningData> reasoning;
   final Map<String, List<stream_ctrl.ReasoningSegmentData>> reasoningSegments;
@@ -206,6 +223,7 @@ class MessageListView extends StatefulWidget {
 
   /// When set, the message with this ID will receive a spotlight pulse animation.
   final String? spotlightMessageId;
+  final ConversationFindController? conversationFind;
 
   /// Incremented each time a new spotlight is triggered. Used as an animation key
   /// so re-selecting the same message re-triggers the pulse.
@@ -218,13 +236,13 @@ class MessageListView extends StatefulWidget {
   // Callbacks
   final OnVersionChange? onVersionChange;
   final OnRegenerateMessage? onRegenerateMessage;
+  final OnRegenerateMessage? onRetryWithoutImages;
+  final ValueChanged<ChatMessage>? onSetContextStart;
   final OnResendMessage? onResendMessage;
   final OnTranslateMessage? onTranslateMessage;
   final OnEditMessage? onEditMessage;
   final OnDeleteMessage? onDeleteMessage;
-  final OnDeleteAllVersions? onDeleteAllVersions;
   final OnForkConversation? onForkConversation;
-  final OnShareMessage? onShareMessage;
   final OnSelectMessages? onSelectMessages;
   final OnSpeakMessage? onSpeakMessage;
   final List<String> suggestions;
@@ -273,6 +291,7 @@ class MessageListView extends StatefulWidget {
 
   /// Whether tool-result image thumbnails are hidden under the card.
   final bool hideToolResultImages;
+  final bool showBrowserPageCards;
 
   /// Lines a long code block collapses to, or null when it stays expanded.
   final int? collapsedCodeLines;
@@ -296,12 +315,27 @@ class MessageListView extends StatefulWidget {
 }
 
 class _MessageListViewState extends State<MessageListView> {
+  final _timelineStorage = <String, PageStorageBucket>{};
   static const _footerExtent = 48.0;
   static final _idleStreamingContent = AlwaysStoppedAnimation(
     StreamingContentData(content: '', totalTokens: 0),
   );
 
   bool get _hasFooter => _showsFooter(widget);
+
+  bool _taskAt(int index) {
+    final task = widget.contextTask;
+    if (task == null ||
+        !compressionShowsDivider(task) ||
+        widget.selecting ||
+        index < 0 ||
+        index >= _effectiveRenderModels.length) {
+      return false;
+    }
+    return task.anchorGroupId == null
+        ? !widget.hasMoreAfter && index == _effectiveRenderModels.length - 1
+        : task.anchorGroupId == _effectiveRenderModels[index].slotId;
+  }
 
   static bool _showsFooter(MessageListView view) =>
       view.footer != null &&
@@ -335,6 +369,7 @@ class _MessageListViewState extends State<MessageListView> {
       ToolExtentInvalidationQueue();
   var _awaitingAttachFlush = false;
   var _attachFlushScheduled = false;
+  final _uiRegistry = UiRuntimeRegistry();
   final FocusNode _keyboardFocusNode = FocusNode(
     debugLabel: 'timeline-keyboard-scroll-region',
   );
@@ -366,8 +401,21 @@ class _MessageListViewState extends State<MessageListView> {
       _awaitingAttachFlush = _toolExtentQueue.pendingIds.isNotEmpty;
       _scheduleAttachAwareFlush();
     }
+    final liveIds = widget.messages.map((message) => message.id).toSet();
+    _timelineStorage.removeWhere((id, _) => !liveIds.contains(id));
     final oldRenderModels = _effectiveRenderModels;
     _refreshRenderModels();
+    for (final message in widget.messages) {
+      // StreamingContentNotifier supplies the current parts to the child;
+      // the list's backing row can still contain an earlier checkpoint.
+      if (message.isStreaming) continue;
+      _uiRegistry.reconcile(
+        message,
+        hasProviderReasoning:
+            (widget.reasoning[message.id]?.text.isNotEmpty ?? false) ||
+            (widget.reasoningSegments[message.id]?.isNotEmpty ?? false),
+      );
+    }
     _synchronizeExtentCache(oldWidget, oldRenderModels);
     _snapshotToolSignatures();
   }
@@ -417,7 +465,10 @@ class _MessageListViewState extends State<MessageListView> {
     final previous = timelineImageAspects[imageKey];
     if (previous != null && (previous - aspectRatio).abs() < 0.001) return;
     timelineImageAspects[imageKey] = aspectRatio;
-    _invalidateToolExtentForMessage(messageId);
+    // The mounted image's relayout updates the list's measured extent. Only
+    // discard our estimate here: preserving distance from the end would fight
+    // the image's reading anchor when other images load below it in this frame.
+    _extentEstimateCache.remove(messageId);
   }
 
   void _invalidateToolExtentForMessage(String messageId) {
@@ -566,6 +617,7 @@ class _MessageListViewState extends State<MessageListView> {
     showToolCards: true,
     showToolResultSummary: false,
     hideToolResultImages: false,
+    showBrowserPageCards: true,
     collapsedCodeLines: null,
     wrapCodeBlocks: false,
     visualRegexSignature: 0,
@@ -594,6 +646,20 @@ class _MessageListViewState extends State<MessageListView> {
     });
   }
 
+  bool _showsOperationDivider(ContextOperation operation, ChatMessage message) {
+    final group = ContextHistory.group(message);
+    if (operation.revoked || operation.anchorGroupId != group) return false;
+    if (operation.isImportedNative) return false;
+    // A new conversation already displays its copied summary as a message.
+    // Keep the operation for context assembly without repeating it in the UI.
+    return !(operation.isCompression &&
+        !operation.isNative &&
+        !operation.isEdited &&
+        operation.sourceGroups.length == 1 &&
+        operation.sourceGroups.single == group &&
+        operation.summary == message.content);
+  }
+
   /// Rough height of a message bubble, used for items that never got laid out.
   ///
   /// SuperSliverList's default estimate is a flat 100px. In a long chat a real
@@ -610,7 +676,20 @@ class _MessageListViewState extends State<MessageListView> {
         _hasFooter && index == _effectiveRenderModels.length - 1
         ? _footerExtent
         : 0;
-    return _estimateMessageExtent(index, crossAxisExtent) + footerExtent;
+    final nodes = index >= _effectiveRenderModels.length
+        ? 0
+        : widget.contextOperations
+              .where(
+                (op) => _showsOperationDivider(
+                  op,
+                  _effectiveRenderModels[index].message,
+                ),
+              )
+              .length;
+    return _estimateMessageExtent(index, crossAxisExtent) +
+        footerExtent +
+        (nodes + (_taskAt(index) ? 1 : 0)) *
+            (28 + widget.dividerPadding.vertical);
   }
 
   double _estimateMessageExtent(int? index, double crossAxisExtent) {
@@ -860,7 +939,11 @@ class _MessageListViewState extends State<MessageListView> {
             finishedAt: segment.finishedAt,
             toolStartIndex: segment.toolStartIndex,
           )
-      else if (reasoning != null && reasoning.text.isNotEmpty)
+      else if (reasoning != null &&
+          (reasoning.text.isNotEmpty ||
+              (message.isStreaming &&
+                  reasoning.startAt != null &&
+                  reasoning.finishedAt == null)))
         TimelineReasoningRef(
           text: reasoning.text,
           expanded: reasoning.expanded,
@@ -881,6 +964,12 @@ class _MessageListViewState extends State<MessageListView> {
       reasoningCountAtSplit: reasoningCountAtSplit,
       toolCountAtSplit: toolCountAtSplit,
       transformText: _estimateVisualTransform,
+      transformProtectedText: (text) => applyAssistantRegexesProtected(
+        text,
+        assistant: widget.assistant,
+        scope: AssistantRegexScope.assistant,
+        target: AssistantRegexTransformTarget.visual,
+      ),
       partsArrivalOrdered: message.isStreaming,
       inlineThinkingExpanded: !settings.collapseThinking,
     );
@@ -935,7 +1024,10 @@ class _MessageListViewState extends State<MessageListView> {
       }
       if (!block.isThinking) continue;
       final collapsed = collapseTimelineSteps(
-        block.thinkingSteps,
+        groupBrowserTimelineSteps(
+          block.thinkingSteps,
+          isPendingApproval: isPending,
+        ),
         collapseThinkingSteps: settings.collapseThinkingSteps,
       );
       addVisible(
@@ -969,6 +1061,12 @@ class _MessageListViewState extends State<MessageListView> {
           textWidth: textWidth,
           fontScale: fontScale,
         );
+      } else if (step.browserTools != null) {
+        extent +=
+            _estimateCollapsedCard +
+            (settings.showBrowserPageCards
+                ? estimateBrowserGroupBodyHeight(lite: step.browserLite)
+                : 0);
       } else {
         final tool = step.tool!;
         extent += _estimateCollapsedCard;
@@ -1046,12 +1144,14 @@ class _MessageListViewState extends State<MessageListView> {
   /// identity is the change signal — the same rule as the live tool map.
   int _partsEstimateSignature(List<MessagePart> parts) {
     if (parts.isEmpty) return 0;
-    return Object.hashAll([for (final part in parts) identityHashCode(part)]);
+    return identityHashCode(parts);
   }
 
   int _toolEstimateSignature(List<ToolUIPart>? parts) {
     if (parts == null || parts.isEmpty) return 0;
-    return Object.hashAll([for (final part in parts) identityHashCode(part)]);
+    return parts is ToolPartSnapshot
+        ? identityHashCode(parts)
+        : Object.hashAll(parts.map(identityHashCode));
   }
 
   /// Identity of the reasoning inputs an estimate was computed from.
@@ -1226,7 +1326,8 @@ class _MessageListViewState extends State<MessageListView> {
     final newModels = _effectiveRenderModels;
     if ((_hasFooter || _showsFooter(oldWidget)) &&
         (oldModels.length != newModels.length ||
-            _hasFooter != _showsFooter(oldWidget))) {
+            _hasFooter != _showsFooter(oldWidget) ||
+            !identical(widget.footer, oldWidget.footer))) {
       for (final index in {
         math.max(0, oldModels.length - 1),
         math.max(0, newModels.length - 1),
@@ -1237,6 +1338,31 @@ class _MessageListViewState extends State<MessageListView> {
       }
     }
     final metricInputsChanged =
+        oldWidget.contextTaskRevision != widget.contextTaskRevision ||
+        !listEquals(
+          oldWidget.contextOperations
+              .map(
+                (op) => (
+                  op.id,
+                  op.revoked,
+                  op.anchorGroupId,
+                  op.summary,
+                  op.isEdited,
+                ),
+              )
+              .toList(),
+          widget.contextOperations
+              .map(
+                (op) => (
+                  op.id,
+                  op.revoked,
+                  op.anchorGroupId,
+                  op.summary,
+                  op.isEdited,
+                ),
+              )
+              .toList(),
+        ) ||
         oldWidget.chatFontScale != widget.chatFontScale ||
         oldWidget.selecting != widget.selecting ||
         oldWidget.showModelIcon != widget.showModelIcon ||
@@ -1249,6 +1375,7 @@ class _MessageListViewState extends State<MessageListView> {
         oldWidget.showProducedFiles != widget.showProducedFiles ||
         oldWidget.showToolResultSummary != widget.showToolResultSummary ||
         oldWidget.hideToolResultImages != widget.hideToolResultImages ||
+        oldWidget.showBrowserPageCards != widget.showBrowserPageCards ||
         oldWidget.collapsedCodeLines != widget.collapsedCodeLines ||
         oldWidget.wrapCodeBlocks != widget.wrapCodeBlocks ||
         !identical(oldWidget.assistant, widget.assistant);
@@ -1551,6 +1678,7 @@ class _MessageListViewState extends State<MessageListView> {
         old.completionTokens != current.completionTokens ||
         old.cachedTokens != current.cachedTokens ||
         old.durationMs != current.durationMs ||
+        old.firstResponseMs != current.firstResponseMs ||
         old.firstTokenMs != current.firstTokenMs ||
         _partsIdentityChanged(old.parts, current.parts);
   }
@@ -1624,42 +1752,8 @@ class _MessageListViewState extends State<MessageListView> {
     _scrollIdleTimer?.cancel();
     _deferStreamingMessageUpdates.dispose();
     _keyboardFocusNode.dispose();
+    _uiRegistry.dispose();
     super.dispose();
-  }
-
-  /// Build the context divider widget shown at truncate position.
-  Widget _buildContextDivider(BuildContext context) {
-    final l10n = AppLocalizations.of(context)!;
-    final cs = Theme.of(context).colorScheme;
-    final label = l10n.homePageClearContext;
-    return Row(
-      children: [
-        Expanded(
-          child: Divider(
-            color: cs.outlineVariant.withValues(alpha: 0.6),
-            height: 1,
-            thickness: 1,
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10),
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              color: cs.onSurface.withValues(alpha: 0.6),
-            ),
-          ),
-        ),
-        Expanded(
-          child: Divider(
-            color: cs.outlineVariant.withValues(alpha: 0.6),
-            height: 1,
-            thickness: 1,
-          ),
-        ),
-      ],
-    );
   }
 
   @override
@@ -1692,6 +1786,7 @@ class _MessageListViewState extends State<MessageListView> {
       showToolCards: widget.showToolCards,
       showToolResultSummary: widget.showToolResultSummary,
       hideToolResultImages: widget.hideToolResultImages,
+      showBrowserPageCards: widget.showBrowserPageCards,
       collapsedCodeLines: widget.collapsedCodeLines,
       wrapCodeBlocks: widget.wrapCodeBlocks,
       visualRegexSignature: _visualRegexEstimateSignature(widget.assistant),
@@ -1711,100 +1806,117 @@ class _MessageListViewState extends State<MessageListView> {
       showTokenStats: widget.showTokenStats,
       assistant: widget.assistant,
     );
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final horizontalPad =
-            ((constraints.maxWidth - ChatLayoutConstants.maxContentWidth) / 2)
-                .clamp(0.0, double.infinity);
+    return UiPersistenceHost(
+      registry: _uiRegistry,
+      conversationId: widget.messages.firstOrNull?.conversationId,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final horizontalPad =
+              ((constraints.maxWidth - ChatLayoutConstants.maxContentWidth) / 2)
+                  .clamp(0.0, double.infinity);
 
-        return Builder(
-          builder: (context) {
-            final list = SuperListView.builder(
-              controller: widget.scrollController,
-              listController: widget.listController,
-              cacheExtent: 600,
-              delayPopulatingCacheArea: false,
-              addRepaintBoundaries: false,
-              findChildIndexCallback: _findMessageIndexByKey,
-              extentEstimation: _estimateItemExtent,
-              padding: EdgeInsets.fromLTRB(
-                horizontalPad,
-                widget.topContentPadding,
-                horizontalPad,
-                widget.bottomContentPadding +
-                    (widget.isPinnedIndicatorActive ? 12 : 0),
-              ),
-              itemCount: _effectiveRenderModels.isEmpty && _hasFooter
-                  ? 1
-                  : _effectiveRenderModels.length,
-              keyboardDismissBehavior: _keyboardDismissBehavior,
-              itemBuilder: (context, index) {
-                if (_effectiveRenderModels.isEmpty && _hasFooter) {
-                  return SizedBox(height: _footerExtent, child: widget.footer);
-                }
-                if (index < 0 || index >= _effectiveRenderModels.length) {
-                  return const SizedBox.shrink();
-                }
-                return _buildMessageItem(
-                  context,
-                  index: index,
-                  presentation: presentation,
-                );
-              },
-            );
+          return Builder(
+            builder: (context) {
+              final list = SuperListView.builder(
+                controller: widget.scrollController,
+                listController: widget.listController,
+                cacheExtent: 600,
+                delayPopulatingCacheArea: false,
+                addRepaintBoundaries: false,
+                findChildIndexCallback: _findMessageIndexByKey,
+                extentEstimation: _estimateItemExtent,
+                padding: EdgeInsets.fromLTRB(
+                  horizontalPad,
+                  widget.topContentPadding,
+                  horizontalPad,
+                  widget.bottomContentPadding +
+                      (widget.isPinnedIndicatorActive ? 12 : 0),
+                ),
+                itemCount: _effectiveRenderModels.isEmpty && _hasFooter
+                    ? 1
+                    : _effectiveRenderModels.length,
+                keyboardDismissBehavior: _keyboardDismissBehavior,
+                itemBuilder: (context, index) {
+                  if (_effectiveRenderModels.isEmpty && _hasFooter) {
+                    return widget.footer!;
+                  }
+                  if (index < 0 || index >= _effectiveRenderModels.length) {
+                    return const SizedBox.shrink();
+                  }
+                  return _buildMessageItem(
+                    context,
+                    index: index,
+                    presentation: presentation,
+                  );
+                },
+              );
 
-            final historyList = NotificationListener<ScrollNotification>(
-              onNotification: _handleScrollNotification,
-              child: list,
-            );
+              final historyList =
+                  NotificationListener<SelectionAutoScrollNotification>(
+                    onNotification: (_) {
+                      _handleUserScrollActivity();
+                      return false;
+                    },
+                    child: NotificationListener<ScrollNotification>(
+                      onNotification: _handleScrollNotification,
+                      child: list,
+                    ),
+                  );
 
-            final userScrollAwareList = Listener(
-              onPointerDown: (event) {
-                if (_isDesktopPlatform) _keyboardFocusNode.requestFocus();
-                if (event.buttons != 0 &&
-                    event.buttons != kSecondaryMouseButton) {
-                  _pointerDragInProgress = true;
-                  _latestPointerDragMetrics = null;
-                  _setDeferStreamingMessageUpdates(true);
-                }
-              },
-              onPointerUp: (_) => _settlePointerDrag(),
-              onPointerCancel: (_) => _settlePointerDrag(),
-              onPointerSignal: (event) {
-                if (event is PointerScrollEvent) {
-                  _setDeferStreamingMessageUpdates(true);
-                  _schedulePointerScrollActivityCheck();
-                }
-              },
-              child: Focus(
-                key: const ValueKey('timeline-keyboard-scroll-region'),
-                focusNode: _keyboardFocusNode,
-                onKeyEvent: _handleTimelineKeyEvent,
-                child: historyList,
-              ),
-            );
+              final userScrollAwareList = Listener(
+                onPointerDown: (event) {
+                  // Keep copy shortcuts on a focused text selection when the
+                  // second click of a double-click reaches the list.
+                  if (_isDesktopPlatform &&
+                      !_keyboardFocusNode.hasFocus &&
+                      !GenUiControlPointer.contains(event)) {
+                    _keyboardFocusNode.requestFocus();
+                  }
+                  if (event.buttons != 0 &&
+                      event.buttons != kSecondaryMouseButton) {
+                    _pointerDragInProgress = true;
+                    _latestPointerDragMetrics = null;
+                    _setDeferStreamingMessageUpdates(true);
+                  }
+                },
+                onPointerUp: (_) => _settlePointerDrag(),
+                onPointerCancel: (_) => _settlePointerDrag(),
+                onPointerSignal: (event) {
+                  if (event is PointerScrollEvent) {
+                    _setDeferStreamingMessageUpdates(true);
+                    _schedulePointerScrollActivityCheck();
+                  }
+                },
+                child: Focus(
+                  key: const ValueKey('timeline-keyboard-scroll-region'),
+                  focusNode: _keyboardFocusNode,
+                  onKeyEvent: _handleTimelineKeyEvent,
+                  child: historyList,
+                ),
+              );
 
-            return Stack(
-              children: [
-                userScrollAwareList,
-                if (_effectiveRenderModels.isEmpty && widget.isLoadingWindow)
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: _WindowLoadingSkeleton(
-                        key: MessageListView.windowSkeletonKey,
-                        horizontalPadding: horizontalPad,
-                        topPadding: widget.topContentPadding,
+              return Stack(
+                children: [
+                  userScrollAwareList,
+                  if (_effectiveRenderModels.isEmpty && widget.isLoadingWindow)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: _WindowLoadingSkeleton(
+                          key: MessageListView.windowSkeletonKey,
+                          horizontalPadding: horizontalPad,
+                          topPadding: widget.topContentPadding,
+                        ),
                       ),
                     ),
-                  ),
-                if (widget.isPinnedIndicatorActive &&
-                    widget.buildPinnedStreamingIndicator != null)
-                  widget.buildPinnedStreamingIndicator!(),
-              ],
-            );
-          },
-        );
-      },
+                  if (widget.isPinnedIndicatorActive &&
+                      widget.buildPinnedStreamingIndicator != null)
+                    widget.buildPinnedStreamingIndicator!(),
+                ],
+              );
+            },
+          );
+        },
+      ),
     );
   }
 
@@ -2014,6 +2126,33 @@ class _MessageListViewState extends State<MessageListView> {
   }) {
     final model = _effectiveRenderModels[index];
     final message = model.message;
+    final imported = widget.contextOperations
+        .where(
+          (op) =>
+              op.isImportedNative &&
+              op.anchorGroupId == ContextHistory.group(message),
+        )
+        .firstOrNull;
+    final importedEntry = imported == null
+        ? null
+        : Padding(
+            padding: widget.dividerPadding,
+            child: ContextOperationDivider(
+              key: ValueKey('context-node-${imported.id}'),
+              operation: imported,
+              onOpen: () => widget.onOpenContextOperation?.call(imported),
+              hiddenByClear: widget.contextOperations.any(
+                (op) =>
+                    !op.revoked &&
+                    (op.isFixedStart ||
+                        (op.isClear &&
+                            op.sourceGroups.contains(imported.anchorGroupId))),
+              ),
+              superseded: widget.contextOperations.any(
+                (op) => !op.revoked && op.dependencies.contains(imported.id),
+              ),
+            ),
+          );
     final r = widget.reasoning[message.id];
     final t = widget.translations[message.id];
     final assistant = presentation.assistant;
@@ -2023,7 +2162,7 @@ class _MessageListViewState extends State<MessageListView> {
     final availableVersions = model.availableVersions;
     final selectedVersion = model.selectedVersion;
     final selectedIdx = model.selectedVersionIndex;
-    final total = availableVersions.length;
+    final hasMultipleVersions = model.versionCount > 1;
     final messageSuggestions =
         !widget.selecting &&
             model.isLatestCompleteAssistant &&
@@ -2042,150 +2181,229 @@ class _MessageListViewState extends State<MessageListView> {
       key: ValueKey<String>('timeline-slot:${_slotId(message)}'),
       mainAxisSize: MainAxisSize.min,
       children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (widget.selecting &&
-                (message.role == 'user' || message.role == 'assistant'))
-              Padding(
-                padding: const EdgeInsets.only(left: 10, right: 6),
-                child: IosCheckbox(
-                  value: widget.selectedItems.contains(message.id),
-                  size: 20,
-                  hitTestSize: 28,
-                  onChanged: (v) {
-                    widget.onToggleSelection?.call(message.id, v);
-                  },
-                ),
+        for (final operation in widget.contextOperations)
+          if (operation.isFixedStart &&
+              _showsOperationDivider(operation, message))
+            Padding(
+              padding: widget.dividerPadding,
+              child: ContextOperationDivider(
+                key: ValueKey('context-node-${operation.id}'),
+                operation: operation,
+                onOpen: () => widget.onOpenContextOperation?.call(operation),
+                onUndo: widget.onUndoContextOperation == null
+                    ? null
+                    : () => widget.onUndoContextOperation!(operation),
               ),
-            Expanded(
-              child: (() {
-                Widget buildContent(bool isProcessingFiles) => Builder(
-                  builder: (context) {
-                    final baseMediaQuery = context
-                        .getInheritedWidgetOfExactType<MediaQuery>();
-                    final baseData = baseMediaQuery?.data;
-                    final data = baseData ?? MediaQuery.of(context);
-                    final textScale = data.textScaler.scale(1);
-                    return MediaQuery(
-                      // Keep chat font scaling without rebuilding on keyboard insets.
-                      data: data.copyWith(
-                        textScaler: TextScaler.linear(
-                          textScale * presentation.chatFontScale,
-                        ),
-                      ),
-                      child: message.role == 'assistant'
-                          ? _buildStreamingMessageWidget(
-                              context,
-                              isStreaming: isStreaming,
-                              message: message,
-                              index: index,
-                              r: r,
-                              t: t,
-                              useAssistAvatar: useAssistAvatar,
-                              useAssistName: useAssistName,
-                              assistant: assistant,
-                              gid: gid,
-                              availableVersions: availableVersions,
-                              selectedVersion: selectedVersion,
-                              selectedIdx: selectedIdx,
-                              total: total,
-                              isProcessingFiles: isProcessingFiles,
-                              suggestions: messageSuggestions,
-                              presentation: presentation,
-                            )
-                          : _buildChatMessageWidget(
-                              context,
-                              message: message,
-                              index: index,
-                              r: r,
-                              t: t,
-                              useAssistAvatar: useAssistAvatar,
-                              useAssistName: useAssistName,
-                              assistant: assistant,
-                              gid: gid,
-                              availableVersions: availableVersions,
-                              selectedVersion: selectedVersion,
-                              selectedIdx: selectedIdx,
-                              total: total,
-                              isProcessingFiles: isProcessingFiles,
-                              suggestions: messageSuggestions,
-                              presentation: presentation,
-                            ),
-                    );
-                  },
-                );
-
-                // Only the assistant message that owns the indicator listens,
-                // so parsing never rebuilds the rest of the timeline.
-                Widget content = message.role == 'assistant'
-                    ? ValueListenableBuilder<String?>(
-                        valueListenable: widget.processingFilesMessageId,
-                        builder: (context, processingId, _) =>
-                            buildContent(processingId == message.id),
-                      )
-                    : buildContent(false);
-
-                final canSelect =
-                    (message.role == 'user' || message.role == 'assistant');
-                if (widget.selecting && canSelect) {
-                  final isSelected = widget.selectedItems.contains(message.id);
-                  content = GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () =>
-                        widget.onToggleSelection?.call(message.id, !isSelected),
-                    child: IgnorePointer(ignoring: true, child: content),
-                  );
-                }
-
-                return content;
-              })(),
             ),
-          ],
-        ),
-        if (model.showContextDivider)
-          Padding(
-            padding: widget.dividerPadding,
-            child: _buildContextDivider(context),
-          ),
-        if (_hasFooter && index == _effectiveRenderModels.length - 1)
-          SizedBox(height: _footerExtent, child: widget.footer),
-      ],
-    );
-    final isSpotlight =
-        widget.spotlightMessageId != null &&
-        message.id == widget.spotlightMessageId;
-    final Widget item = isSpotlight
-        ? RepaintBoundary(
-            child: TweenAnimationBuilder<double>(
-              key: ValueKey('spotlight-${widget.spotlightToken}'),
-              tween: Tween<double>(begin: 1.0, end: 0.0),
-              duration: const Duration(milliseconds: 1200),
-              curve: Curves.easeOut,
-              builder: (context, opacity, child) {
-                return Stack(
-                  children: [
-                    child!,
-                    if (opacity > 0.0)
-                      Positioned.fill(
-                        child: IgnorePointer(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              color: const Color(
-                                0xFFFFA726,
-                              ).withValues(alpha: opacity * 0.30),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
+        if (importedEntry != null)
+          importedEntry
+        else
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (widget.selecting &&
+                  (message.role == 'user' || message.role == 'assistant'))
+                Padding(
+                  padding: const EdgeInsets.only(left: 10, right: 6),
+                  child: IosCheckbox(
+                    value: widget.selectedItems.contains(message.id),
+                    size: 20,
+                    hitTestSize: 28,
+                    onChanged: (v) {
+                      widget.onToggleSelection?.call(message.id, v);
+                    },
+                  ),
+                ),
+              Expanded(
+                child: (() {
+                  Widget buildContent(bool isProcessingFiles) => Builder(
+                    builder: (context) {
+                      final baseMediaQuery = context
+                          .getInheritedWidgetOfExactType<MediaQuery>();
+                      final baseData = baseMediaQuery?.data;
+                      final data = baseData ?? MediaQuery.of(context);
+                      final textScale = data.textScaler.scale(1);
+                      return MediaQuery(
+                        // Keep chat font scaling without rebuilding on keyboard insets.
+                        data: data.copyWith(
+                          textScaler: TextScaler.linear(
+                            textScale * presentation.chatFontScale,
                           ),
                         ),
+                        child: message.role == 'assistant'
+                            ? _buildStreamingMessageWidget(
+                                context,
+                                isStreaming: isStreaming,
+                                message: message,
+                                index: index,
+                                r: r,
+                                t: t,
+                                useAssistAvatar: useAssistAvatar,
+                                useAssistName: useAssistName,
+                                assistant: assistant,
+                                gid: gid,
+                                availableVersions: availableVersions,
+                                selectedVersion: selectedVersion,
+                                selectedIdx: selectedIdx,
+                                hasMultipleVersions: hasMultipleVersions,
+                                isProcessingFiles: isProcessingFiles,
+                                suggestions: messageSuggestions,
+                                presentation: presentation,
+                              )
+                            : _buildChatMessageWidget(
+                                context,
+                                message: message,
+                                index: index,
+                                r: r,
+                                t: t,
+                                useAssistAvatar: useAssistAvatar,
+                                useAssistName: useAssistName,
+                                assistant: assistant,
+                                gid: gid,
+                                availableVersions: availableVersions,
+                                selectedVersion: selectedVersion,
+                                selectedIdx: selectedIdx,
+                                hasMultipleVersions: hasMultipleVersions,
+                                isProcessingFiles: isProcessingFiles,
+                                suggestions: messageSuggestions,
+                                presentation: presentation,
+                              ),
+                      );
+                    },
+                  );
+
+                  // Only the assistant message that owns the indicator listens,
+                  // so parsing never rebuilds the rest of the timeline.
+                  Widget content = message.role == 'assistant'
+                      ? ValueListenableBuilder<String?>(
+                          valueListenable: widget.processingFilesMessageId,
+                          builder: (context, processingId, _) =>
+                              buildContent(processingId == message.id),
+                        )
+                      : buildContent(false);
+
+                  final canSelect =
+                      (message.role == 'user' || message.role == 'assistant');
+                  if (widget.selecting && canSelect) {
+                    final isSelected = widget.selectedItems.contains(
+                      message.id,
+                    );
+                    content = GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => widget.onToggleSelection?.call(
+                        message.id,
+                        !isSelected,
                       ),
-                  ],
-                );
-              },
-              child: messageColumn,
+                      child: IgnorePointer(ignoring: true, child: content),
+                    );
+                  }
+
+                  return content;
+                })(),
+              ),
+            ],
+          ),
+        for (final operation in widget.contextOperations)
+          if (!operation.isFixedStart &&
+              _showsOperationDivider(operation, message))
+            Padding(
+              padding: widget.dividerPadding,
+              child: ContextOperationDivider(
+                key: ValueKey('context-node-${operation.id}'),
+                operation: operation,
+                hiddenByClear: widget.contextOperations
+                    .skipWhile((op) => op.id != operation.id)
+                    .skip(1)
+                    .any(
+                      (op) =>
+                          !op.revoked &&
+                          (op.isFixedStart ||
+                              (op.isClear &&
+                                  op.sourceGroups.contains(
+                                    operation.anchorGroupId,
+                                  ))),
+                    ),
+                superseded:
+                    operation.isCompression &&
+                    widget.contextOperations.any(
+                      (other) =>
+                          !other.revoked &&
+                          other.dependencies.contains(operation.id),
+                    ),
+                onOpen: () => widget.onOpenContextOperation?.call(operation),
+                onUndo: widget.onUndoContextOperation == null
+                    ? null
+                    : () => widget.onUndoContextOperation!(operation),
+              ),
             ),
-          )
-        : RepaintBoundary(child: messageColumn);
+        if (_taskAt(index))
+          Padding(
+            padding: widget.dividerPadding,
+            child: Builder(
+              builder: (anchorContext) => ContextOperationDivider.task(
+                key: ValueKey('context-task-${widget.contextTask!.id}'),
+                task: widget.contextTask!,
+                waitingForApproval: widget.contextTaskWaitingForApproval,
+                onOpen: () {
+                  final box = anchorContext.findRenderObject() as RenderBox?;
+                  if (box != null) {
+                    widget.onOpenContextTask?.call(
+                      widget.contextTask!,
+                      box.localToGlobal(
+                        Offset(box.size.width / 2, box.size.height),
+                      ),
+                    );
+                  }
+                },
+              ),
+            ),
+          ),
+        if (_hasFooter && index == _effectiveRenderModels.length - 1)
+          widget.footer!,
+      ],
+    );
+    final find = widget.conversationFind;
+    Widget highlightedMessage() {
+      final current = find?.current;
+      return ConversationFindHighlights(
+        hits: find?.hitsFor(message.id) ?? const [],
+        current: current?.messageId == message.id ? current : null,
+        child: messageColumn,
+      );
+    }
+
+    final item = RepaintBoundary(
+      child: Stack(
+        children: [
+          if (find == null)
+            highlightedMessage()
+          else
+            ListenableBuilder(
+              listenable: find,
+              builder: (_, _) => highlightedMessage(),
+            ),
+          if (widget.spotlightMessageId == message.id)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: TweenAnimationBuilder<double>(
+                  key: ValueKey('spotlight-${widget.spotlightToken}'),
+                  tween: Tween<double>(begin: 1, end: 0),
+                  duration: const Duration(milliseconds: 1200),
+                  curve: Curves.easeOut,
+                  builder: (context, opacity, _) => DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(
+                        0xFFFFA726,
+                      ).withValues(alpha: opacity * .30),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
 
     // The animator wraps the item's RepaintBoundary so the fade only
     // re-composites the boundary's cached layer instead of repainting the
@@ -2214,7 +2432,7 @@ class _MessageListViewState extends State<MessageListView> {
     required List<int> availableVersions,
     required int selectedVersion,
     required int selectedIdx,
-    required int total,
+    required bool hasMultipleVersions,
     required bool isProcessingFiles,
     required List<String> suggestions,
     required _MessagePresentation presentation,
@@ -2279,7 +2497,7 @@ class _MessageListViewState extends State<MessageListView> {
             availableVersions: availableVersions,
             selectedVersion: selectedVersion,
             selectedIdx: selectedIdx,
-            total: total,
+            hasMultipleVersions: hasMultipleVersions,
             isProcessingFiles: isProcessingFiles,
             suggestions: suggestions,
             presentation: presentation,
@@ -2308,7 +2526,7 @@ class _MessageListViewState extends State<MessageListView> {
     required List<int> availableVersions,
     required int selectedVersion,
     required int selectedIdx,
-    required int total,
+    required bool hasMultipleVersions,
     required bool isProcessingFiles,
     required List<String> suggestions,
     required _MessagePresentation presentation,
@@ -2320,10 +2538,14 @@ class _MessageListViewState extends State<MessageListView> {
   }) {
     final currentIdx = availableVersions.indexOf(selectedVersion);
     return ChatMessageWidget(
+      timelineStorage: _timelineStorage.putIfAbsent(
+        message.id,
+        PageStorageBucket.new,
+      ),
       message: message,
       enableStreamingTextMotion: enableStreamingTextMotion,
       versionIndex: currentIdx < 0 ? selectedIdx : currentIdx,
-      versionCount: total > 0 ? total : 1,
+      versionCount: availableVersions.length,
       onPrevVersion: (currentIdx > 0)
           ? () => widget.onVersionChange?.call(
               gid,
@@ -2368,8 +2590,9 @@ class _MessageListViewState extends State<MessageListView> {
           : false,
       reasoningLoading: (message.role == 'assistant')
           ? (message.isStreaming &&
-                r?.finishedAt == null &&
-                (r?.text.isNotEmpty == true))
+                r != null &&
+                r.startAt != null &&
+                r.finishedAt == null)
           : false,
       reasoningStartAt: (message.role == 'assistant') ? r?.startAt : null,
       reasoningFinishedAt: (message.role == 'assistant') ? r?.finishedAt : null,
@@ -2386,6 +2609,9 @@ class _MessageListViewState extends State<MessageListView> {
       onRegenerate: message.role == 'assistant'
           ? () => widget.onRegenerateMessage?.call(message)
           : null,
+      onRetryWithoutImages: widget.onRetryWithoutImages == null
+          ? null
+          : () => widget.onRetryWithoutImages!(message),
       onResend: message.role == 'user'
           ? () => widget.onResendMessage?.call(message)
           : null,
@@ -2399,25 +2625,32 @@ class _MessageListViewState extends State<MessageListView> {
           ? () => widget.onEditMessage?.call(message)
           : null,
       onDelete: message.role == 'user'
-          ? () => widget.onDeleteMessage?.call(message, widget.byGroup)
+          ? () => widget.onDeleteMessage?.call(
+              message,
+              MessageVersionDeleteScope.current,
+            )
           : null,
       onMore: () async {
+        final start = ContextHistory.fixedStart(widget.contextOperations);
         final action = await showMessageMoreSheet(
           context,
           message,
-          canDeleteAllVersions: total > 1,
+          hasMultipleVersions: hasMultipleVersions,
           canCreateBranch: widget.onForkConversation != null,
+          canSetContextStart:
+              widget.onSetContextStart != null && !message.isStreaming,
+          isContextStart: start?.anchorGroupId == ContextHistory.group(message),
         );
-        if (action == MessageMoreAction.deleteCurrentVersion) {
-          await widget.onDeleteMessage?.call(message, widget.byGroup);
-        } else if (action == MessageMoreAction.deleteAllVersions) {
-          await widget.onDeleteAllVersions?.call(message, widget.byGroup);
+        if (action == MessageMoreAction.setContextStart) {
+          widget.onSetContextStart?.call(message);
+        } else if (action == MessageMoreAction.cancelContextStart) {
+          if (start != null) widget.onUndoContextOperation?.call(start);
+        } else if (action?.deleteScope case final scope?) {
+          await widget.onDeleteMessage?.call(message, scope);
         } else if (action == MessageMoreAction.edit) {
           widget.onEditMessage?.call(message);
         } else if (action == MessageMoreAction.fork) {
           await widget.onForkConversation?.call(message);
-        } else if (action == MessageMoreAction.share) {
-          widget.onShareMessage?.call(index, widget.messages);
         } else if (action == MessageMoreAction.selectMessages) {
           widget.onSelectMessages?.call(index, widget.messages);
         }
@@ -2529,6 +2762,7 @@ final class _EstimateSettings {
     required this.showToolCards,
     required this.showToolResultSummary,
     required this.hideToolResultImages,
+    required this.showBrowserPageCards,
     required this.collapsedCodeLines,
     required this.wrapCodeBlocks,
     required this.visualRegexSignature,
@@ -2552,6 +2786,7 @@ final class _EstimateSettings {
 
   /// Whether tool-result image thumbnails are hidden under the card.
   final bool hideToolResultImages;
+  final bool showBrowserPageCards;
 
   /// Lines a long code block collapses to, or null when it stays expanded.
   final int? collapsedCodeLines;
@@ -2577,6 +2812,7 @@ final class _EstimateSettings {
       other.showToolCards == showToolCards &&
       other.showToolResultSummary == showToolResultSummary &&
       other.hideToolResultImages == hideToolResultImages &&
+      other.showBrowserPageCards == showBrowserPageCards &&
       other.collapsedCodeLines == collapsedCodeLines &&
       other.wrapCodeBlocks == wrapCodeBlocks &&
       other.visualRegexSignature == visualRegexSignature &&
@@ -2590,6 +2826,7 @@ final class _EstimateSettings {
     showToolCards,
     showToolResultSummary,
     hideToolResultImages,
+    showBrowserPageCards,
     collapsedCodeLines,
     wrapCodeBlocks,
     visualRegexSignature,

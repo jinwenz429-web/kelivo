@@ -34,6 +34,7 @@ void main() {
       LocalToolNames.currentLocation,
       LocalToolNames.bluetoothScan,
       LocalToolNames.phoneControl,
+      LocalToolNames.browser,
       LocalToolNames.weather,
       LocalToolNames.healthSummary,
       LocalToolNames.remindersQuery,

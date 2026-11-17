@@ -1,3 +1,21 @@
+import '../../../features/chat/models/conversation_find_candidate.dart';
+import '../../models/carried_original.dart';
+import '../../../shared/markdown/markdown_image_sources.dart';
+import '../api/request_image_context.dart';
+import '../../../features/chat/utils/thinking_tag_parser.dart';
+import '../../../features/intelligent_ui/host/ui_source_map.dart';
+import '../../models/compression_config.dart';
+import '../../models/image_context.dart';
+import '../../utils/chat_image_result.dart';
+import '../../utils/conversation_fork_title.dart';
+import '../../models/quote_ref.dart';
+import '../../../features/intelligent_ui/host/ui_context_submission.dart';
+import '../../../features/intelligent_ui/models/ui_context_attachment.dart';
+import 'package:Kelivo/core/models/tool_permission_mode.dart';
+import '../../models/composer_draft.dart';
+import '../../../features/intelligent_ui/storage/ui_state_transfer.dart';
+import '../../../features/intelligent_ui/runtime/ui_surface_state.dart';
+import '../../database/composer_draft_store.dart';
 import '../../models/conversation_prompt_settings.dart';
 import '../world_book_activation.dart';
 import 'dart:async';
@@ -7,7 +25,6 @@ import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/scheduler.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 import '../../database/app_database.dart';
@@ -20,15 +37,33 @@ import '../backup/backup_isolate_runner.dart';
 import '../backup/backup_task_progress.dart';
 import '../../database/generation_run.dart';
 import '../../models/chat_message.dart';
+import '../../models/context_operation.dart';
+import '../../models/context_operation_summary.dart';
+import '../../models/compress_context_options.dart';
+import 'context_compression_service.dart';
+import '../memory/memory_block_builder.dart';
+import '../logging/log_payload_elider.dart';
+import '../../../utils/mcp_structured_image.dart';
 import '../api/providers/claude/claude_container.dart';
 import '../api/providers/claude/claude_history.dart';
+import '../api/providers/claude/claude_thinking_recovery.dart';
 import '../api/providers/google_gemini.dart';
+import '../api/providers/openai/responses_history.dart';
 import '../../models/message_part.dart';
 import '../../models/conversation.dart';
+import '../../models/conversation_mcp_settings.dart';
 import '../../models/workspace_binding.dart';
 import '../../../utils/sandbox_path_resolver.dart';
 import '../../../utils/app_directories.dart';
-import '../../utils/scheduler_idle.dart';
+import '../mcp/mcp_image_snapshot.dart';
+import '../storage/storage_attachment_usage.dart';
+import '../storage/attachment_file_lock.dart';
+import '../workspace/workspace_session_sync.dart'
+    show deleteSessionAttachmentCopies;
+
+part 'chat_context_operations.dart';
+part 'chat_image_context.dart';
+part 'chat_compression_settings.dart';
 
 final class LoadedTimelineSlot {
   const LoadedTimelineSlot({required this.identity, required this.message});
@@ -64,6 +99,8 @@ final class LoadedTimelinePage {
 }
 
 typedef AssetContentHash = Future<String> Function(File file);
+typedef GenUiSnapshotReader =
+    Iterable<UiSurfaceSnapshot> Function(List<ChatMessage> messages);
 
 class ChatService extends ChangeNotifier {
   ChatService({
@@ -89,7 +126,6 @@ class ChatService extends ChangeNotifier {
   // force the database path everywhere.
   static bool timelineCacheFastPathEnabled = true;
   static const int _assetReferenceBackfillVersion = 2;
-  static const Duration _assetGcDelay = Duration(days: 7);
   static const int _imageContentHashCacheMaxEntries = 256;
 
   late ChatDatabaseRepository _repo;
@@ -100,18 +136,107 @@ class ChatService extends ChangeNotifier {
   ChatDatabaseLease? _databaseLease;
   Future<void>? _assetReferenceMaintenanceFuture;
   Future<void>? _postStartupAssetMaintenanceFuture;
-  // Per-conversation full message-ID skeleton backfill kicked off by
-  // loadTimelinePage so first paint is not blocked on getMessageIds.
-  // Futures cover idle wait + query and are awaitable before idle fires.
-  final Map<String, Future<void>> _messageOrderBackfillFutures = {};
-  // Completing these aborts the idle wait (close) without resurrecting order.
-  final Map<String, Completer<void>> _messageOrderBackfillAbort = {};
-
+  Future<void>? _deferredAssetMaintenance;
+  bool _assetCleanupClosing = false;
   String? _currentConversationId;
   final Map<String, List<ChatMessage>> _messagesCache = {};
+  final _genUiSnapshotReaders = <GenUiSnapshotReader>{};
+
+  void Function() registerGenUiSnapshotReader(GenUiSnapshotReader reader) {
+    _genUiSnapshotReaders.add(reader);
+    return () => _genUiSnapshotReaders.remove(reader);
+  }
+
+  /// Freeze accepted values synchronously for explicit copy/speech actions.
+  /// Owners register for their lifetime; leaving a viewport does not discard
+  /// state and unrelated conversations are never used as an implicit source.
+  List<UiSurfaceSnapshot> captureGenUiSnapshots(List<ChatMessage> messages) => [
+    for (final reader in List.of(_genUiSnapshotReaders)) ...reader(messages),
+  ];
+
+  Future<Map<String, UiRevisionTransfer>> _captureGenUiCopies(
+    List<ChatMessage> messages,
+  ) async {
+    final temporary = <String, ChatMessage>{};
+    for (final message in messages) {
+      if (!_temporaryConversationIds.contains(message.conversationId)) continue;
+      final cached = _messagesCache[message.conversationId]
+          ?.where((m) => m.id == message.id)
+          .firstOrNull;
+      if (cached != null) temporary[cached.id] = cached;
+    }
+    final snapshots = [
+      for (final reader in List.of(_genUiSnapshotReaders))
+        ...reader(temporary.values.toList()),
+    ];
+    final frozen = {
+      for (final message in temporary.values)
+        message.id: UiRevisionTransfer.temporary(message, snapshots),
+    };
+    final copies = await _repo.captureGenUiTransfer(messages.map((m) => m.id));
+    copies.addAll(frozen);
+    return copies;
+  }
+
   final Map<String, Conversation> _conversationsCache = {};
+  final Set<String> _unpublishedForks = {};
+  final Map<String, List<ContextOperation>> _contextOperations = {};
+  final Map<String, int> _contextStartIndices = {};
+  final Map<String, int> _contextStateVersions = {};
+  ContextCompressionService? _contextCompression;
+  ContextCompressionService get contextCompression {
+    _contextCompression ??= ContextCompressionService(this)
+      ..addListener(notifyListeners);
+    return _contextCompression!;
+  }
+
   final Map<String, Conversation> _draftConversations = {};
+
+  // Message writes publish a captured conversation after awaiting the writer.
+  // Order MCP edits with that publication so an older snapshot cannot undo them.
+  final Map<String, Future<void>> _conversationPublications = {};
+
+  Future<T> _withTemporaryAttachmentLock<T>(
+    String id,
+    Future<T> Function() action,
+  ) => _temporaryConversationIds.contains(id) || _isTemporaryMessageId(id)
+      ? AttachmentFileLock.synchronized(action)
+      : action();
+
+  Future<T> _serializeConversationPublication<T>(
+    String conversationId,
+    Future<T> Function() action,
+  ) {
+    final previous =
+        _conversationPublications[conversationId] ?? Future<void>.value();
+    final result = previous.then(
+      (_) => _withTemporaryAttachmentLock(conversationId, action),
+    );
+    late final Future<void> tail;
+    tail = result
+        .then<void>((_) {}, onError: (Object _, StackTrace __) {})
+        .whenComplete(() {
+          if (identical(_conversationPublications[conversationId], tail)) {
+            _conversationPublications.remove(conversationId);
+          }
+        });
+    _conversationPublications[conversationId] = tail;
+    return result;
+  }
+
   final Set<String> _temporaryConversationIds = <String>{};
+  bool _hadTemporaryConversations = false;
+
+  @override
+  void notifyListeners() {
+    final temporary = _temporaryConversationIds.isNotEmpty;
+    if (temporary || _hadTemporaryConversations) {
+      AttachmentFileLock.notifyTransientChanged();
+    }
+    _hadTemporaryConversations = temporary;
+    super.notifyListeners();
+  }
+
   // Evicting these ids could reopen persistence races with background work.
   final Set<String> _discardedTemporaryConversationIds = <String>{};
   final Set<String> _discardedTemporaryMessageIds = <String>{};
@@ -125,7 +250,9 @@ class ChatService extends ChangeNotifier {
   static const Set<String> _providerArtifactKinds = {
     claudeContainerArtifactKind,
     claudeTurnArtifactKind,
+    claudeThinkingRecoveryArtifactKind,
     geminiThoughtSignatureArtifactKind,
+    responsesTurnArtifactKind,
   };
   final Map<String, Map<String, String>> _providerArtifactsCache = {};
 
@@ -153,14 +280,6 @@ class ChatService extends ChangeNotifier {
 
   @visibleForTesting
   int get debugTimelineFastPathHitCount => _timelineFastPathHitCount;
-
-  /// In-flight full order backfill for [conversationId], if any.
-  ///
-  /// [loadTimelinePage] schedules this after caching the first-page window so
-  /// callers (and tests) can await completeness without blocking first paint.
-  @visibleForTesting
-  Future<void>? debugMessageOrderBackfillFuture(String conversationId) =>
-      _messageOrderBackfillFutures[conversationId];
 
   /// Whether `_messageOrderIds` currently holds a complete skeleton entry.
   @visibleForTesting
@@ -207,7 +326,7 @@ class ChatService extends ChangeNotifier {
     if (extras == null || extras.isEmpty) {
       return const <String, dynamic>{};
     }
-    return Map<String, dynamic>.from(extras);
+    return ToolPermissionMode.withoutGrant(extras);
   }
 
   Future<void> _copyConversationSettingsFrom(
@@ -220,7 +339,6 @@ class ChatService extends ChangeNotifier {
         WorkspaceBinding(
           workspaceId: source.workspaceId,
           cwd: source.cwd,
-          allowAll: source.allowAll,
         ).applyTo({
           if (sourceExtras.containsKey(WorldBookActivation.extrasKey))
             WorldBookActivation.extrasKey:
@@ -236,6 +354,8 @@ class ChatService extends ChangeNotifier {
   }
 
   bool _initialized = false;
+  ComposerDraftStore? get composerDrafts =>
+      _initialized ? _repo.composerDrafts : null;
   Future<void>? _initFuture;
   bool get initialized => _initialized;
 
@@ -262,6 +382,62 @@ class ChatService extends ChangeNotifier {
     _conversationListRevision++;
   }
 
+  void _notifyContextChanged(String id) {
+    _bumpContextRevision(id);
+    _contextStateVersions[id] = contextRevision(id);
+    notifyListeners();
+  }
+
+  final Map<String, int> _compressionHistoryRevisions = {};
+  final Map<String, ValueNotifier<int>> _compressionHistoryRevisionNotifiers =
+      {};
+
+  /// Includes completed output changes, without invalidating the exact usage
+  /// anchor for the request whose input context revision is unchanged.
+  int compressionHistoryRevision(String id) =>
+      _compressionHistoryRevisions[id] ?? 0;
+
+  ValueListenable<int> compressionHistoryRevisionListenable(String id) =>
+      _compressionHistoryRevisionNotifiers.putIfAbsent(
+        id,
+        () => ValueNotifier(compressionHistoryRevision(id)),
+      );
+
+  void _bumpCompressionHistoryRevision(String id) {
+    if (_compressionHistoryCache?.id == id) _compressionHistoryCache = null;
+    final revision = compressionHistoryRevision(id) + 1;
+    _compressionHistoryRevisions[id] = revision;
+    _compressionHistoryRevisionNotifiers[id]?.value = revision;
+  }
+
+  int _contextPreviewEpoch = 0;
+  ({String id, int revision, Future<CompressionHistory> value})?
+  _compressionHistoryCache;
+  ({String id, int revision, int limit, Future<ContextMessageCounts> value})?
+  _contextCountsCache;
+
+  void _resetContextPreviewCaches({bool notify = false}) {
+    final ids = {
+      ..._contextRevisions.keys,
+      ..._contextRevisionNotifiers.keys,
+      ..._compressionHistoryRevisions.keys,
+      ..._compressionHistoryRevisionNotifiers.keys,
+      if (_compressionHistoryCache != null) _compressionHistoryCache!.id,
+      if (_contextCountsCache != null) _contextCountsCache!.id,
+    };
+    _contextPreviewEpoch++;
+    _compressionHistoryCache = null;
+    _contextCountsCache = null;
+    if (notify) {
+      for (final id in ids) {
+        final revision = contextRevision(id) + 1;
+        _contextRevisions[id] = revision;
+        _contextRevisionNotifiers[id]?.value = revision;
+        _bumpCompressionHistoryRevision(id);
+      }
+    }
+  }
+
   final Map<String, int> _contextRevisions = {};
   final Map<String, ValueNotifier<int>> _contextRevisionNotifiers = {};
 
@@ -275,15 +451,38 @@ class ChatService extends ChangeNotifier {
     );
   }
 
+  final _temporaryCompressionSettings = <String, Map<String, dynamic>>{};
+  final _temporaryImageSettings = <String, ImageContextSettings>{};
+
   void _bumpContextRevision(String conversationId) {
+    if (_initialized && !_temporaryConversationIds.contains(conversationId)) {
+      final draftSeed =
+          _draftConversations[conversationId] ??
+          _conversationsCache[conversationId];
+      if (draftSeed != null) _repo.composerDrafts.updateSeed(draftSeed);
+    }
     if (conversationId.isEmpty) return;
+    if (_compressionHistoryCache?.id == conversationId) {
+      _compressionHistoryCache = null;
+    }
+    if (_contextCountsCache?.id == conversationId) _contextCountsCache = null;
     final next = contextRevision(conversationId) + 1;
     _contextRevisions[conversationId] = next;
     final notifier = _contextRevisionNotifiers[conversationId];
     if (notifier != null) notifier.value = next;
+    _bumpCompressionHistoryRevision(conversationId);
   }
 
   void _forgetContextRevision(String conversationId) {
+    if (_compressionHistoryCache?.id == conversationId) {
+      _compressionHistoryCache = null;
+    }
+    if (_contextCountsCache?.id == conversationId) _contextCountsCache = null;
+    _compressionHistoryRevisions.remove(conversationId);
+    _compressionHistoryRevisionNotifiers.remove(conversationId)?.dispose();
+    _contextOperations.remove(conversationId);
+    _contextStartIndices.remove(conversationId);
+    _contextStateVersions.remove(conversationId);
     _contextRevisions.remove(conversationId);
     final notifier = _contextRevisionNotifiers.remove(conversationId);
     notifier?.dispose();
@@ -313,6 +512,7 @@ class ChatService extends ChangeNotifier {
     if (_initialized) return Future<void>.value();
     final inFlight = _initFuture;
     if (inFlight != null) return inFlight;
+    _assetCleanupClosing = false;
     final initialization = _initialize();
     _initFuture = initialization;
     return initialization.whenComplete(() {
@@ -345,22 +545,33 @@ class ChatService extends ChangeNotifier {
       // force-quit. After a fresh launch no message can be actively streaming.
       await _resetStaleStreamingFlags();
 
+      await _repo.composerDrafts.initialize();
+      _repo.composerDrafts.addListener(notifyListeners);
       _initialized = true;
+      await contextCompression.restore();
+      AttachmentFileLock.registerTransientOwner(
+        this,
+        capture: _captureTemporaryReferences,
+        active: () => hasTransientGeneration,
+      );
       notifyListeners();
       late final Future<void> postStartupMaintenance;
-      postStartupMaintenance = _runAssetReferenceMaintenance(appDataDir)
-          .then((_) => runAssetMaintenance())
-          .catchError((Object error) {
-            debugPrint('Post-startup asset maintenance failed: $error');
-          })
-          .whenComplete(() {
-            if (identical(
-              _postStartupAssetMaintenanceFuture,
-              postStartupMaintenance,
-            )) {
-              _postStartupAssetMaintenanceFuture = null;
-            }
-          });
+      postStartupMaintenance =
+          _runAssetReferenceMaintenance(
+                await AppDirectories.getContentDirectory(),
+              )
+              .then((_) => runAssetMaintenance())
+              .catchError((Object error) {
+                debugPrint('Post-startup asset maintenance failed: $error');
+              })
+              .whenComplete(() {
+                if (identical(
+                  _postStartupAssetMaintenanceFuture,
+                  postStartupMaintenance,
+                )) {
+                  _postStartupAssetMaintenanceFuture = null;
+                }
+              });
       _postStartupAssetMaintenanceFuture = postStartupMaintenance;
       unawaited(postStartupMaintenance);
     } catch (_) {
@@ -371,6 +582,7 @@ class ChatService extends ChangeNotifier {
   }
 
   Future<void> close() async {
+    _assetCleanupClosing = true;
     final initialization = _initFuture;
     if (initialization != null) {
       try {
@@ -381,36 +593,33 @@ class ChatService extends ChangeNotifier {
     }
     if (!_initialized) return;
     final postStartupMaintenance = _postStartupAssetMaintenanceFuture;
+    await _contextCompression?.cancelAll(interrupted: true);
     if (postStartupMaintenance != null) {
       try {
         await postStartupMaintenance;
       } catch (_) {}
     }
+    await _deferredAssetMaintenance;
     final assetMaintenance = _assetReferenceMaintenanceFuture;
     if (assetMaintenance != null) {
       try {
         await assetMaintenance;
       } catch (_) {}
     }
-    // Abort idle waits so close never waits for an animation to finish.
-    for (final abort in _messageOrderBackfillAbort.values) {
-      if (!abort.isCompleted) abort.complete();
-    }
-    _messageOrderBackfillAbort.clear();
-    final orderBackfills = List<Future<void>>.of(
-      _messageOrderBackfillFutures.values,
-    );
-    _messageOrderBackfillFutures.clear();
-    for (final backfill in orderBackfills) {
-      try {
-        await backfill;
-      } catch (_) {}
-    }
+    await _repo.composerDrafts.flush();
+    await _repo.genUiStates.flush();
+    _repo.composerDrafts.removeListener(notifyListeners);
     _initialized = false;
-    for (final id in List<String>.of(_contextRevisionNotifiers.keys)) {
+    AttachmentFileLock.unregisterTransientOwner(this);
+    for (final id in {
+      ..._contextRevisionNotifiers.keys,
+      ..._compressionHistoryRevisionNotifiers.keys,
+    }) {
       _forgetContextRevision(id);
     }
     _contextRevisions.clear();
+    _compressionHistoryRevisions.clear();
+    _resetContextPreviewCaches();
     final lease = _databaseLease;
     _databaseLease = null;
     await lease?.release();
@@ -418,8 +627,17 @@ class ChatService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _contextCompression?.removeListener(notifyListeners);
+    _contextCompression?.dispose();
+    // A final save can still finish (or report a storage error) after this
+    // notifier has been disposed. Detach before the asynchronous close.
+    if (_initialized) _repo.composerDrafts.removeListener(notifyListeners);
     if (_initialized || _initFuture != null) {
-      unawaited(close());
+      unawaited(
+        close().catchError((Object error) {
+          debugPrint('Chat service close failed: ${error.runtimeType}');
+        }),
+      );
     }
     super.dispose();
   }
@@ -432,6 +650,9 @@ class ChatService extends ChangeNotifier {
   }
 
   Future<void> _loadConversationsCache() async {
+    _contextOperations.clear();
+    _contextStartIndices.clear();
+    _contextStateVersions.clear();
     final conversations = await _repo.getAllConversationSummaries();
     _toolEventsCache.clear();
     _providerArtifactsCache.clear();
@@ -447,6 +668,7 @@ class ChatService extends ChangeNotifier {
           (conversation) => MapEntry(conversation.id, conversation),
         ),
       );
+    _resetContextPreviewCaches(notify: true);
     _bumpConversationListRevision();
   }
 
@@ -463,9 +685,12 @@ class ChatService extends ChangeNotifier {
     }
     final cached = getMessageCount(conversationId);
     if (cached >= 0) return cached;
+    final revision = _contextRevisions[conversationId] ?? 0;
     final count = await _repo.getMessageCount(conversationId);
-    _messageCounts[conversationId] = count;
-    return count;
+    if ((_contextRevisions[conversationId] ?? 0) != revision) {
+      return resolveMessageCount(conversationId);
+    }
+    return _messageCounts.putIfAbsent(conversationId, () => count);
   }
 
   Future<int> _resolveMessageCount(String conversationId) =>
@@ -474,9 +699,13 @@ class ChatService extends ChangeNotifier {
   Future<List<String>> _loadMessageOrder(String conversationId) async {
     final cached = _messageOrderIds[conversationId];
     if (cached != null) return cached;
+    final revision = _contextRevisions[conversationId] ?? 0;
     final ids = (await _repo.getMessageIds(
       conversationId,
     )).toList(growable: true);
+    if ((_contextRevisions[conversationId] ?? 0) != revision) {
+      return _loadMessageOrder(conversationId);
+    }
     // Presence means complete & authoritative. A concurrent writer may have
     // installed a full skeleton (and appended newer ids) while getMessageIds
     // was in flight — never clobber that with a potentially stale snapshot.
@@ -487,124 +716,11 @@ class ChatService extends ChangeNotifier {
     return ids;
   }
 
-  /// Idle-deferred full order backfill. Keeps `_messageOrderIds` absent until a
-  /// complete list is ready. Failure only logs — it never removes a concurrent
-  /// foreground-installed skeleton. Cancel/close leave an absent key absent.
-  ///
-  /// Does not start [getMessageIds] immediately — waits past the next frame,
-  /// then for an idle slot (same pattern as chat/home idle warm-ups).
-  /// Post-frame matters: an idle task alone can
-  /// still start during first-paint sibling awaits (e.g. visible-group preload)
-  /// and contend for SQLite. The registered future covers frame + idle wait +
-  /// query so tests and [close] can await it deterministically.
-  void _scheduleMessageOrderBackfill(String conversationId) {
-    if (_messageOrderIds.containsKey(conversationId)) return;
-    if (_messageOrderBackfillFutures.containsKey(conversationId)) return;
-
-    final abort = Completer<void>();
-    _messageOrderBackfillAbort[conversationId] = abort;
-
-    late final Future<void> backfill;
-    backfill = _runMessageOrderBackfill(conversationId, abort).whenComplete(() {
-      if (identical(_messageOrderBackfillFutures[conversationId], backfill)) {
-        _messageOrderBackfillFutures.remove(conversationId);
-      }
-      if (identical(_messageOrderBackfillAbort[conversationId], abort)) {
-        _messageOrderBackfillAbort.remove(conversationId);
-      }
-    });
-    _messageOrderBackfillFutures[conversationId] = backfill;
-    unawaited(backfill);
-  }
-
-  void _abortMessageOrderBackfill(String conversationId) {
-    final abort = _messageOrderBackfillAbort.remove(conversationId);
-    if (abort != null && !abort.isCompleted) {
-      abort.complete();
-    }
-  }
-
-  /// Returns `false` when [abort] wins before the idle slot is granted.
-  Future<bool> _awaitMessageOrderBackfillSlot(Completer<void> abort) async {
-    try {
-      final binding = SchedulerBinding.instance;
-      // 1) Past the next frame so first paint / visible-group preload DB work
-      // is not contended by a full-ID scan during their awaits.
-      final frame = Completer<void>();
-      binding.addPostFrameCallback((_) {
-        if (!frame.isCompleted) frame.complete();
-      });
-      binding.ensureVisualUpdate();
-      await Future.any<void>([frame.future, abort.future]);
-      if (abort.isCompleted) return false;
-
-      // 2) Wait alongside frames instead of spinning the event loop while
-      // a spinner, route transition or scroll animation keeps idle work paused.
-      return await waitForSchedulerIdle(cancelled: abort.future);
-    } catch (_) {
-      // No scheduler binding (rare bare isolates): proceed immediately.
-      return !abort.isCompleted;
-    }
-  }
-
-  Future<void> _runMessageOrderBackfill(
-    String conversationId,
-    Completer<void> abort,
-  ) async {
-    try {
-      if (!await _awaitMessageOrderBackfillSlot(abort)) return;
-      if (_messageOrderIds.containsKey(conversationId)) return;
-
-      // Race the query against abort so [close] never hangs on a gated /
-      // slow getMessageIds. Orphaned queries swallow late errors.
-      final query = Completer<List<String>>();
-      unawaited(() async {
-        try {
-          final ids = (await _repo.getMessageIds(
-            conversationId,
-          )).toList(growable: true);
-          if (!query.isCompleted) query.complete(ids);
-        } catch (error, stack) {
-          if (!query.isCompleted) query.completeError(error, stack);
-        }
-      }());
-      await Future.any<void>([query.future.then((_) {}), abort.future]);
-      if (abort.isCompleted) {
-        unawaited(query.future.catchError((Object _) => <String>[]));
-        return;
-      }
-      final ids = await query.future;
-
-      // Cancel / delete while in flight: do not resurrect a removed skeleton.
-      if (abort.isCompleted) return;
-      final raced = _messageOrderIds[conversationId];
-      if (raced != null) return;
-      if (!_conversationsCache.containsKey(conversationId) &&
-          !_draftConversations.containsKey(conversationId)) {
-        return;
-      }
-      // Existence == complete: install atomically with matching count.
-      _messageOrderIds[conversationId] = ids;
-      _messageCounts[conversationId] = ids.length;
-      // Re-project any already-cached messages through the complete order so
-      // getMessages matches the pre-Issue-7 awaited-skeleton ordering.
-      final cached = _messagesCache[conversationId];
-      if (cached != null) {
-        _cacheLoadedMessages(conversationId, cached);
-      }
-    } catch (error) {
-      // Do not remove caches on failure: this task never installs a partial
-      // skeleton (existence == complete), and a concurrent foreground
-      // `_loadMessageOrder` may have already written a full authoritative
-      // entry while our getMessageIds was in flight.
-      debugPrint('Message order backfill failed for $conversationId: $error');
-    }
-  }
-
   Future<List<ChatMessage>> loadActiveTimelineMessages(
     String conversationId,
   ) async {
     if (!_initialized) return const <ChatMessage>[];
+    await loadContextOperations(conversationId);
     if (_temporaryConversationIds.contains(conversationId)) {
       return List<ChatMessage>.of(
         _messagesCache[conversationId] ?? const <ChatMessage>[],
@@ -641,6 +757,7 @@ class ChatService extends ChangeNotifier {
     int limit = 40,
   }) async {
     if (!_initialized || limit <= 0) return null;
+    await loadContextOperations(conversationId);
     if (_temporaryConversationIds.contains(conversationId)) {
       return _loadTemporaryTimelinePage(
         conversationId,
@@ -651,6 +768,10 @@ class ChatService extends ChangeNotifier {
         limit: limit,
       );
     }
+    // A cold prefetch must also know whether its bounded cache is complete.
+    // The maintained index resolves this once without scanning message rows.
+    final revision = _contextRevisions[conversationId] ?? 0;
+    await _resolveMessageCount(conversationId);
     if (timelineCacheFastPathEnabled &&
         !fromStart &&
         beforeRevisionId == null &&
@@ -675,6 +796,16 @@ class ChatService extends ChangeNotifier {
         .map((slot) => slot.revisionId)
         .toList(growable: false);
     final messages = await _repo.getMessagesByIds(revisionIds);
+    if ((_contextRevisions[conversationId] ?? 0) != revision) {
+      return loadTimelinePage(
+        conversationId,
+        beforeRevisionId: beforeRevisionId,
+        afterRevisionId: afterRevisionId,
+        aroundRevisionId: aroundRevisionId,
+        fromStart: fromStart,
+        limit: limit,
+      );
+    }
     final byId = {for (final message in messages) message.id: message};
     String? parentRevisionId;
     final loadedSlots = <LoadedTimelineSlot>[];
@@ -702,18 +833,23 @@ class ChatService extends ChangeNotifier {
     if (loadedSlots.length != page.slots.length) {
       throw StateError('timeline_selected_revision_shadow_missing');
     }
-    // First-page paint must not await the full message-ID skeleton. Cache the
-    // window, return, then backfill order in the background. Invariant:
-    // `_messageOrderIds` stays absent until backfill installs a complete list.
-    //
-    // Scroll audit (home_page_controller.scrollToMessageId / post-initChat):
-    // jump uses collapsed-index + loadUntilMessageVisible, not getMessageIndex
-    // on the order skeleton, so an absent order during first paint is safe.
-    // `_tryAppendPersistedTail` already treats missing order (index -1 / count
-    // unknown) as a contiguity miss and falls back to a full reload.
+    // Browse only the requested page. Full order and full bodies are loaded
+    // only by operations that explicitly need them.
     _cacheLoadedMessages(conversationId, messages);
     await _cacheMessageArtifacts(messages);
-    _scheduleMessageOrderBackfill(conversationId);
+    // A selection or structural mutation may finish during body/artifact reads.
+    // Return a page from the current selection, so a delayed navigation cannot
+    // replace an already refreshed version with an older selected body.
+    if ((_contextRevisions[conversationId] ?? 0) != revision) {
+      return loadTimelinePage(
+        conversationId,
+        beforeRevisionId: beforeRevisionId,
+        afterRevisionId: afterRevisionId,
+        aroundRevisionId: aroundRevisionId,
+        fromStart: fromStart,
+        limit: limit,
+      );
+    }
     return LoadedTimelinePage(
       conversationId: conversationId,
       stateRevision:
@@ -748,13 +884,21 @@ class ChatService extends ChangeNotifier {
     final conversation = _draftConversations[conversationId];
     if (conversation == null) return null;
     final allMessages = _messagesCache[conversationId] ?? const <ChatMessage>[];
+    final cursorId = aroundRevisionId ?? beforeRevisionId ?? afterRevisionId;
+    String? cursorGroupId;
     final groups = <String, List<ChatMessage>>{};
     for (final message in allMessages) {
-      groups.putIfAbsent(message.groupId ?? message.id, () => []).add(message);
+      final groupId = message.groupId ?? message.id;
+      groups.putIfAbsent(groupId, () => []).add(message);
+      if (message.id == cursorId) cursorGroupId = groupId;
     }
     final activeMessages = <ChatMessage>[];
     final versionCounts = <String, int>{};
+    var cursorIndex = -1;
     for (final entry in groups.entries) {
+      // Like persisted windows, any revision can identify the logical slot,
+      // including the revision that was selected before a version switch.
+      if (entry.key == cursorGroupId) cursorIndex = activeMessages.length;
       final revisions = entry.value;
       versionCounts[entry.key] = revisions.length;
       final selection = conversation.versionSelections[entry.key];
@@ -775,25 +919,17 @@ class ChatService extends ChangeNotifier {
     if (fromStart) {
       end = limit.clamp(0, activeMessages.length).toInt();
     } else if (aroundRevisionId != null) {
-      final targetIndex = activeMessages.indexWhere(
-        (message) => message.id == aroundRevisionId,
-      );
-      if (targetIndex < 0) return null;
-      start = (targetIndex - (limit ~/ 2))
+      if (cursorIndex < 0) return null;
+      start = (cursorIndex - (limit ~/ 2))
           .clamp(0, activeMessages.length)
           .toInt();
       end = (start + limit).clamp(start, activeMessages.length).toInt();
       start = (end - limit).clamp(0, end).toInt();
     } else if (beforeRevisionId != null) {
-      end = activeMessages.indexWhere(
-        (message) => message.id == beforeRevisionId,
-      );
+      end = cursorIndex;
       if (end < 0) return null;
       start = (end - limit).clamp(0, end).toInt();
     } else if (afterRevisionId != null) {
-      final cursorIndex = activeMessages.indexWhere(
-        (message) => message.id == afterRevisionId,
-      );
       if (cursorIndex < 0) return null;
       start = cursorIndex + 1;
       end = (start + limit).clamp(start, activeMessages.length).toInt();
@@ -999,7 +1135,7 @@ class ChatService extends ChangeNotifier {
   }
 
   int getContextStartIndex(String conversationId) =>
-      _conversationsCache[conversationId]?.truncateIndex ?? -1;
+      _contextStartIndices[conversationId] ?? -1;
 
   Future<void> _cacheMessageArtifacts(Iterable<ChatMessage> messages) async {
     final ids = messages.map((message) => message.id).toSet();
@@ -1016,7 +1152,8 @@ class ChatService extends ChangeNotifier {
       ),
     ).wait;
     for (final id in ids) {
-      _evictMessageCaches(id);
+      _toolEventsCache.remove(id);
+      _providerArtifactsCache.remove(id);
     }
     _toolEventsCache.addAll(toolEvents);
     for (var i = 0; i < artifactKinds.length; i++) {
@@ -1027,6 +1164,12 @@ class ChatService extends ChangeNotifier {
         )[artifactKinds[i]] = entry.value;
       }
     }
+    for (final message in messages) {
+      message.hydrateProviderArtifacts(
+        _providerArtifactsCache[message.id] ?? const {},
+      );
+    }
+    _enforceMessageCacheLimits();
   }
 
   void _cacheLoadedMessages(
@@ -1048,6 +1191,10 @@ class ChatService extends ChangeNotifier {
             for (final id in order)
               if (byId[id] != null) byId[id]!,
           ];
+    final cached = _messagesCache[conversationId]!;
+    if (order == null && cached.every((m) => m.storageOrder != null)) {
+      cached.sort((a, b) => a.storageOrder!.compareTo(b.storageOrder!));
+    }
     _touchMessageCache(conversationId);
     _enforceMessageCacheLimits();
   }
@@ -1058,89 +1205,70 @@ class ChatService extends ChangeNotifier {
   }
 
   int _estimateCachedMessageBytes(ChatMessage message) {
+    // Charge raw parts and decoded tool structures without re-encoding their
+    // JSON on every insertion. This intentionally overestimates shared strings.
     var bytes =
-        message.content.length * 2 +
+        256 +
         (message.reasoningText?.length ?? 0) * 2 +
         (message.translation?.length ?? 0) * 2 +
         (message.reasoningSegmentsJson?.length ?? 0) * 2;
-    final toolEvents = _toolEventsCache[message.id];
-    if (toolEvents != null) {
-      for (final event in toolEvents) {
-        bytes += jsonEncode(event).length * 2;
-      }
+    for (final part in message.parts) {
+      bytes += part.encodePayload().length * (part is ToolCallPart ? 4 : 2);
+    }
+    final artifacts =
+        _providerArtifactsCache[message.id] ?? message.providerArtifactSnapshot;
+    for (final payload in artifacts.values) {
+      bytes += payload.length * 2;
     }
     return bytes;
   }
 
+  @visibleForTesting
+  int get debugCachedMessageBytes => _messagesCache.entries
+      .where((entry) => !_temporaryConversationIds.contains(entry.key))
+      .expand((entry) => entry.value)
+      .fold(0, (sum, message) => sum + _estimateCachedMessageBytes(message));
+
   void _enforceMessageCacheLimits() {
-    bool isExempt(String conversationId) =>
-        conversationId == _currentConversationId ||
-        _temporaryConversationIds.contains(conversationId);
-
-    // The current conversation is exempt from eviction: its cache upper bound
-    // is the full conversation or the idle-backfill count threshold.
-    //
-    // A conversation that alone exceeds the budget is tail-trimmed (keeps its
-    // most recent messages) instead of cascading an eviction of every other
-    // cached conversation.
-    for (final conversationId in _messagesCache.keys.toList()) {
-      if (isExempt(conversationId)) continue;
-      final messages = _messagesCache[conversationId]!;
-      var entries = messages.length;
-      var bytes = 0;
-      for (final message in messages) {
-        bytes += _estimateCachedMessageBytes(message);
-      }
-      if (entries <= _messageCacheMaxEntries &&
-          bytes <= _messageCacheMaxBytes) {
-        continue;
-      }
-      var drop = 0;
-      while (drop < messages.length &&
-          (entries > _messageCacheMaxEntries ||
-              bytes > _messageCacheMaxBytes)) {
-        entries--;
-        bytes -= _estimateCachedMessageBytes(messages[drop]);
-        drop++;
-      }
-      for (final message in messages.sublist(0, drop)) {
-        _evictMessageCaches(message.id);
-      }
-      if (drop >= messages.length) {
-        _messagesCache.remove(conversationId);
-      } else {
-        _messagesCache[conversationId] = messages.sublist(drop);
-      }
-    }
-
     var entries = 0;
     var bytes = 0;
+    final sizes = <String, int>{};
     for (final entry in _messagesCache.entries) {
-      if (isExempt(entry.key)) continue;
-      entries += entry.value.length;
-      bytes += entry.value.fold<int>(
-        0,
-        (sum, message) => sum + _estimateCachedMessageBytes(message),
-      );
-    }
-    while ((entries > _messageCacheMaxEntries ||
-            bytes > _messageCacheMaxBytes) &&
-        _messagesCache.isNotEmpty) {
-      final candidate = _messagesCache.entries.firstWhere(
-        (entry) => !isExempt(entry.key),
-        orElse: () => const MapEntry('', <ChatMessage>[]),
-      );
-      if (candidate.key.isEmpty) break;
-      _messagesCache.remove(candidate.key);
-      entries -= candidate.value.length;
-      bytes -= candidate.value.fold<int>(
-        0,
-        (sum, message) => sum + _estimateCachedMessageBytes(message),
-      );
-      for (final message in candidate.value) {
-        _evictMessageCaches(message.id);
+      if (_temporaryConversationIds.contains(entry.key)) continue;
+      for (final message in entry.value) {
+        if (message.isStreaming) continue;
+        final size = _estimateCachedMessageBytes(message);
+        sizes[message.id] = size;
+        entries++;
+        bytes += size;
       }
     }
+    for (final conversation in _messagesCache.entries.toList()) {
+      if (_temporaryConversationIds.contains(conversation.key)) continue;
+      if (entries <= _messageCacheMaxEntries &&
+          bytes <= _messageCacheMaxBytes) {
+        break;
+      }
+      final retained = <ChatMessage>[];
+      for (final message in conversation.value) {
+        if (!message.isStreaming &&
+            (entries > _messageCacheMaxEntries ||
+                bytes > _messageCacheMaxBytes)) {
+          entries--;
+          bytes -= sizes[message.id] ?? 0;
+          _evictMessageCaches(message.id);
+        } else {
+          retained.add(message);
+        }
+      }
+      _messagesCache[conversation.key] = retained;
+    }
+    final retainedIds = {
+      for (final messages in _messagesCache.values)
+        for (final message in messages) message.id,
+    };
+    _toolEventsCache.removeWhere((id, _) => !retainedIds.contains(id));
+    _providerArtifactsCache.removeWhere((id, _) => !retainedIds.contains(id));
   }
 
   List<Conversation> getAllConversations() {
@@ -1150,7 +1278,9 @@ class ChatService extends ChangeNotifier {
         _sortedConversationsCacheRevision == _conversationListRevision) {
       return List<Conversation>.of(cached);
     }
-    final conversations = _conversationsCache.values.toList();
+    final conversations = _conversationsCache.values
+        .where((conversation) => !_unpublishedForks.contains(conversation.id))
+        .toList();
     conversations.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     _sortedConversationsCache = conversations;
     _sortedConversationsCacheRevision = _conversationListRevision;
@@ -1171,10 +1301,8 @@ class ChatService extends ChangeNotifier {
   }
 
   Conversation? getCompleteConversation(String id) {
-    if (!_initialized) return null;
-    final draft = _draftConversations[id];
-    if (draft != null) return draft;
-    return _conversationsCache[id];
+    if (_unpublishedForks.contains(id)) return null;
+    return getConversation(id);
   }
 
   Conversation? _conversationForMessages(String conversationId) {
@@ -1278,6 +1406,18 @@ class ChatService extends ChangeNotifier {
         .toList(growable: false);
   }
 
+  Future<List<ChatMessage>> loadMessageVersionHeaders(
+    String conversationId,
+    Iterable<String> groupIds,
+  ) {
+    if (!_initialized ||
+        _temporaryConversationIds.contains(conversationId) ||
+        _draftConversations.containsKey(conversationId)) {
+      return Future.value(getMessagesForGroups(conversationId, groupIds));
+    }
+    return _repo.getMessageVersionHeaders(conversationId, groupIds);
+  }
+
   Future<List<ChatMessage>> loadMessagesForGroups(
     String conversationId,
     Iterable<String> groupIds,
@@ -1320,14 +1460,18 @@ class ChatService extends ChangeNotifier {
     String? assistantId,
   }) async {
     if (!_initialized) return const <ConversationSearchMatch>[];
-    return _repo.searchConversationMatches(
+    final matches = await _repo.searchConversationMatches(
       tokens: tokens,
       limit: limit,
       includeAllRevisions: includeAllRevisions,
       conversationId: conversationId,
       excludeConversationId: excludeConversationId,
       assistantId: assistantId,
+      excludedConversationIds: Set<String>.of(_unpublishedForks),
     );
+    return matches
+        .where((match) => !_unpublishedForks.contains(match.conversationId))
+        .toList();
   }
 
   Future<ChatStatsAggregate> loadStatsAggregate({
@@ -1357,6 +1501,13 @@ class ChatService extends ChangeNotifier {
     if (!_initialized) return false;
     final cached = _messagesCache[conversationId];
     if (cached == null) return false;
+    if (_temporaryConversationIds.contains(conversationId)) return true;
+    // Complete pages are sorted using their stored row order. An unknown
+    // order cannot become a full-history hit merely by collecting enough ids.
+    if (!_messageOrderIds.containsKey(conversationId) &&
+        cached.any((m) => m.storageOrder == null)) {
+      return false;
+    }
     final known =
         _messageCounts[conversationId] ??
         _messageOrderIds[conversationId]?.length;
@@ -1364,6 +1515,52 @@ class ChatService extends ChangeNotifier {
   }
 
   static const int _titleSourceMaxChars = 3000;
+
+  Future<String> generateSummarySource(
+    String conversationId, {
+    required int start,
+    required int end,
+  }) {
+    if (!_initialized ||
+        isTemporaryConversation(conversationId) ||
+        end <= start) {
+      return Future.value('');
+    }
+    return _repo.getConversationSummarySource(
+      conversationId,
+      start: start,
+      end: end,
+    );
+  }
+
+  /// Selected history in reverse chronological order for background readers.
+  /// Read older pages only while the caller still needs more messages.
+  Future<void> readSelectedMessageTextTail(
+    String id, {
+    required int start,
+    required bool Function(Iterable<ChatMessageText>) visit,
+  }) async {
+    if (!_initialized) return;
+    if (_temporaryConversationIds.contains(id) ||
+        _draftConversations.containsKey(id)) {
+      final selected = _collapseTitleVersions(
+        _messagesCache[id] ?? [],
+        getVersionSelections(id),
+      );
+      visit(
+        selected.reversed
+            .take(selected.length - start.clamp(0, selected.length))
+            .map((m) => m.textProjection),
+      );
+      return;
+    }
+    await _repo.readSelectedMessageTextTail(
+      id,
+      start: start,
+      pageSize: defaultHistoryPageSize,
+      visit: visit,
+    );
+  }
 
   /// Builds the source text for LLM title generation.
   ///
@@ -1377,7 +1574,14 @@ class ChatService extends ChangeNotifier {
     final truncateIndex = getContextStartIndex(conversationId);
 
     final List<ChatMessage> source;
-    if (isConversationFullyCached(conversationId)) {
+    final operations = await loadContextOperations(conversationId);
+    if (operations.any((op) => !op.revoked)) {
+      final effective = await loadSelectedContextMessages(
+        conversationId,
+        limit: 64,
+      );
+      source = _titleSourceTailWindow(effective, 0);
+    } else if (isConversationFullyCached(conversationId)) {
       final selected = _collapseTitleVersions(
         _messagesCache[conversationId]!,
         getVersionSelections(conversationId),
@@ -1499,13 +1703,24 @@ class ChatService extends ChangeNotifier {
     if (!_initialized) return const [];
     // Require a known count: unknown (-1) must not short-circuit as a cache hit.
     if (isConversationFullyCached(conversationId)) {
-      return _messagesCache[conversationId]!;
+      final messages = List<ChatMessage>.of(_messagesCache[conversationId]!);
+      if (!_temporaryConversationIds.contains(conversationId)) {
+        // This explicit full read already owns every body, so its identity
+        // list needs no additional database query.
+        _messageOrderIds.putIfAbsent(
+          conversationId,
+          () => messages.map((m) => m.id).toList(growable: true),
+        );
+        await _cacheMessageArtifacts(messages);
+      }
+      return messages;
     }
     final conversation =
         _conversationsCache[conversationId] ??
         _draftConversations[conversationId];
     if (conversation == null) return [];
 
+    final revision = _contextRevisions[conversationId] ?? 0;
     final List<ChatMessage> messages;
     if (_temporaryConversationIds.contains(conversationId)) {
       messages = _messagesCache[conversationId] ?? const <ChatMessage>[];
@@ -1520,6 +1735,9 @@ class ChatService extends ChangeNotifier {
 
     if (!_temporaryConversationIds.contains(conversationId)) {
       await _cacheMessageArtifacts(messages);
+      if ((_contextRevisions[conversationId] ?? 0) != revision) {
+        return loadMessages(conversationId);
+      }
       // A full read sorted by message_order is the authoritative order; backfill
       // the skeleton so later windowed loads don't intersect against stale data.
       // Merge instead of replacing outright: a concurrent addMessage may have
@@ -1550,7 +1768,20 @@ class ChatService extends ChangeNotifier {
 
   Future<List<ChatMessage>> loadSelectedContextMessages(
     String conversationId, {
-    required int truncateIndex,
+    required int limit,
+    String? throughRevisionId,
+    bool includeFollowingAssistant = false,
+  }) => loadEffectiveContextMessages(
+    conversationId,
+    limit: limit,
+    throughRevisionId: throughRevisionId,
+    includeFollowingAssistant: includeFollowingAssistant,
+  );
+
+  /// Selected original messages for history-based bookkeeping such as world-book
+  /// timers. Model requests must use loadSelectedContextMessages instead.
+  Future<List<ChatMessage>> loadRawSelectedContextMessages(
+    String conversationId, {
     required int limit,
     String? throughRevisionId,
     bool includeFollowingAssistant = false,
@@ -1595,16 +1826,11 @@ class ChatService extends ChangeNotifier {
           if (assistant >= 0) end = assistant + 1;
         }
       }
-      final start = truncateIndex >= 0 && truncateIndex <= end
-          ? truncateIndex
-          : 0;
-      final available = end - start;
-      final boundedStart = start + (available - limit).clamp(0, available);
+      final boundedStart = (end - limit).clamp(0, end);
       return selected.sublist(boundedStart, end);
     }
     final messages = await _repo.getSelectedContextMessages(
       conversationId,
-      truncateIndex: truncateIndex,
       limit: limit,
       throughRevisionId: throughRevisionId,
       includeFollowingAssistant: includeFollowingAssistant,
@@ -1629,105 +1855,114 @@ class ChatService extends ChangeNotifier {
     return _repo.getMaxMessageVersionForGroup(conversationId, groupId);
   }
 
+  Future<ContextMutationState> loadContextMutationState(String id) async {
+    if (_initialized &&
+        !_temporaryConversationIds.contains(id) &&
+        !_draftConversations.containsKey(id)) {
+      return _repo.readContextMutationState(id);
+    }
+    final operations = await loadContextOperations(id);
+    return (
+      revision: ContextHistory.operationsFingerprint(operations),
+      operations: operations,
+    );
+  }
+
+  Future<({List<ChatMessage> messages, List<ContextOperation> operations})>
+  loadContextMutationPreview(String id, {required String expectedState}) async {
+    if (_initialized &&
+        !_temporaryConversationIds.contains(id) &&
+        !_draftConversations.containsKey(id)) {
+      final snapshot = await _repo.readContextMutationPreview(
+        id,
+        expectedState: expectedState,
+      );
+      await _cacheMessageArtifacts(snapshot.messages);
+      return snapshot;
+    }
+    final operations = await loadContextOperations(id);
+    if (ContextHistory.operationsFingerprint(operations) != expectedState) {
+      throw StateError('context_changed');
+    }
+    return (
+      messages: await loadRawSelectedContextMessages(id, limit: 0x7fffffff),
+      operations: operations,
+    );
+  }
+
   Future<List<ChatMessage>> loadSelectedMessageProjections(
     String conversationId,
   ) async {
     if (_temporaryConversationIds.contains(conversationId) ||
         _draftConversations.containsKey(conversationId)) {
-      return loadSelectedContextMessages(
+      return loadRawSelectedContextMessages(
         conversationId,
-        truncateIndex: -1,
         limit: _messagesCache[conversationId]?.length ?? 0,
       );
     }
     return _repo.getSelectedMessageProjections(conversationId);
   }
 
-  Future<List<MiniMapSearchHit>> searchMiniMapMatches(
+  Future<({String? targetGroupId, Set<String> removedGroups})>
+  loadRegenerationSourceGroups(
     String conversationId,
-    String query, {
-    int snippetRadius = 40,
-    int snippetLength = 120,
+    String revisionId, {
+    required bool assistantAsNewReply,
+    required bool deleteTrailingMessages,
   }) async {
-    if (!_initialized) return const <MiniMapSearchHit>[];
-    if (_temporaryConversationIds.contains(conversationId) ||
-        _draftConversations.containsKey(conversationId)) {
-      return _miniMapHitsFromCachedMessages(
+    if (!_temporaryConversationIds.contains(conversationId) &&
+        !_draftConversations.containsKey(conversationId)) {
+      return _repo.getRegenerationSourceGroups(
         conversationId,
-        query,
-        snippetRadius: snippetRadius,
-        snippetLength: snippetLength,
+        revisionId,
+        assistantAsNewReply: assistantAsNewReply,
+        deleteTrailingMessages: deleteTrailingMessages,
       );
     }
-    return _repo.searchMiniMapMatches(
-      conversationId,
-      query,
-      snippetRadius: snippetRadius,
-      snippetLength: snippetLength,
+    final selected = _collapseTitleVersions(
+      _messagesCache[conversationId] ?? [],
+      getVersionSelections(conversationId),
+    );
+    var keep = selected.indexWhere((m) => m.id == revisionId);
+    if (keep < 0) return (targetGroupId: null, removedGroups: <String>{});
+    String? target;
+    if (selected[keep].role == 'assistant') {
+      if (!assistantAsNewReply) target = ContextHistory.group(selected[keep]);
+    } else if (keep + 1 < selected.length &&
+        selected[keep + 1].role == 'assistant') {
+      target = ContextHistory.group(selected[++keep]);
+    }
+    return (
+      targetGroupId: target,
+      removedGroups: deleteTrailingMessages
+          ? selected.skip(keep + 1).map(ContextHistory.group).toSet()
+          : <String>{},
     );
   }
 
-  List<MiniMapSearchHit> _miniMapHitsFromCachedMessages(
+  Stream<List<ConversationFindCandidate>> conversationFindCandidates(
     String conversationId,
-    String query, {
-    required int snippetRadius,
-    required int snippetLength,
-  }) {
-    final needle = query.trim().toLowerCase();
-    if (needle.isEmpty) return const <MiniMapSearchHit>[];
-    final radius = snippetRadius < 0 ? 0 : snippetRadius;
-    final length = miniMapSnippetLength(
-      needleLength: needle.length,
-      snippetRadius: snippetRadius,
-      snippetLength: snippetLength,
-    );
-    final messages = _messagesCache[conversationId] ?? const <ChatMessage>[];
-    final groups = <String, List<ChatMessage>>{};
-    final order = <String>[];
-    for (final message in messages) {
-      final groupId = message.groupId ?? message.id;
-      if (!groups.containsKey(groupId)) order.add(groupId);
-      groups.putIfAbsent(groupId, () => <ChatMessage>[]).add(message);
-    }
-    final selections = getVersionSelections(conversationId);
-    final hits = <MiniMapSearchHit>[];
-    for (final groupId in order) {
-      final versions = groups[groupId]!
-        ..sort((a, b) => a.version.compareTo(b.version));
-      final version = selections[groupId];
-      final selected =
-          versions.cast<ChatMessage?>().firstWhere(
-            (message) => message!.version == version,
-            orElse: () => null,
-          ) ??
-          versions.last;
-      if (selected.role != 'user' && selected.role != 'assistant') continue;
-      final text = selected.content;
-      final lower = text.toLowerCase();
-      final first = lower.indexOf(needle);
-      if (first < 0) continue;
-      var matchCount = 0;
-      var pos = 0;
-      while (true) {
-        final index = lower.indexOf(needle, pos);
-        if (index < 0) break;
-        matchCount++;
-        pos = index + needle.length;
-      }
-      final snippetStart = first < radius ? 0 : first - radius;
-      final snippetEnd = snippetStart + length > text.length
-          ? text.length
-          : snippetStart + length;
-      hits.add(
-        MiniMapSearchHit(
-          messageId: selected.id,
-          matchCount: matchCount,
-          snippet: text.substring(snippetStart, snippetEnd),
-          snippetStart: snippetStart,
-        ),
+  ) async* {
+    if (!_initialized) return;
+    if (_temporaryConversationIds.contains(conversationId) ||
+        _draftConversations.containsKey(conversationId)) {
+      final selected = _collapseTitleVersions(
+        _messagesCache[conversationId] ?? [],
+        getVersionSelections(conversationId),
       );
+      yield [
+        for (final message in selected)
+          if (message.role == 'assistant' || message.role == 'user')
+            ConversationFindCandidate(message),
+      ];
+    } else {
+      yield* _repo.conversationFindCandidates(conversationId);
     }
-    return hits;
+  }
+
+  Future<bool> messageExists(String id) async {
+    if (_cachedTemporaryMessage(id) != null) return true;
+    return _repo.messageExists(id);
   }
 
   Future<List<ChatMessage>> loadMessagesByIds(List<String> ids) async {
@@ -1928,6 +2163,8 @@ class ChatService extends ChangeNotifier {
       _draftConversations[conversation.id] = conversation;
       return;
     }
+    await loadContextOperations(conversation.id);
+    conversation.truncateIndex = -1;
     await _repo.putConversation(conversation);
     _conversationsCache[conversation.id] = conversation;
   }
@@ -1947,15 +2184,31 @@ class ChatService extends ChangeNotifier {
     String? title,
     String? assistantId,
     bool temporary = false,
+    bool reuseNewEntry = false,
   }) async {
     if (!_initialized) await init();
     _discardTemporaryConversation(_currentConversationId);
+    final existing = temporary || !reuseNewEntry
+        ? null
+        : _repo.composerDrafts.newEntry(assistantId);
+    if (existing != null) {
+      final restored = _conversationsCache[existing.id] ?? existing;
+      if (!_conversationsCache.containsKey(restored.id)) {
+        _draftConversations[restored.id] = restored;
+      }
+      _currentConversationId = restored.id;
+      notifyListeners();
+      return restored;
+    }
     final conversation = Conversation(
       title: title ?? _defaultConversationTitle,
       assistantId: assistantId,
       extras: _extrasForNewConversation(assistantId),
     );
     _draftConversations[conversation.id] = conversation;
+    if (!temporary && reuseNewEntry) {
+      _repo.composerDrafts.registerNewEntry(conversation);
+    }
     if (temporary) {
       _temporaryConversationIds.add(conversation.id);
       _messagesCache[conversation.id] = <ChatMessage>[];
@@ -1974,7 +2227,14 @@ class ChatService extends ChangeNotifier {
 
   void _discardTemporaryConversation(String? id) {
     if (id == null || !_temporaryConversationIds.remove(id)) return;
+    _temporaryImageSettings.remove(id);
+    _temporaryCompressionSettings.remove(id);
+    _contextCompression?.forget(id);
+    _forgetContextRevision(id);
     _rememberDiscardedTemporaryConversation(id);
+    unawaited(
+      _repo.composerDrafts.removePrivateDirectory(id).catchError((Object _) {}),
+    );
     final messages = _messagesCache[id] ?? const <ChatMessage>[];
     for (final message in messages) {
       _temporaryToolEvents.remove(message.id);
@@ -1985,10 +2245,14 @@ class ChatService extends ChangeNotifier {
     if (_currentConversationId == id) {
       _currentConversationId = null;
     }
+    _scheduleDueAssetMaintenance();
   }
 
   Future<void> deleteConversation(String id) async {
+    _temporaryImageSettings.remove(id);
+    _temporaryCompressionSettings.remove(id);
     if (!_initialized) return;
+    _contextCompression?.forget(id);
 
     final deleted =
         await _deleteDraftConversation(id) ||
@@ -2003,6 +2267,7 @@ class ChatService extends ChangeNotifier {
 
   Future<Conversation?> duplicateConversation(String id) async {
     if (!_initialized) await init();
+    await loadContextOperations(id);
     final duplicate = await _repo.duplicateConversation(id);
     if (duplicate == null) return null;
 
@@ -2017,6 +2282,7 @@ class ChatService extends ChangeNotifier {
   Future<bool> _deleteDraftConversation(String id) async {
     if (!_draftConversations.containsKey(id)) return false;
 
+    await _repo.composerDrafts.delete(id);
     _draftConversations.remove(id);
     if (_temporaryConversationIds.remove(id)) {
       _rememberDiscardedTemporaryConversation(id);
@@ -2045,7 +2311,6 @@ class ChatService extends ChangeNotifier {
     _conversationsCache.remove(id);
     // Stop any deferred/in-flight order backfill before clearing caches so a
     // late getMessageIds cannot resurrect order/count for a deleted id.
-    _abortMessageOrderBackfill(id);
     final removedMessages = _messagesCache.remove(id);
     final removedOrder = _messageOrderIds.remove(id);
     _messageCounts.remove(id);
@@ -2085,6 +2350,13 @@ class ChatService extends ChangeNotifier {
         .toList(growable: false);
 
     var deleted = false;
+    for (final id in _repo.composerDrafts.newEntriesForAssistant(targetId)) {
+      if (!draftConversationIds.contains(id) &&
+          !persistedConversationIds.contains(id)) {
+        await _repo.composerDrafts.delete(id);
+        deleted = true;
+      }
+    }
     for (final conversationId in draftConversationIds) {
       deleted = await _deleteDraftConversation(conversationId) || deleted;
     }
@@ -2121,10 +2393,10 @@ class ChatService extends ChangeNotifier {
     return count;
   }
 
-  List<({String path, String kind})> _extractLocalAttachmentsFromMessage(
-    ChatMessage message,
-  ) {
+  Future<List<({String path, String kind})>>
+  _extractLocalAttachmentsFromMessage(ChatMessage message) async {
     final fromParts = <String, ({String path, String kind})>{};
+    final previews = <String>{};
     for (final part in message.parts) {
       if (part is ImagePart) {
         // Unavailable placeholders stay in history for UI but must not enter
@@ -2146,6 +2418,27 @@ class ChatService extends ChangeNotifier {
         final fixed = SandboxPathResolver.resolveForIo(uri);
         if (fixed == null) continue;
         fromParts['file:$fixed'] = (path: fixed, kind: 'file');
+      } else if (part is ToolCallPart) {
+        final uri = part.browserPreviewImage;
+        if (uri != null && previews.add(uri)) {
+          final file = await McpImageSnapshot.localFile(uri);
+          if (file != null) {
+            // Keep the sandbox spelling after validating its real destination;
+            // macOS /var can resolve to /private/var outside the lexical root.
+            final path = SandboxPathResolver.resolveForIo(uri)!;
+            fromParts['image:$path'] = (path: path, kind: 'image');
+          }
+        }
+        for (final asset in chatImageAssetsFromPart(part)) {
+          if (!asset.directAsset &&
+              await McpImageSnapshot.localFile(asset.uri) == null) {
+            continue;
+          }
+          final path = SandboxPathResolver.resolveForIo(asset.uri);
+          if (path != null) {
+            fromParts['image:$path'] = (path: path, kind: 'image');
+          }
+        }
       }
     }
     return List.unmodifiable(fromParts.values);
@@ -2174,6 +2467,9 @@ class ChatService extends ChangeNotifier {
     (part) =>
         part is ImagePart ||
         part is FilePart ||
+        (part is ToolCallPart &&
+            (part.browserPreviewImage != null ||
+                chatImageAssetsFromPart(part).isNotEmpty)) ||
         (part is MalformedPart && part.isAttachmentKind),
   );
 
@@ -2223,7 +2519,7 @@ class ChatService extends ChangeNotifier {
   Future<void> runAssetReferenceMaintenance() async {
     if (!_initialized) await init();
     return _runAssetReferenceMaintenance(
-      await AppDirectories.getAppDataDirectory(),
+      await AppDirectories.getContentDirectory(),
     );
   }
 
@@ -2254,13 +2550,15 @@ class ChatService extends ChangeNotifier {
       await _repo.markMessageAssetReferencesDirty(message.id);
       return false;
     }
-    final appDataDir = await AppDirectories.getAppDataDirectory();
+    final appDataDir = await AppDirectories.getContentDirectory();
     final allowedRoots = [
       p.normalize(p.join(appDataDir.absolute.path, 'upload')),
       p.normalize(p.join(appDataDir.absolute.path, 'images')),
     ];
     final registrations = <MessageAssetRegistration>[];
-    for (final attachment in _extractLocalAttachmentsFromMessage(message)) {
+    for (final attachment in await _extractLocalAttachmentsFromMessage(
+      message,
+    )) {
       final normalizedPath = p.normalize(File(attachment.path).absolute.path);
       if (!allowedRoots.any((root) => p.isWithin(root, normalizedPath))) {
         continue;
@@ -2308,6 +2606,15 @@ class ChatService extends ChangeNotifier {
     }
   }
 
+  Future<void> _synchronizePersistedMessageAssetsBestEffort(String id) async {
+    try {
+      final message = await _repo.getMessage(id);
+      if (message != null) await _synchronizeMessageAssets(message);
+    } catch (error) {
+      debugPrint('Message asset synchronization failed: $error');
+    }
+  }
+
   Future<void> _migrateSandboxPaths() async {
     if (SandboxPathResolver.docsDir == null) {
       await SandboxPathResolver.init();
@@ -2338,83 +2645,263 @@ class ChatService extends ChangeNotifier {
     await _repo.resetStaleStreamingState();
   }
 
-  Future<void> runAssetMaintenance({DateTime? now}) async {
+  bool get hasTransientGeneration => _temporaryConversationIds.any(
+    (id) => (_messagesCache[id] ?? const <ChatMessage>[]).any(
+      (message) => message.isStreaming,
+    ),
+  );
+
+  Future<void> _collectDueAssetsAfterGeneration() async {
+    if (!_initialized || _assetCleanupClosing) return;
+    // Maintenance runs after the reply commits. A cleanup failure must never
+    // make the generation state machine retry that already committed write.
+    try {
+      if (await _repo.hasDueAssetGc()) await runAssetMaintenance();
+    } catch (error) {
+      debugPrint('Deferred asset cleanup failed: $error');
+    }
+  }
+
+  void _scheduleDueAssetMaintenance() {
+    if (!_initialized ||
+        _assetCleanupClosing ||
+        _deferredAssetMaintenance != null) {
+      return;
+    }
+    late final Future<void> pending;
+    pending = Future<void>(_collectDueAssetsAfterGeneration).whenComplete(() {
+      if (identical(_deferredAssetMaintenance, pending)) {
+        _deferredAssetMaintenance = null;
+      }
+    });
+    _deferredAssetMaintenance = pending;
+  }
+
+  AttachmentReferenceReader? _captureTemporaryReferences() =>
+      _captureAttachmentReferences([
+        for (final id in _temporaryConversationIds) ...?_messagesCache[id],
+      ], _temporaryToolEvents);
+
+  AttachmentReferenceReader? _captureAttachmentReferences(
+    Iterable<ChatMessage> messages,
+    Map<String, List<Map<String, dynamic>>> toolEvents,
+  ) {
+    if (messages.isEmpty) return null;
+    return _attachmentReader(SandboxPathResolver.docsDir ?? '', [
+      for (final message in messages)
+        (
+          conversationId: message.conversationId,
+          title: getConversation(message.conversationId)?.title ?? '',
+          parts: message.parts,
+          events: toolEvents[message.id] ?? const <Map<String, dynamic>>[],
+        ),
+    ]);
+  }
+
+  // Build this closure in a static method so it carries only the snapshot,
+  // never ChatService, a database connection, or a live HiveObject.
+  static AttachmentReferenceReader _attachmentReader(
+    String root,
+    List<
+      ({
+        String conversationId,
+        String title,
+        List<MessagePart> parts,
+        List<Map<String, dynamic>> events,
+      })
+    >
+    messages,
+  ) => () {
+    final references = <String, Map<String, String>>{};
+    for (final message in messages) {
+      final id = message.conversationId;
+      void add(String uri) {
+        final source = resolveStorageSessionReference(uri, id, root);
+        references.putIfAbsent(source, () => {})[id] = message.title;
+      }
+
+      for (final part in message.parts) {
+        final uris = switch (part) {
+          ImagePart(:final uri) || FilePart(:final uri) => [uri],
+          ToolCallPart() => storageToolAttachmentUris(
+            jsonDecode(part.payloadJson),
+            root,
+            id,
+          ),
+          TextPart(:final text) => markdownImageSources(
+            text,
+            includeLinks: true,
+          ),
+          _ => const <String>[],
+        };
+        uris.forEach(add);
+      }
+      for (final event in message.events) {
+        storageToolAttachmentUris(event, root, id).forEach(add);
+      }
+    }
+    return references;
+  };
+
+  Future<void> runAssetMaintenance({DateTime? now}) =>
+      AttachmentFileLock.synchronized(() => _runAssetMaintenance(now: now));
+
+  Future<void> _runAssetMaintenance({DateTime? now}) async {
     final effectiveNow = (now ?? DateTime.now()).toUtc();
     try {
+      final retentionDays = await _repo.getAttachmentRetentionDays();
+      await _repo.applyAttachmentRetention(retentionDays);
       await _repo.scheduleUnreferencedAssetGc(
-        notBefore: effectiveNow.add(_assetGcDelay),
+        notBefore: effectiveNow.add(Duration(days: retentionDays)),
       );
-      final candidates = await _repo.claimAssetGc(now: effectiveNow);
-      final appDataDir = await AppDirectories.getAppDataDirectory();
-      final allowedRoots = [
-        p.normalize(p.join(appDataDir.absolute.path, 'upload')),
-        p.normalize(p.join(appDataDir.absolute.path, 'images')),
-      ];
-      for (final candidate in candidates) {
-        final paths = [
-          candidate.path,
-          candidate.thumbnailPath,
-        ].whereType<String>();
-        final regularFiles = <File>[];
-        var safe = true;
-        for (final candidatePath in paths) {
-          final resolved = SandboxPathResolver.resolveForIo(candidatePath);
-          if (resolved == null) {
-            safe = false;
-            break;
-          }
-          final normalized = p.normalize(File(resolved).absolute.path);
-          if (!allowedRoots.any((root) => p.isWithin(root, normalized))) {
-            safe = false;
-            break;
-          }
-          final type = await FileSystemEntity.type(
-            normalized,
-            followLinks: false,
-          );
-          if (type == FileSystemEntityType.file) {
-            regularFiles.add(File(normalized));
-          } else if (type != FileSystemEntityType.notFound) {
-            safe = false;
-            break;
-          }
-        }
-        if (!safe) continue;
-        if (!await _repo.isAssetGcClaimStillValid(candidate)) continue;
-        final quarantined = <({File original, File quarantine})>[];
-        try {
-          for (final file in regularFiles) {
-            final quarantine = File(
-              '${file.path}.kelivo-gc-${candidate.assetId}-'
-              '${candidate.generation}',
-            );
-            if (await quarantine.exists()) {
+      final deletedPaths = <String>{};
+      while (true) {
+        final candidates = await _repo.claimAssetGc(
+          now: effectiveNow,
+          generationActive: AttachmentFileLock.hasActiveTransientGeneration,
+          protectedPaths: {
+            for (final uri
+                in (await AttachmentFileLock.readTransientReferences())
+                    .keys) ...[
+              uri,
+              SandboxPathResolver.canonicalize(uri),
+              ?SandboxPathResolver.resolveForIo(uri),
+            ],
+          },
+        );
+        if (candidates.isEmpty) break;
+        final imageUsage = await StorageAttachmentUsage.load();
+        final appDataDir = await AppDirectories.getContentDirectory();
+        final allowedRoots = [
+          p.normalize(p.join(appDataDir.absolute.path, 'upload')),
+          p.normalize(p.join(appDataDir.absolute.path, 'images')),
+        ];
+        for (final candidate in candidates) {
+          final paths = [
+            candidate.path,
+            candidate.thumbnailPath,
+            ...candidate.additionalPaths,
+          ].whereType<String>().toSet();
+          final regularFiles = <File>[];
+          final physicalPaths = <String>{};
+          final sourcePaths = <String>{};
+          Future<bool> generationInFlight() async =>
+              AttachmentFileLock.hasActiveTransientGeneration ||
+              await _repo.hasActiveGenerations();
+          var safe = true;
+          for (final candidatePath in paths) {
+            final resolved = SandboxPathResolver.resolveForIo(candidatePath);
+            if (resolved == null) {
               safe = false;
               break;
             }
-            await file.rename(quarantine.path);
-            quarantined.add((original: file, quarantine: quarantine));
+            final normalized = p.normalize(File(resolved).absolute.path);
+            if (imageUsage.isInUse(normalized)) {
+              safe = false;
+              break;
+            }
+            if (!allowedRoots.any((root) => p.isWithin(root, normalized))) {
+              safe = false;
+              break;
+            }
+            sourcePaths.add(normalized);
+            final type = await FileSystemEntity.type(
+              normalized,
+              followLinks: false,
+            );
+            if (type == FileSystemEntityType.file) {
+              if (imageUsage.isInUse(
+                await File(normalized).resolveSymbolicLinks(),
+              )) {
+                safe = false;
+                break;
+              }
+              final real = await File(normalized).resolveSymbolicLinks();
+              if (physicalPaths.add(real)) regularFiles.add(File(normalized));
+            } else if (type != FileSystemEntityType.notFound) {
+              safe = false;
+              break;
+            }
+          }
+          if (!safe && !await generationInFlight()) {
+            await _repo.deferAssetGc(
+              candidate,
+              notBefore: effectiveNow.add(const Duration(hours: 6)),
+            );
           }
           if (!safe) continue;
-          final completed = await _repo.completeAssetGc(
-            assetId: candidate.assetId,
-            expectedGeneration: candidate.generation,
-            path: candidate.path,
-          );
-          if (!completed) continue;
-          for (final moved in quarantined) {
-            await moved.quarantine.delete();
+          if (!await _repo.isAssetGcClaimStillValid(candidate)) {
+            if (!await generationInFlight()) {
+              await _repo.deferAssetGc(
+                candidate,
+                notBefore: effectiveNow.add(const Duration(hours: 6)),
+              );
+            }
+            continue;
           }
-          quarantined.clear();
-        } finally {
-          for (final moved in quarantined.reversed) {
-            if (!await moved.original.exists() &&
-                await moved.quarantine.exists()) {
-              await moved.quarantine.rename(moved.original.path);
+          final quarantined = <({File original, File quarantine})>[];
+          try {
+            for (final file in regularFiles) {
+              final quarantine = File(
+                '${file.path}.kelivo-gc-${candidate.assetId}-'
+                '${candidate.generation}',
+              );
+              if (await quarantine.exists()) {
+                safe = false;
+                break;
+              }
+              await file.rename(quarantine.path);
+              quarantined.add((original: file, quarantine: quarantine));
+            }
+            if (!safe) continue;
+            // A generation may have started after the initial snapshot.
+            if (await generationInFlight()) {
+              safe = false;
+              continue;
+            }
+            final completed = await _repo.completeAssetGc(
+              assetId: candidate.assetId,
+              expectedGeneration: candidate.generation,
+              path: candidate.path,
+              additionalPaths: candidate.additionalPaths,
+            );
+            if (!completed) {
+              if (!await generationInFlight()) {
+                await _repo.deferAssetGc(
+                  candidate,
+                  notBefore: effectiveNow.add(const Duration(hours: 6)),
+                );
+              }
+              continue;
+            }
+            for (final moved in quarantined) {
+              await moved.quarantine.delete();
+            }
+            deletedPaths.addAll(sourcePaths);
+            quarantined.clear();
+          } finally {
+            if (!safe && !await generationInFlight()) {
+              await _repo.deferAssetGc(
+                candidate,
+                notBefore: effectiveNow.add(const Duration(hours: 6)),
+              );
+            }
+            for (final moved in quarantined.reversed) {
+              if (!await moved.original.exists() &&
+                  await moved.quarantine.exists()) {
+                await moved.quarantine.rename(moved.original.path);
+              }
             }
           }
         }
       }
+      if (deletedPaths.isNotEmpty) {
+        await deleteSessionAttachmentCopies(
+          deletedPaths,
+          sessionsDirectory: await AppDirectories.getSessionsDirectory(),
+        );
+      }
+      await StorageAttachmentUsage.cleanSessions();
     } catch (error) {
       debugPrint('Asset maintenance failed: $error');
     }
@@ -2467,6 +2954,7 @@ class ChatService extends ChangeNotifier {
         .map((message) => message.id)
         .toList(growable: true);
     _messageCounts[restored.id] = messages.length;
+    _bumpContextRevision(restored.id);
     _bumpConversationListRevision();
     notifyListeners();
   }
@@ -2477,13 +2965,14 @@ class ChatService extends ChangeNotifier {
   Future<void> commitParsedImport({
     required BusinessRepository businessRepository,
     required bool overwrite,
+    bool deleteUploads = true,
     required List<ParsedChatImportBatch> conversationBatches,
     required Map<String, List<ChatMessage>> messagesToAppend,
     required BusinessSnapshot Function(BusinessSnapshot current)
     transformBusiness,
   }) async {
     if (!_initialized) await init();
-    await _repo.commitParsedImport(
+    Future<void> commit() => _repo.commitParsedImport(
       businessRepository: businessRepository,
       overwrite: overwrite,
       conversationBatches: conversationBatches,
@@ -2492,10 +2981,15 @@ class ChatService extends ChangeNotifier {
     );
 
     if (overwrite) {
-      await _resetAfterOverwriteRestore();
-      await _deleteUploadDirectory();
+      await _contextCompression?.cancelAll();
+      await _repo.composerDrafts.overwrite(() async {
+        await commit();
+        await _resetAfterOverwriteRestore();
+      });
+      if (deleteUploads) await _deleteUploadDirectory();
       return;
     }
+    await commit();
     _clearPersistedMessageCache();
     await _backfillAssetReferencesForCurrentRoot();
     await _loadConversationsCache();
@@ -2509,6 +3003,7 @@ class ChatService extends ChangeNotifier {
     required Map<String, String> geminiSignaturesByMessageId,
   }) async {
     if (!_initialized) await init();
+    await _contextCompression?.cancelAll();
 
     final nextOrderByConversation = <String, int>{};
     final orderedMessages = <({ChatMessage message, int messageOrder})>[];
@@ -2521,15 +3016,22 @@ class ChatService extends ChangeNotifier {
       orderedMessages.add((message: message, messageOrder: messageOrder));
     }
 
-    await _repo.replaceBackupData(
-      conversations: conversations,
-      messages: orderedMessages,
-      toolEventsByMessageId: toolEventsByMessageId,
-      geminiSignaturesByMessageId: geminiSignaturesByMessageId,
-    );
+    await _repo.composerDrafts.overwrite(() async {
+      await _repo.replaceBackupData(
+        conversations: conversations,
+        messages: orderedMessages,
+        toolEventsByMessageId: toolEventsByMessageId,
+        geminiSignaturesByMessageId: geminiSignaturesByMessageId,
+      );
 
-    await _resetAfterOverwriteRestore();
+      await _resetAfterOverwriteRestore();
+    });
   }
+
+  /// Snapshot scheduling can inspect change fingerprints before it builds an
+  /// archive, so pending UI writes must be observable at both entry points.
+  Future<void> flushAcceptedUiState() =>
+      chatRepositoryOrNull?.genUiStates.flush() ?? Future<void>.value();
 
   Future<ChatDatabaseSnapshotInfo> createBackupDatabaseSnapshot(
     File destinationFile, {
@@ -2538,6 +3040,7 @@ class ChatService extends ChangeNotifier {
     Duration timeout = const Duration(minutes: 10),
   }) async {
     if (!_initialized) await init();
+    await flushAcceptedUiState();
     final sourcePath = _databaseFile.path;
     final destinationPath = destinationFile.path;
     try {
@@ -2603,6 +3106,8 @@ class ChatService extends ChangeNotifier {
     _messagesCache.clear();
     _draftConversations.clear();
     _temporaryConversationIds.clear();
+    _temporaryImageSettings.clear();
+    _temporaryCompressionSettings.clear();
     _temporaryToolEvents.clear();
     _temporaryProviderArtifacts.clear();
     _toolEventsCache.clear();
@@ -2612,6 +3117,7 @@ class ChatService extends ChangeNotifier {
     _currentConversationId = null;
     await _backfillAssetReferencesForCurrentRoot();
     await _loadConversationsCache();
+    await _contextCompression?.restore();
     notifyListeners();
   }
 
@@ -2645,6 +3151,16 @@ class ChatService extends ChangeNotifier {
   ) async {
     if (!_initialized) await init();
 
+    if (_temporaryConversationIds.contains(conversationId)) {
+      final messages = _messagesCache.putIfAbsent(conversationId, () => []);
+      if (messages.any((m) => m.id == message.id)) return;
+      messages.add(message);
+      _messageOrderIds[conversationId] = messages.map((m) => m.id).toList();
+      _messageCounts[conversationId] = messages.length;
+      _bumpContextRevision(conversationId);
+      notifyListeners();
+      return;
+    }
     final conversation = _conversationsCache[conversationId];
     if (conversation == null) return;
     final order = await _loadMessageOrder(conversationId);
@@ -2657,7 +3173,7 @@ class ChatService extends ChangeNotifier {
     if (_messageCanOwnAssets(message)) {
       await _synchronizeMessageAssetsBestEffort(message);
     }
-    _conversationsCache[conversationId] = persisted;
+    _conversationsCache[conversationId] = persisted.conversation;
     order.add(message.id);
     _messageCounts[conversationId] = order.length;
 
@@ -2681,28 +3197,35 @@ class ChatService extends ChangeNotifier {
     return c?.mcpServerIds ?? const <String>[];
   }
 
+  /// Null restores inheritance; an empty list explicitly disables all MCP.
   Future<void> setConversationMcpServers(
     String conversationId,
-    List<String> serverIds,
-  ) async {
+    List<String>? serverIds,
+  ) => _serializeConversationPublication(conversationId, () async {
     if (!_initialized) await init();
-    if (_draftConversations.containsKey(conversationId)) {
-      final draft = _draftConversations[conversationId]!;
-      draft.mcpServerIds = List.of(serverIds);
-      draft.updatedAt = DateTime.now();
+    final ids = serverIds?.toSet().toList();
+    final draft = _draftConversations[conversationId];
+    if (draft != null) {
+      final updated = draft.copyWith(
+        mcpServerIds: ids ?? const [],
+        extras: ConversationMcpSettings.updateExtras(
+          draft.extras,
+          override: ids != null,
+        ),
+        updatedAt: DateTime.now(),
+      );
+      _draftConversations[conversationId] = updated;
+      _repo.composerDrafts.updateSeed(updated);
       _bumpContextRevision(conversationId);
       notifyListeners();
       return;
     }
-    final c = _conversationsCache[conversationId];
-    if (c == null) return;
-    c.mcpServerIds = List.of(serverIds);
-    c.updatedAt = DateTime.now();
-    await _saveConversation(c);
+    await _repo.updateConversationMcpServers(conversationId, ids);
+    await _refreshConversation(conversationId);
     _bumpConversationListRevision();
     _bumpContextRevision(conversationId);
     notifyListeners();
-  }
+  });
 
   Future<void> toggleConversationMcpServer(
     String conversationId,
@@ -2807,19 +3330,38 @@ class ChatService extends ChangeNotifier {
   /// Reads extras, applies [update], writes the result, and refreshes the cache.
   Future<void> updateConversationExtras(
     String conversationId,
-    Map<String, dynamic> Function(Map<String, dynamic> current) update,
-  ) async {
+    Map<String, dynamic> Function(Map<String, dynamic> current) update, {
+    Conversation? expectedOwner,
+  }) async {
     final draft = _draftConversations[conversationId];
     if (draft != null) {
-      _draftConversations[conversationId] = draft.copyWith(
-        extras: update(Map<String, dynamic>.from(draft.extras)),
-      );
+      if (expectedOwner != null &&
+          draft.assistantId != expectedOwner.assistantId) {
+        throw StateError('context_changed');
+      }
+      final extras =
+          _initialized &&
+              !_temporaryConversationIds.contains(conversationId) &&
+              _repo.composerDrafts.isNewEntry(conversationId)
+          ? await _repo.composerDrafts.updateNewEntryExtras(
+              conversationId,
+              update,
+              expectedOwner: expectedOwner,
+            )
+          : update(Map<String, dynamic>.from(draft.extras));
+      final current = _draftConversations[conversationId];
+      if (current == null) throw StateError('conversation_not_found');
+      _draftConversations[conversationId] = current.copyWith(extras: extras);
       _bumpContextRevision(conversationId);
       notifyListeners();
       return;
     }
     if (!_initialized) return;
-    await _repo.updateConversationExtras(conversationId, update);
+    await _repo.updateConversationExtras(
+      conversationId,
+      update,
+      expectedOwner: expectedOwner,
+    );
     await _refreshConversation(conversationId);
     _bumpContextRevision(conversationId);
     notifyListeners();
@@ -2918,11 +3460,54 @@ class ChatService extends ChangeNotifier {
     return changed;
   }
 
+  Future<bool> isUiContextCurrent(UiContextSource source) async {
+    if (!_initialized) await init();
+    return isTemporaryConversation(source.conversationId)
+        ? _temporaryUiContextCurrent(source)
+        : _repo.isUiContextCurrent(source);
+  }
+
+  bool _temporaryUiContextCurrent(UiContextSource source) {
+    final message = _cachedTemporaryMessage(source.revisionId);
+    final conversation = _draftConversations[source.conversationId];
+    if (message == null || conversation == null) return false;
+    final group = message.groupId ?? message.id;
+    final revisions = (_messagesCache[source.conversationId] ?? [])
+        .where((m) => (m.groupId ?? m.id) == group)
+        .toList();
+    return uiContextSourceMatches(
+      source,
+      message,
+      selectedRevisionId: revisions.isEmpty
+          ? null
+          : _selectTimelineRevision(
+              revisions,
+              conversation.versionSelections[group],
+            ).id,
+    );
+  }
+
+  ChatMessage _withTemporaryUiContext(
+    ChatMessage message,
+    UiContextSubmission? request,
+  ) {
+    if (request == null) return message;
+    if (message.role != 'user') throw StateError('ui_context_requires_user');
+    final source = request.attachment.source;
+    return message.copyWith(
+      parts: request.resolve(
+        message.parts,
+        sourceIsCurrent: source != null && _temporaryUiContextCurrent(source),
+      ),
+    );
+  }
+
   Future<ChatMessage> addMessage({
     required String conversationId,
     required String role,
     String content = '',
     List<MessagePart>? parts,
+    List<QuoteRef> quotes = const [],
     String? modelId,
     String? providerId,
     int? totalTokens,
@@ -2934,7 +3519,8 @@ class ChatService extends ChangeNotifier {
     int? version,
     bool selectVersion = false,
     String? temporaryAfterGroupId,
-  }) async {
+    UiContextSubmission? uiContext,
+  }) => _serializeConversationPublication(conversationId, () async {
     if (!_initialized) await init();
 
     var conversation = _conversationsCache[conversationId];
@@ -2957,10 +3543,11 @@ class ChatService extends ChangeNotifier {
       }
     }
 
-    final message = ChatMessage(
+    var message = ChatMessage(
       role: role,
       content: parts == null ? content : null,
       parts: parts,
+      quotes: quotes,
       conversationId: conversationId,
       modelId: modelId,
       providerId: providerId,
@@ -2980,6 +3567,7 @@ class ChatService extends ChangeNotifier {
 
     int? temporaryInsertIndex;
     if (temporary) {
+      message = _withTemporaryUiContext(message, uiContext);
       if (temporaryAfterGroupId != null) {
         final messages = _messagesCache[conversationId]!;
         final anchorIndex = messages.indexWhere(
@@ -2996,6 +3584,9 @@ class ChatService extends ChangeNotifier {
       }
       conversation.updatedAt = DateTime.now();
       if (selectVersion) {
+        _revokeTemporaryContext(conversationId, {
+          message.groupId ?? message.id,
+        });
         conversation.versionSelections[message.groupId ?? message.id] =
             message.version;
       }
@@ -3004,67 +3595,69 @@ class ChatService extends ChangeNotifier {
       if (temporaryAfterGroupId != null) {
         throw StateError('anchored_message_requires_temporary_conversation');
       }
-      if (_conversationsCache.containsKey(conversationId)) {
-        await _loadMessageOrder(conversationId);
-      }
       final persisted = await _repo.appendLinearMessageToConversation(
         conversation: conversation,
         message: message,
         selectVersion: selectVersion,
+        uiContext: uiContext,
       );
+      message = persisted.message;
       if (_messageCanOwnAssets(message)) {
         await _synchronizeMessageAssetsBestEffort(message);
       }
       _draftConversations.remove(conversationId);
-      _conversationsCache[conversationId] = persisted;
-      conversation = persisted;
-      final order = _messageOrderIds.putIfAbsent(
+      _conversationsCache[conversationId] = persisted.conversation;
+      conversation = persisted.conversation;
+      _messageCounts[conversationId] = await _repo.getMessageCount(
         conversationId,
-        () => <String>[],
       );
-      if (!order.contains(message.id)) order.add(message.id);
-      _messageCounts[conversationId] = order.length;
+      final order = _messageOrderIds[conversationId];
+      if (order != null && !order.contains(message.id)) order.add(message.id);
       // Persisted append touches updatedAt (list order) and may promote a
       // draft into the persisted list.
       _bumpConversationListRevision();
     }
 
     // Update cache
-    if (_messagesCache.containsKey(conversationId)) {
-      final messages = _messagesCache[conversationId]!;
-      if (temporaryInsertIndex == null) {
-        messages.add(message);
-      } else {
-        messages.insert(temporaryInsertIndex, message);
-      }
+    final messages = _messagesCache.putIfAbsent(conversationId, () => []);
+    if (temporaryInsertIndex == null) {
+      messages.add(message);
+    } else {
+      messages.insert(temporaryInsertIndex, message);
     }
     _touchMessageCache(conversationId);
+    _enforceMessageCacheLimits();
     _bumpContextRevision(conversationId);
 
     notifyListeners();
     return message;
-  }
+  });
 
   Future<GenerationBeginResult> beginSendGeneration({
     required String conversationId,
     required List<MessagePart> userParts,
+    List<QuoteRef> quotes = const [],
     required String modelId,
     required String providerId,
-  }) async {
+    DraftSubmission? draftSubmission,
+    UiContextSubmission? uiContext,
+  }) => _serializeConversationPublication(conversationId, () async {
     if (!_initialized) await init();
     if (isTemporaryConversation(conversationId)) {
       throw StateError('temporary_generation_is_not_persisted');
+    }
+    if (draftSubmission != null && getConversation(conversationId) == null) {
+      throw StateError('conversation_missing');
     }
     final conversation =
         _conversationsCache[conversationId] ??
         _draftConversations[conversationId] ??
         Conversation(id: conversationId, title: _defaultConversationTitle);
-    if (_conversationsCache.containsKey(conversationId)) {
-      await _loadMessageOrder(conversationId);
-    }
     final userMessage = ChatMessage(
+      id: draftSubmission?.id,
       role: 'user',
       parts: userParts,
+      quotes: quotes,
       conversationId: conversationId,
     );
     final assistantMessage = ChatMessage(
@@ -3080,10 +3673,12 @@ class ChatService extends ChangeNotifier {
       userMessage: userMessage,
       assistantMessage: assistantMessage,
       runId: const Uuid().v4(),
+      draftSubmission: draftSubmission,
+      uiContext: uiContext,
     );
     await _publishGenerationBegin(result);
     return result;
-  }
+  });
 
   Future<GenerationBeginResult> beginRegeneration({
     required String conversationId,
@@ -3092,14 +3687,14 @@ class ChatService extends ChangeNotifier {
     required String groupId,
     required int version,
     required bool truncateFuture,
-  }) async {
+    String? expectedContextState,
+  }) => _serializeConversationPublication(conversationId, () async {
     if (!_initialized) await init();
     if (isTemporaryConversation(conversationId)) {
       throw StateError('temporary_generation_is_not_persisted');
     }
     final conversation = _conversationsCache[conversationId];
     if (conversation == null) throw StateError('conversation_missing');
-    await _loadMessageOrder(conversationId);
     final assistantMessage = ChatMessage(
       role: 'assistant',
       content: '',
@@ -3111,6 +3706,7 @@ class ChatService extends ChangeNotifier {
       version: version,
     );
     final result = await _repo.beginRegeneration(
+      expectedContextState: expectedContextState,
       conversation: conversation,
       assistantMessage: assistantMessage,
       runId: const Uuid().v4(),
@@ -3120,11 +3716,10 @@ class ChatService extends ChangeNotifier {
       _messagesCache.remove(conversationId);
       _messageOrderIds.remove(conversationId);
       _firstGroupIndicesCache.remove(conversationId);
-      await _loadMessageOrder(conversationId);
     }
     await _publishGenerationBegin(result);
     return result;
-  }
+  });
 
   Future<GenerationBeginResult> beginAssistantGeneration({
     required String conversationId,
@@ -3132,14 +3727,14 @@ class ChatService extends ChangeNotifier {
     required String providerId,
     required String anchorGroupId,
     required bool truncateFuture,
-  }) async {
+    String? expectedContextState,
+  }) => _serializeConversationPublication(conversationId, () async {
     if (!_initialized) await init();
     if (isTemporaryConversation(conversationId)) {
       throw StateError('temporary_generation_is_not_persisted');
     }
     final conversation = _conversationsCache[conversationId];
     if (conversation == null) throw StateError('conversation_missing');
-    await _loadMessageOrder(conversationId);
     final assistantMessage = ChatMessage(
       role: 'assistant',
       content: '',
@@ -3149,6 +3744,7 @@ class ChatService extends ChangeNotifier {
       isStreaming: true,
     );
     final result = await _repo.beginAssistantGeneration(
+      expectedContextState: expectedContextState,
       conversation: conversation,
       assistantMessage: assistantMessage,
       anchorGroupId: anchorGroupId,
@@ -3158,10 +3754,9 @@ class ChatService extends ChangeNotifier {
     _messagesCache.remove(conversationId);
     _messageOrderIds.remove(conversationId);
     _firstGroupIndicesCache.remove(conversationId);
-    await _loadMessageOrder(conversationId);
     await _publishGenerationBegin(result);
     return result;
-  }
+  });
 
   Future<void> _publishGenerationBegin(GenerationBeginResult result) async {
     final conversationId = result.conversation.id;
@@ -3175,20 +3770,18 @@ class ChatService extends ChangeNotifier {
         when _messageCanOwnAssets(userMessage)) {
       await _synchronizeMessageAssetsBestEffort(userMessage);
     }
-    final order = _messageOrderIds.putIfAbsent(
+    _messageCounts[conversationId] = await _repo.getMessageCount(
       conversationId,
-      () => <String>[],
     );
+    final order = _messageOrderIds[conversationId];
     for (final message in messages) {
-      if (!order.contains(message.id)) order.add(message.id);
+      if (order != null && !order.contains(message.id)) order.add(message.id);
     }
-    _messageCounts[conversationId] = order.length;
-    if (_messagesCache.containsKey(conversationId)) {
-      _messagesCache[conversationId]!.addAll(messages);
-    }
+    _messagesCache.putIfAbsent(conversationId, () => []).addAll(messages);
     _touchMessageCache(conversationId);
     _bumpConversationListRevision();
     _bumpContextRevision(conversationId);
+    await loadContextOperations(conversationId, refresh: true);
     notifyListeners();
   }
 
@@ -3206,14 +3799,28 @@ class ChatService extends ChangeNotifier {
     return _cachedTemporaryMessage(messageId) != null;
   }
 
-  void _replaceCachedMessage(ChatMessage updatedMessage) {
+  bool _replaceCachedMessage(
+    ChatMessage updatedMessage, {
+    bool skipFinished = false,
+  }) {
     final messages = _messagesCache[updatedMessage.conversationId];
-    if (messages == null) return;
+    if (messages == null) return false;
     final index = messages.indexWhere((m) => m.id == updatedMessage.id);
     if (index >= 0) {
+      if (skipFinished && !messages[index].isStreaming) return false;
+      if (updatedMessage.storageOrder == null) {
+        updatedMessage.hydrateStorageOrder(messages[index].storageOrder);
+      }
+      if (!updatedMessage.hasProviderArtifactSnapshot &&
+          messages[index].hasProviderArtifactSnapshot) {
+        updatedMessage.hydrateProviderArtifacts(
+          messages[index].providerArtifactSnapshot,
+        );
+      }
       messages[index] = updatedMessage;
     }
     _touchMessageCache(updatedMessage.conversationId);
+    return index >= 0;
   }
 
   Future<void> updateMessage(
@@ -3317,7 +3924,7 @@ class ChatService extends ChangeNotifier {
     int? reasoningTokens,
     int? cacheWriteTokens,
     bool bumpContextRevision = true,
-  }) async {
+  }) => _withTemporaryAttachmentLock(messageId, () async {
     if (!_initialized) return;
 
     final shouldBump =
@@ -3332,6 +3939,13 @@ class ChatService extends ChangeNotifier {
     // Temporary conversations live only in memory.
     final temporaryMessage = _cachedTemporaryMessage(messageId);
     if (temporaryMessage != null) {
+      if (!temporaryMessage.isStreaming &&
+          ((content != null && content != temporaryMessage.content) ||
+              parts != null)) {
+        _revokeTemporaryContext(temporaryMessage.conversationId, {
+          ContextHistory.group(temporaryMessage),
+        });
+      }
       _replaceCachedMessage(
         temporaryMessage.copyWith(
           content: content,
@@ -3351,8 +3965,16 @@ class ChatService extends ChangeNotifier {
           cacheWriteTokens: cacheWriteTokens,
         ),
       );
+      if (_compressionHistoryCache?.id == temporaryMessage.conversationId &&
+          (content != null || parts != null)) {
+        _compressionHistoryCache = null;
+      }
       if (shouldBump) _bumpContextRevision(temporaryMessage.conversationId);
-      if (notify) notifyListeners();
+      if (notify) {
+        notifyListeners();
+      } else if (content != null || parts != null || isStreaming != null) {
+        AttachmentFileLock.notifyTransientChanged();
+      }
       return;
     }
 
@@ -3385,9 +4007,16 @@ class ChatService extends ChangeNotifier {
     }
 
     _replaceCachedMessage(updatedMessage);
-    if (shouldBump) _bumpContextRevision(updatedMessage.conversationId);
+    if (_compressionHistoryCache?.id == updatedMessage.conversationId &&
+        (content != null || parts != null)) {
+      _compressionHistoryCache = null;
+    }
+    if (shouldBump) {
+      _bumpContextRevision(updatedMessage.conversationId);
+      await loadContextOperations(updatedMessage.conversationId, refresh: true);
+    }
     if (notify) notifyListeners();
-  }
+  });
 
   /// Persists one complete streaming snapshot without a read-before-write.
   Future<void> updateStreamingCheckpointSilent(
@@ -3395,29 +4024,41 @@ class ChatService extends ChangeNotifier {
     List<Map<String, dynamic>> toolEvents, {
     String? generationRunId,
     int? checkpointSeq,
-  }) async {
+  }) => _withTemporaryAttachmentLock(message.conversationId, () async {
     if (!_initialized) return;
 
     if (_discardedTemporaryConversationIds.contains(message.conversationId)) {
       return;
     }
     if (isTemporaryConversation(message.conversationId)) {
-      _replaceCachedMessage(message);
+      if (!_replaceCachedMessage(message, skipFinished: message.isStreaming)) {
+        return;
+      }
+      if (_compressionHistoryCache?.id == message.conversationId) {
+        _compressionHistoryCache = null;
+      }
       _temporaryToolEvents[message.id] = List<Map<String, dynamic>>.of(
         toolEvents,
       );
+      AttachmentFileLock.notifyTransientChanged();
       return;
     }
 
-    await _repo.updateStreamingCheckpoint(
+    final applied = await _repo.updateStreamingCheckpoint(
       message,
       toolEvents,
       generationRunId: generationRunId,
       checkpointSeq: checkpointSeq,
     );
+    if (!applied) return;
+    // Reopening during a stream should read its latest checkpoint. The open
+    // dialog keeps a stable snapshot until finalization advances the revision.
+    if (_compressionHistoryCache?.id == message.conversationId) {
+      _compressionHistoryCache = null;
+    }
     _replaceCachedMessage(message);
     _toolEventsCache[message.id] = List<Map<String, dynamic>>.of(toolEvents);
-  }
+  });
 
   Future<GenerationRun> transitionGenerationRun({
     required String id,
@@ -3444,15 +4085,33 @@ class ChatService extends ChangeNotifier {
     int? checkpointSeq,
     String? errorCode,
   }) async {
-    if (!_initialized) return null;
+    if (!_initialized) {
+      message.hydrateGenerationState(terminalState);
+      return null;
+    }
     if (isTemporaryConversation(message.conversationId)) {
       await updateStreamingCheckpointSilent(message, toolEvents);
+      message.hydrateGenerationState(terminalState);
+      _bumpCompressionHistoryRevision(message.conversationId);
+      notifyListeners();
+      await _collectDueAssetsAfterGeneration();
       return null;
     }
     if (generationRunId == null) {
       await updateStreamingCheckpointSilent(message, toolEvents);
+      message.hydrateGenerationState(terminalState);
+      if (_messageCanOwnAssets(message) ||
+          toolEvents.any(
+            (event) =>
+                browserPreviewImageFromToolEvent(event) != null ||
+                chatImageAssetsFromToolEvent(event).isNotEmpty,
+          )) {
+        await _synchronizePersistedMessageAssetsBestEffort(message.id);
+      }
+      _bumpCompressionHistoryRevision(message.conversationId);
       _statisticsRevision++;
       notifyListeners();
+      await _collectDueAssetsAfterGeneration();
       return null;
     }
     if (expectedState == null || expectedStateRevision == null) {
@@ -3468,13 +4127,22 @@ class ChatService extends ChangeNotifier {
       checkpointSeq: checkpointSeq,
       errorCode: errorCode,
     );
-    if (_messageCanOwnAssets(message)) {
-      await _synchronizeMessageAssetsBestEffort(message);
+    message.hydrateGenerationState(run.state);
+    if (_messageCanOwnAssets(message) ||
+        toolEvents.any(
+          (event) =>
+              browserPreviewImageFromToolEvent(event) != null ||
+              chatImageAssetsFromToolEvent(event).isNotEmpty,
+        )) {
+      // Tool-event overlays may be ahead of the message's streaming parts.
+      await _synchronizePersistedMessageAssetsBestEffort(message.id);
     }
     _replaceCachedMessage(message);
     _toolEventsCache[message.id] = List<Map<String, dynamic>>.of(toolEvents);
+    _bumpCompressionHistoryRevision(message.conversationId);
     _statisticsRevision++;
     notifyListeners();
+    await _collectDueAssetsAfterGeneration();
     return run;
   }
 
@@ -3483,15 +4151,62 @@ class ChatService extends ChangeNotifier {
     if (!_initialized) return const <Map<String, dynamic>>[];
     final temporary = _temporaryToolEvents[assistantMessageId];
     if (temporary != null) return List<Map<String, dynamic>>.of(temporary);
+    final events = _toolEventsCache[assistantMessageId];
+    if (events != null) return List<Map<String, dynamic>>.of(events);
+    final message = _cachedMessage(assistantMessageId);
+    if (message == null) return const [];
     return List<Map<String, dynamic>>.of(
-      _toolEventsCache[assistantMessageId] ?? const [],
+      _messageToolEvents[message] ??= [
+        for (final part in message.parts.whereType<ToolCallPart>())
+          ..._decodeMessageToolPart(part),
+      ],
     );
   }
+
+  ChatMessage? _cachedMessage(String id) {
+    for (final messages in _messagesCache.values) {
+      for (final message in messages) {
+        if (message.id == id) return message;
+      }
+    }
+    return null;
+  }
+
+  final _messageToolEvents = Expando<List<Map<String, dynamic>>>(
+    'message tool events',
+  );
+
+  List<Map<String, dynamic>> getToolEventsForMessage(ChatMessage message) {
+    final cached = getToolEvents(message.id);
+    if (cached.isNotEmpty ||
+        _temporaryToolEvents.containsKey(message.id) ||
+        _toolEventsCache.containsKey(message.id)) {
+      return cached;
+    }
+    return _messageToolEvents[message] ??= [
+      for (final part in message.parts.whereType<ToolCallPart>())
+        ..._decodeMessageToolPart(part),
+    ];
+  }
+
+  static List<Map<String, dynamic>> _decodeMessageToolPart(ToolCallPart part) {
+    try {
+      final value = jsonDecode(part.payloadJson);
+      return value is Map ? [Map<String, dynamic>.from(value)] : const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  String? getProviderArtifactForMessage(ChatMessage message, String kind) =>
+      message.hasProviderArtifactSnapshot
+      ? message.providerArtifactSnapshot[kind]
+      : getProviderArtifact(message.id, kind);
 
   Future<void> setToolEvents(
     String assistantMessageId,
     List<Map<String, dynamic>> events,
-  ) async {
+  ) => _withTemporaryAttachmentLock(assistantMessageId, () async {
     if (!_initialized) await init();
     if (_isTemporaryMessageId(assistantMessageId)) {
       _temporaryToolEvents[assistantMessageId] = List<Map<String, dynamic>>.of(
@@ -3501,11 +4216,18 @@ class ChatService extends ChangeNotifier {
       return;
     }
     await _repo.setToolEvents(assistantMessageId, events);
+    if (events.any(
+      (event) =>
+          browserPreviewImageFromToolEvent(event) != null ||
+          chatImageAssetsFromToolEvent(event).isNotEmpty,
+    )) {
+      await _synchronizePersistedMessageAssetsBestEffort(assistantMessageId);
+    }
     _toolEventsCache[assistantMessageId] = List<Map<String, dynamic>>.of(
       events,
     );
     notifyListeners();
-  }
+  });
 
   Future<void> upsertToolEvent(
     String assistantMessageId, {
@@ -3514,7 +4236,7 @@ class ChatService extends ChangeNotifier {
     required Map<String, dynamic> arguments,
     String? content,
     Map<String, dynamic>? metadata,
-  }) async {
+  }) => _withTemporaryAttachmentLock(assistantMessageId, () async {
     if (!_initialized) await init();
     final list = List<Map<String, dynamic>>.of(
       getToolEvents(assistantMessageId),
@@ -3558,10 +4280,8 @@ class ChatService extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    await _repo.setToolEvents(assistantMessageId, list);
-    _toolEventsCache[assistantMessageId] = list;
-    notifyListeners();
-  }
+    await setToolEvents(assistantMessageId, list);
+  });
 
   // Gemini thought signature persistence (per assistant message)
   String? getGeminiThoughtSignature(String assistantMessageId) =>
@@ -3605,7 +4325,8 @@ class ChatService extends ChangeNotifier {
   String? getProviderArtifact(String assistantMessageId, String kind) {
     if (!_initialized) return null;
     return _temporaryProviderArtifacts[assistantMessageId]?[kind] ??
-        _providerArtifactsCache[assistantMessageId]?[kind];
+        _providerArtifactsCache[assistantMessageId]?[kind] ??
+        _cachedMessage(assistantMessageId)?.providerArtifactSnapshot[kind];
   }
 
   Future<void> setProviderArtifact(
@@ -3631,6 +4352,9 @@ class ChatService extends ChangeNotifier {
     );
     final previous = artifacts[kind];
     artifacts[kind] = payload;
+    final message = _cachedMessage(assistantMessageId);
+    final previousSnapshot = message?.providerArtifactSnapshot;
+    message?.hydrateProviderArtifacts({...?previousSnapshot, kind: payload});
     try {
       await _repo.setProviderArtifact(assistantMessageId, kind, payload);
     } catch (_) {
@@ -3639,6 +4363,9 @@ class ChatService extends ChangeNotifier {
       } else {
         artifacts[kind] = previous;
       }
+      if (previousSnapshot != null) {
+        message?.hydrateProviderArtifacts(previousSnapshot);
+      }
       rethrow;
     }
   }
@@ -3646,108 +4373,165 @@ class ChatService extends ChangeNotifier {
   Future<Conversation> forkConversationAtRevision({
     required String sourceConversationId,
     required String sourceRevisionId,
-    required String title,
     bool preserveVersions = false,
   }) async {
     if (!_initialized) await init();
+    final activationOwner = _currentConversationId;
+    await loadContextOperations(sourceConversationId);
     final source = _conversationsCache[sourceConversationId];
     if (source == null) throw StateError('conversation_missing');
-    if (preserveVersions) {
-      final forked = await _repo.forkConversationWithVersions(
-        sourceId: sourceConversationId,
-        targetRevisionId: sourceRevisionId,
-        title: source.title,
-        assistantId: source.assistantId,
-      );
-      if (forked == null) throw StateError('linear_fork_target_missing');
-      _conversationsCache[forked.id] = forked;
-      _messageOrderIds[forked.id] = List<String>.of(forked.messageIds);
-      _messageCounts[forked.id] = forked.messageIds.length;
-      _bumpConversationListRevision();
-      _currentConversationId = forked.id;
-      notifyListeners();
-      return forked;
-    }
-    final targetMessage = await _repo.getMessage(sourceRevisionId);
-    if (targetMessage == null ||
-        targetMessage.conversationId != sourceConversationId) {
-      throw StateError('linear_fork_target_missing');
-    }
-    final targetGroupId = targetMessage.groupId ?? targetMessage.id;
-    final probe = await _repo.loadLinearMessageWindow(
-      conversationId: sourceConversationId,
-      fromStart: true,
-      limit: 1,
-    );
-    final window = await _repo.loadLinearMessageWindow(
-      conversationId: sourceConversationId,
-      fromStart: true,
-      limit: probe.totalSlotCount,
-    );
-    final targetIndex = window.slots.indexWhere(
-      (slot) => slot.groupId == targetGroupId,
-    );
-    if (targetIndex < 0) throw StateError('linear_fork_target_not_visible');
-    final sourceMessages = await _repo.getMessagesByIds([
-      for (final slot in window.slots.take(targetIndex + 1)) slot.revisionId,
-    ]);
-    // Older messages and other versions must not inherit the latest suggestions.
-    final suggestions =
-        targetMessage.role == 'assistant' &&
-            !targetMessage.isStreaming &&
-            window.slots.last.revisionId == sourceRevisionId
-        ? List<String>.of(source.chatSuggestions)
-        : const <String>[];
-    final sourceExtras = Map<String, dynamic>.from(source.extras);
-    final persisted = await createConversation(
-      title: source.title,
+    final forked = await _repo.forkConversationWithVersions(
+      sourceId: sourceConversationId,
+      preserveVersions: preserveVersions,
+      targetRevisionId: sourceRevisionId,
       assistantId: source.assistantId,
     );
-    await _copyConversationSettingsFrom(persisted.id, sourceExtras);
-    _messagesCache[persisted.id] = <ChatMessage>[];
-    _messageOrderIds[persisted.id] = <String>[];
-    _messageCounts[persisted.id] = 0;
-    await _cloneMessagesInto(persisted.id, sourceMessages);
-    if (suggestions.isNotEmpty) {
-      await updateConversationSuggestions(persisted.id, suggestions);
-    }
-    _currentConversationId = persisted.id;
+    if (forked == null) throw StateError('linear_fork_target_missing');
+    _conversationsCache[forked.id] = forked;
+    _messageOrderIds[forked.id] = List<String>.of(forked.messageIds);
+    _messageCounts[forked.id] = forked.messageIds.length;
+    if (!preserveVersions) await loadMessages(forked.id);
+    _bumpConversationListRevision();
+    _activateForkIfCurrent(forked.id, activationOwner);
     notifyListeners();
-    return getConversation(persisted.id) ?? persisted;
+    return forked;
   }
 
   Future<Conversation> forkConversationFromMessages({
     required String title,
     required String? assistantId,
     required List<ChatMessage> sourceMessages,
+    bool activate = true,
   }) async {
     if (!_initialized) await init();
     Map<String, dynamic> sourceExtras = const <String, dynamic>{};
+    List<String>? sourceMcpServerIds;
     for (final message in sourceMessages) {
       final existing = getConversation(message.conversationId);
       if (existing != null) {
         sourceExtras = Map<String, dynamic>.from(existing.extras);
+        if (ConversationMcpSettings.isOverridden(existing)) {
+          sourceMcpServerIds = List<String>.of(existing.mcpServerIds);
+        }
         break;
       }
     }
-    final persisted = await createConversation(
+    return _forkSelectedMessages(
       title: title,
       assistantId: assistantId,
+      sourceMessages: sourceMessages,
+      sourceExtras: sourceExtras,
+      sourceMcpServerIds: sourceMcpServerIds,
+      activationOwner: _currentConversationId,
+      activate: activate,
     );
-    await _copyConversationSettingsFrom(persisted.id, sourceExtras);
-    _messagesCache[persisted.id] = <ChatMessage>[];
-    _messageOrderIds[persisted.id] = <String>[];
-    _messageCounts[persisted.id] = 0;
-    await _cloneMessagesInto(persisted.id, sourceMessages);
-    _currentConversationId = persisted.id;
-    notifyListeners();
-    return getConversation(persisted.id) ?? persisted;
+  }
+
+  Future<Conversation> _forkSelectedMessages({
+    required String title,
+    required String? assistantId,
+    required List<ChatMessage> sourceMessages,
+    required Map<String, dynamic> sourceExtras,
+    required List<String>? sourceMcpServerIds,
+    required String? activationOwner,
+    bool activate = true,
+    bool temporary = false,
+    Future<void> Function(Conversation)? beforePublish,
+  }) async {
+    // Cache-only metadata belongs to temporary sources too. Capture it before
+    // the first await, since explicit navigation can discard that owner.
+    final cachedTools = {
+      for (final message in sourceMessages)
+        message.id: getToolEvents(message.id),
+    };
+    final cachedArtifacts = {
+      for (final kind in _providerArtifactKinds)
+        kind: {
+          for (final message in sourceMessages)
+            if (getProviderArtifact(message.id, kind) case final String payload)
+              message.id: payload,
+        },
+    };
+    final attachmentOwner = Object();
+    AttachmentFileLock.registerTransientOwner(
+      attachmentOwner,
+      capture: () => _captureAttachmentReferences(sourceMessages, cachedTools),
+      active: () => false,
+    );
+    try {
+      final uiCopies = await _captureGenUiCopies(sourceMessages);
+      final persisted = Conversation(
+        title: temporary
+            ? nextConversationForkTitle(title, [
+                for (final conversation in _conversationsCache.values)
+                  conversation.title,
+                for (final conversation in _draftConversations.values)
+                  conversation.title,
+              ])
+            : title,
+        assistantId: assistantId,
+        extras: _extrasForNewConversation(assistantId),
+      );
+      if (temporary) _temporaryConversationIds.add(persisted.id);
+      _unpublishedForks.add(persisted.id);
+      try {
+        if (temporary) {
+          await _saveConversation(persisted);
+        } else {
+          await _repo.putForkConversation(persisted);
+          _conversationsCache[persisted.id] = persisted;
+        }
+        await _copyConversationSettingsFrom(persisted.id, sourceExtras);
+        if (sourceMcpServerIds != null) {
+          await setConversationMcpServers(persisted.id, sourceMcpServerIds);
+        }
+        _messagesCache[persisted.id] = <ChatMessage>[];
+        _messageOrderIds[persisted.id] = <String>[];
+        _messageCounts[persisted.id] = 0;
+        await _cloneMessagesInto(
+          persisted.id,
+          sourceMessages,
+          uiCopies,
+          cachedTools: cachedTools,
+          cachedArtifacts: cachedArtifacts,
+        );
+        await beforePublish?.call(getConversation(persisted.id)!);
+      } catch (_) {
+        // This target belongs solely to the failed copy. Remove its committed
+        // partial rows and caches; keep the current owner and temporary assets.
+        if (temporary) {
+          _discardTemporaryConversation(persisted.id);
+        } else {
+          await _deletePersistedConversation(persisted.id);
+        }
+        notifyListeners();
+        rethrow;
+      } finally {
+        _unpublishedForks.remove(persisted.id);
+      }
+      if (activate) _activateForkIfCurrent(persisted.id, activationOwner);
+      _enforceMessageCacheLimits();
+      _bumpConversationListRevision();
+      notifyListeners();
+      return getConversation(persisted.id) ?? persisted;
+    } finally {
+      AttachmentFileLock.unregisterTransientOwner(attachmentOwner);
+    }
+  }
+
+  void _activateForkIfCurrent(String targetId, String? activationOwner) {
+    if (_currentConversationId != activationOwner) return;
+    _discardTemporaryConversation(activationOwner);
+    _currentConversationId = targetId;
   }
 
   Future<void> _cloneMessagesInto(
     String targetConversationId,
     List<ChatMessage> sourceMessages,
-  ) async {
+    Map<String, UiRevisionTransfer> uiCopies, {
+    required Map<String, List<Map<String, dynamic>>> cachedTools,
+    required Map<String, Map<String, String>> cachedArtifacts,
+  }) async {
     final sourceIds = [
       for (final message in sourceMessages)
         if (message.id.isNotEmpty) message.id,
@@ -3769,8 +4553,18 @@ class ChatService extends ChangeNotifier {
     );
 
     final cloned = <ChatMessage>[];
+    final messageIdMap = {
+      for (final message in sourceMessages) message.id: const Uuid().v4(),
+    };
     for (final message in sourceMessages) {
       final forked = ChatMessage(
+        id: messageIdMap[message.id],
+        quotes: [
+          for (final quote in message.quotes)
+            quote.withMessageId(
+              messageIdMap[quote.messageId] ?? quote.messageId,
+            ),
+        ],
         role: message.role,
         parts: message.parts,
         timestamp: message.timestamp,
@@ -3788,6 +4582,7 @@ class ChatService extends ChangeNotifier {
         completionTokens: message.completionTokens,
         cachedTokens: message.cachedTokens,
         durationMs: message.durationMs,
+        firstResponseMs: message.firstResponseMs,
         firstTokenMs: message.firstTokenMs,
         reasoningTokens: message.reasoningTokens,
         cacheWriteTokens: message.cacheWriteTokens,
@@ -3795,7 +4590,9 @@ class ChatService extends ChangeNotifier {
       );
       await addMessageDirectly(targetConversationId, forked);
       cloned.add(forked);
-      if (message.role == 'user') {
+      messageIdMap[message.id] = forked.id;
+      if (message.role == 'user' &&
+          !isTemporaryConversation(targetConversationId)) {
         await _inheritImageOcrArtifactsBestEffort(
           fromRevisionId: message.id,
           toRevisionId: forked.id,
@@ -3807,26 +4604,47 @@ class ChatService extends ChangeNotifier {
       // `_cacheMessageArtifacts`. Persist under the new ids and refresh the
       // in-memory caches so tool cards and thought signatures survive.
       final events =
-          toolEventsBySourceId[message.id] ?? getToolEvents(message.id);
+          toolEventsBySourceId[message.id] ??
+          cachedTools[message.id] ??
+          const [];
       if (events.isNotEmpty) {
         await setToolEvents(forked.id, events);
       }
       for (final kind in _providerArtifactKinds) {
         final payload =
             artifactsBySourceId[kind]?[message.id] ??
-            getProviderArtifact(message.id, kind);
+            cachedArtifacts[kind]?[message.id];
         if (payload != null && payload.isNotEmpty) {
           await setProviderArtifact(forked.id, kind, payload);
         }
       }
     }
-    await _cacheMessageArtifacts(cloned);
+    if (isTemporaryConversation(targetConversationId)) {
+      _messagesCache[targetConversationId] = cloned;
+      return;
+    }
+    await _repo.copyGenUiTransfer(
+      sources: uiCopies,
+      messageIdMap: messageIdMap,
+      targetConversationId: targetConversationId,
+    );
+    // Tool overlays can shift native surface ordinals. Publish the final parts
+    // and copied completion proof together, rather than retaining clone drafts.
+    final refreshed = await _repo.getMessagesByIds(
+      cloned.map((m) => m.id).toList(),
+    );
+    _messagesCache[targetConversationId] = refreshed;
+    await _cacheMessageArtifacts(refreshed);
   }
 
   Future<ChatMessage?> appendMessageVersion({
     required String messageId,
     String content = '',
     List<MessagePart>? parts,
+    List<QuoteRef>? quotes,
+    DraftSubmission? draftSubmission,
+    UiContextSubmission? uiContext,
+    String? expectedContextState,
   }) async {
     if (!_initialized) await init();
     final temporaryOriginal = _cachedTemporaryMessage(messageId);
@@ -3837,6 +4655,9 @@ class ChatService extends ChangeNotifier {
       if (conversation == null || messages == null) return null;
 
       final groupId = temporaryOriginal.groupId ?? temporaryOriginal.id;
+      _revokeTemporaryContext(conversationId, {
+        groupId,
+      }, expectedState: expectedContextState);
       final versions = messages
           .where((message) => (message.groupId ?? message.id) == groupId)
           .map((message) => message.version);
@@ -3855,48 +4676,80 @@ class ChatService extends ChangeNotifier {
             temporaryOriginal.parts,
             content,
           );
-      final newMsg = ChatMessage(
-        role: temporaryOriginal.role,
-        parts: resolvedParts,
-        conversationId: conversationId,
-        modelId: temporaryOriginal.modelId,
-        providerId: temporaryOriginal.providerId,
-        totalTokens: null,
-        isStreaming: false,
-        reasoningText: preserveReasoning
-            ? temporaryOriginal.reasoningText
-            : null,
-        reasoningStartAt: preserveReasoning
-            ? temporaryOriginal.reasoningStartAt
-            : null,
-        reasoningFinishedAt: preserveReasoning
-            ? temporaryOriginal.reasoningFinishedAt
-            : null,
-        reasoningSegmentsJson: preserveReasoning
-            ? temporaryOriginal.reasoningSegmentsJson
-            : null,
-        groupId: groupId,
-        version: nextVersion,
+      final newMsg = _withTemporaryUiContext(
+        ChatMessage(
+          role: temporaryOriginal.role,
+          parts: resolvedParts,
+          quotes: quotes ?? temporaryOriginal.quotes,
+          conversationId: conversationId,
+          modelId: temporaryOriginal.modelId,
+          providerId: temporaryOriginal.providerId,
+          totalTokens: null,
+          isStreaming: false,
+          reasoningText: preserveReasoning
+              ? temporaryOriginal.reasoningText
+              : null,
+          reasoningStartAt: preserveReasoning
+              ? temporaryOriginal.reasoningStartAt
+              : null,
+          reasoningFinishedAt: preserveReasoning
+              ? temporaryOriginal.reasoningFinishedAt
+              : null,
+          reasoningSegmentsJson: preserveReasoning
+              ? temporaryOriginal.reasoningSegmentsJson
+              : null,
+          groupId: groupId,
+          version: nextVersion,
+        ),
+        uiContext,
       );
 
+      final preserveArtifacts =
+          parts == null && content == temporaryOriginal.content;
+      final artifacts = _temporaryProviderArtifacts[messageId];
+      if (artifacts != null) {
+        final inherited = <String, String>{};
+        for (final entry in artifacts.entries) {
+          final payload =
+              preserveArtifacts ||
+                  entry.key == claudeThinkingRecoveryArtifactKind
+              ? entry.value
+              : parts == null && entry.key == claudeTurnArtifactKind
+              ? editClaudeTurnText(
+                  entry.value,
+                  content,
+                  originalContent: temporaryOriginal.content,
+                )
+              : null;
+          if (payload != null) inherited[entry.key] = payload;
+        }
+        _temporaryProviderArtifacts[newMsg.id] = inherited;
+      }
+      if (preserveReasoning) {
+        _temporaryToolEvents[newMsg.id] = getToolEvents(messageId);
+      }
       messages.add(newMsg);
       conversation.messageIds.add(newMsg.id);
       conversation.versionSelections[groupId] = nextVersion;
       conversation.updatedAt = DateTime.now();
       _bumpContextRevision(conversationId);
+      await loadContextOperations(conversationId, refresh: true);
       notifyListeners();
       return newMsg;
     }
 
-    final original = await _repo.getMessage(messageId);
-    if (original != null) await _loadMessageOrder(original.conversationId);
     final result = await _repo.appendMessageVersion(
+      expectedContextState: expectedContextState,
       messageId: messageId,
       content: content,
       parts: parts,
+      quotes: quotes,
+      draftSubmission: draftSubmission,
+      uiContext: uiContext,
     );
     if (result == null) return null;
     final newMsg = result.message;
+    await _cacheMessageArtifacts([newMsg]);
     if (_messageCanOwnAssets(newMsg)) {
       await _synchronizeMessageAssetsBestEffort(newMsg);
     }
@@ -3908,15 +4761,14 @@ class ChatService extends ChangeNotifier {
     }
     final cid = newMsg.conversationId;
     _conversationsCache[cid] = result.conversation;
-    final order = _messageOrderIds.putIfAbsent(cid, () => <String>[]);
-    if (!order.contains(newMsg.id)) order.add(newMsg.id);
-    _messageCounts[cid] = order.length;
+    _messageCounts[cid] = await _repo.getMessageCount(cid);
+    final order = _messageOrderIds[cid];
+    if (order != null && !order.contains(newMsg.id)) order.add(newMsg.id);
     // Update caches
-    final arr = _messagesCache[cid];
-    if (arr != null) arr.add(newMsg);
-    _touchMessageCache(cid);
+    _cacheLoadedMessages(cid, [newMsg]);
     _bumpConversationListRevision();
     _bumpContextRevision(cid);
+    await loadContextOperations(cid, refresh: true);
     notifyListeners();
     return newMsg;
   }
@@ -4061,28 +4913,26 @@ class ChatService extends ChangeNotifier {
   Future<void> setSelectedVersion(
     String conversationId,
     String groupId,
-    int version,
-  ) async {
+    int version, {
+    String? expectedContextState,
+  }) async {
     if (_draftConversations.containsKey(conversationId)) {
       final draft = _draftConversations[conversationId]!;
+      _revokeTemporaryContext(conversationId, {
+        groupId,
+      }, expectedState: expectedContextState);
       draft.versionSelections[groupId] = version;
       draft.updatedAt = DateTime.now();
       _bumpContextRevision(conversationId);
+      await loadContextOperations(conversationId, refresh: true);
       notifyListeners();
       return;
     }
-    final candidates = await _repo.getMessagesForGroups(conversationId, [
-      groupId,
-    ]);
-    ChatMessage? target;
-    for (final candidate in candidates) {
-      if (candidate.version == version) {
-        target = candidate;
-        break;
-      }
+    if (!await _repo.messageVersionExists(conversationId, groupId, version)) {
+      throw StateError('message_version_missing');
     }
-    if (target == null) throw StateError('message_version_missing');
     final conversation = await _repo.setSelectedVersion(
+      expectedContextState: expectedContextState,
       conversationId: conversationId,
       groupId: groupId,
       version: version,
@@ -4091,6 +4941,7 @@ class ChatService extends ChangeNotifier {
     _conversationsCache[conversationId] = conversation;
     _bumpConversationListRevision();
     _bumpContextRevision(conversationId);
+    await loadContextOperations(conversationId, refresh: true);
     notifyListeners();
   }
 
@@ -4100,9 +4951,11 @@ class ChatService extends ChangeNotifier {
   ) async {
     if (_draftConversations.containsKey(conversationId)) {
       final draft = _draftConversations[conversationId]!;
+      _revokeTemporaryContext(conversationId, {groupId});
       draft.versionSelections.remove(groupId);
       draft.updatedAt = DateTime.now();
       _bumpContextRevision(conversationId);
+      await loadContextOperations(conversationId, refresh: true);
       notifyListeners();
       return;
     }
@@ -4115,6 +4968,7 @@ class ChatService extends ChangeNotifier {
     _conversationsCache[conversationId] = conversation;
     _bumpConversationListRevision();
     _bumpContextRevision(conversationId);
+    await loadContextOperations(conversationId, refresh: true);
     notifyListeners();
   }
 
@@ -4194,46 +5048,6 @@ class ChatService extends ChangeNotifier {
     if (changed > 0 || touchedCache) notifyListeners();
   }
 
-  Future<Conversation?> toggleTruncateAtTail(
-    String conversationId, {
-    String? defaultTitle,
-  }) async {
-    if (!_initialized) await init();
-    // Draft case
-    if (_draftConversations.containsKey(conversationId)) {
-      final draft = _draftConversations[conversationId]!;
-      final lastIndexPlusOne = draft.messageIds.length; // last index + 1
-      final newValue = (draft.truncateIndex == lastIndexPlusOne)
-          ? -1
-          : lastIndexPlusOne;
-      draft.truncateIndex = newValue;
-      if ((defaultTitle ?? '').isNotEmpty) draft.title = defaultTitle!;
-      draft.updatedAt = DateTime.now();
-      _bumpContextRevision(conversationId);
-      notifyListeners();
-      return draft;
-    }
-    // Persisted case
-    final c = _conversationsCache[conversationId];
-    if (c == null) return null;
-    final probe = await _repo.loadLinearMessageWindow(
-      conversationId: conversationId,
-      fromStart: true,
-      limit: 1,
-    );
-    if (probe.totalSlotCount == 0) return c;
-    c.truncateIndex = c.truncateIndex == probe.totalSlotCount
-        ? -1
-        : probe.totalSlotCount;
-    if ((defaultTitle ?? '').isNotEmpty) c.title = defaultTitle!;
-    c.updatedAt = DateTime.now();
-    await _saveConversation(c);
-    _bumpConversationListRevision();
-    _bumpContextRevision(conversationId);
-    notifyListeners();
-    return c;
-  }
-
   Future<void> deleteMessage(String messageId) async {
     if (!_initialized) return;
 
@@ -4242,6 +5056,18 @@ class ChatService extends ChangeNotifier {
     if (message == null) return;
 
     if (isTemporaryConversation(message.conversationId)) {
+      _revokeTemporaryContext(
+        message.conversationId,
+        {ContextHistory.group(message)},
+        removedGroups:
+            (_messagesCache[message.conversationId] ?? []).any(
+              (other) =>
+                  other.id != messageId &&
+                  ContextHistory.group(other) == ContextHistory.group(message),
+            )
+            ? {}
+            : {ContextHistory.group(message)},
+      );
       final conversation = _draftConversations[message.conversationId];
       conversation?.messageIds.remove(messageId);
       conversation?.chatSuggestions = const <String>[];
@@ -4250,6 +5076,7 @@ class ChatService extends ChangeNotifier {
       _temporaryToolEvents.remove(messageId);
       _temporaryProviderArtifacts.remove(messageId);
       _bumpContextRevision(message.conversationId);
+      await loadContextOperations(message.conversationId, refresh: true);
       notifyListeners();
       return;
     }
@@ -4262,10 +5089,59 @@ class ChatService extends ChangeNotifier {
     );
   }
 
+  Future<bool> canDeleteOtherVersions(
+    String conversationId,
+    String retainedMessageId,
+    Set<String> messageIds,
+  ) {
+    if (_temporaryConversationIds.contains(conversationId)) {
+      return Future.value(
+        _canDeleteOtherTemporaryVersions(
+          conversationId,
+          retainedMessageId,
+          messageIds,
+        ),
+      );
+    }
+    return _repo.canDeleteOtherVersions(
+      conversationId,
+      retainedMessageId,
+      messageIds,
+    );
+  }
+
+  bool _canDeleteOtherTemporaryVersions(
+    String conversationId,
+    String retainedMessageId,
+    Set<String> messageIds,
+  ) {
+    if (messageIds.isEmpty || messageIds.contains(retainedMessageId)) {
+      return false;
+    }
+    final page = _loadTemporaryTimelinePage(
+      conversationId,
+      aroundRevisionId: retainedMessageId,
+      fromStart: false,
+      limit: 1,
+    );
+    final slot = page?.slots.singleOrNull?.identity;
+    if (slot == null ||
+        slot.revisionId != retainedMessageId ||
+        slot.versionCount != messageIds.length + 1) {
+      return false;
+    }
+    return getMessagesForGroups(conversationId, {slot.slotId}).every(
+      (version) =>
+          version.id == retainedMessageId || messageIds.contains(version.id),
+    );
+  }
+
   Future<Set<String>> deleteMessages({
     required String conversationId,
     required Set<String> messageIds,
     required Map<String, int?> versionSelectionChanges,
+    String? retainedMessageId,
+    String? expectedContextState,
   }) async {
     if (!_initialized || messageIds.isEmpty) return const <String>{};
     if (_temporaryConversationIds.contains(conversationId)) {
@@ -4277,9 +5153,57 @@ class ChatService extends ChangeNotifier {
           .map((message) => message.id)
           .toSet();
       if (deletedIds.isEmpty) return const <String>{};
+      if (retainedMessageId != null &&
+          !_canDeleteOtherTemporaryVersions(
+            conversationId,
+            retainedMessageId,
+            messageIds,
+          )) {
+        return const {};
+      }
+      _revokeTemporaryContext(
+        conversationId,
+        {
+          if (retainedMessageId == null)
+            for (final message in messages)
+              if (deletedIds.contains(message.id))
+                ContextHistory.group(message),
+          ...versionSelectionChanges.keys,
+        },
+        expectedState: expectedContextState,
+        removedGroups: {
+          if (retainedMessageId == null)
+            for (final message in messages)
+              if (deletedIds.contains(message.id) &&
+                  !messages.any(
+                    (other) =>
+                        !deletedIds.contains(other.id) &&
+                        ContextHistory.group(other) ==
+                            ContextHistory.group(message),
+                  ))
+                ContextHistory.group(message),
+        },
+      );
+      // Persistent groups keep their earliest message order when the anchor
+      // is deleted. Keep the same slot in the temporary conversation's lists.
+      if (retainedMessageId != null) {
+        final retainedIndex = messages.indexWhere(
+          (message) => message.id == retainedMessageId,
+        );
+        final anchor = messages.indexWhere(
+          (message) => deletedIds.contains(message.id),
+        );
+        if (anchor < retainedIndex) {
+          messages.insert(anchor, messages.removeAt(retainedIndex));
+        }
+      }
       messages.removeWhere((message) => deletedIds.contains(message.id));
-      conversation.messageIds.removeWhere(deletedIds.contains);
-      conversation.chatSuggestions = const <String>[];
+      conversation.messageIds
+        ..clear()
+        ..addAll(messages.map((message) => message.id));
+      if (retainedMessageId == null) {
+        conversation.chatSuggestions = const <String>[];
+      }
       for (final entry in versionSelectionChanges.entries) {
         final version = entry.value;
         if (version == null) {
@@ -4294,13 +5218,16 @@ class ChatService extends ChangeNotifier {
         _temporaryProviderArtifacts.remove(id);
       }
       _bumpContextRevision(conversationId);
+      await loadContextOperations(conversationId, refresh: true);
       notifyListeners();
       return Set<String>.unmodifiable(deletedIds);
     }
     final result = await _repo.deleteMessages(
+      expectedContextState: expectedContextState,
       conversationId: conversationId,
       messageIds: messageIds,
       versionSelectionChanges: versionSelectionChanges,
+      retainedMessageId: retainedMessageId,
     );
     if (result == null) return const <String>{};
 
@@ -4317,11 +5244,13 @@ class ChatService extends ChangeNotifier {
     await _cleanupOrphanUploads();
     _bumpConversationListRevision();
     _bumpContextRevision(conversationId);
+    await loadContextOperations(conversationId, refresh: true);
     notifyListeners();
     return Set<String>.unmodifiable(deletedIds);
   }
 
   void setCurrentConversation(String? id) {
+    if (_unpublishedForks.contains(id)) return;
     if (id != _currentConversationId) {
       _discardTemporaryConversation(_currentConversationId);
     }
@@ -4332,8 +5261,10 @@ class ChatService extends ChangeNotifier {
 
   Future<void> clearAllData({bool deleteUploads = true}) async {
     if (!_initialized) await init();
+    await _contextCompression?.cancelAll();
 
-    await _repo.clearAllData();
+    await _repo.composerDrafts.overwrite(_repo.clearAllData);
+    await _contextCompression?.restore();
     for (final id in _temporaryConversationIds) {
       _rememberDiscardedTemporaryConversation(id);
     }
@@ -4341,6 +5272,8 @@ class ChatService extends ChangeNotifier {
     _conversationsCache.clear();
     _draftConversations.clear();
     _temporaryConversationIds.clear();
+    _temporaryImageSettings.clear();
+    _temporaryCompressionSettings.clear();
     _temporaryToolEvents.clear();
     _temporaryProviderArtifacts.clear();
     _toolEventsCache.clear();
@@ -4349,19 +5282,25 @@ class ChatService extends ChangeNotifier {
     _messageOrderIds.clear();
     _firstGroupIndicesCache.clear();
     _currentConversationId = null;
-    for (final id in List<String>.of(_contextRevisionNotifiers.keys)) {
+    for (final id in {
+      ..._contextRevisionNotifiers.keys,
+      ..._compressionHistoryRevisionNotifiers.keys,
+    }) {
       _forgetContextRevision(id);
     }
     _contextRevisions.clear();
+    _compressionHistoryRevisions.clear();
+    _resetContextPreviewCaches();
     if (deleteUploads) await _deleteUploadDirectory();
     _bumpConversationListRevision();
     notifyListeners();
   }
 
-  Future<void> _deleteUploadDirectory() async {
-    final uploadDir = await AppDirectories.getUploadDirectory();
-    if (await uploadDir.exists()) await uploadDir.delete(recursive: true);
-  }
+  Future<void> _deleteUploadDirectory() =>
+      AttachmentFileLock.synchronized(() async {
+        final uploadDir = await AppDirectories.getUploadDirectory();
+        if (await uploadDir.exists()) await uploadDir.delete(recursive: true);
+      });
 
   // Uploads stats: count and total size of files under app documents/upload
   Future<UploadStats> getUploadStats() async {
@@ -4413,8 +5352,17 @@ class ChatService extends ChangeNotifier {
         if (notify) notifyListeners();
         return true;
       }
-      draft.assistantId = assistantId;
-      draft.updatedAt = DateTime.now();
+      if (!await _repo.composerDrafts.moveAssistant(
+        conversationId,
+        assistantId,
+      )) {
+        return false;
+      }
+      _draftConversations[conversationId] = draft.copyWith(
+        assistantId: assistantId,
+        updatedAt: DateTime.now(),
+        extras: ToolPermissionMode.withoutGrant(draft.extras),
+      );
       _bumpContextRevision(conversationId);
       if (notify) notifyListeners();
       return true;
@@ -4423,15 +5371,22 @@ class ChatService extends ChangeNotifier {
     if (c == null) return false;
     if (c.assistantId == assistantId) return true;
     final updatedAt = DateTime.now();
-    final moved = await _repo.moveConversationToAssistant(
-      conversationId: conversationId,
-      assistantId: assistantId,
-      updatedAt: updatedAt,
+    final moved = await _repo.composerDrafts.moveAssistant(
+      conversationId,
+      assistantId,
+      moveConversation: () => _repo.moveConversationToAssistant(
+        conversationId: conversationId,
+        assistantId: assistantId,
+        updatedAt: updatedAt,
+      ),
     );
     if (!moved) return false;
-    c.assistantId = assistantId;
-    c.updatedAt = updatedAt;
-    c.injectedMemoryHash = null;
+    _conversationsCache[conversationId] = c.copyWith(
+      assistantId: assistantId,
+      updatedAt: updatedAt,
+      clearInjectedMemoryHash: true,
+      extras: ToolPermissionMode.withoutGrant(c.extras),
+    );
     _bumpContextRevision(conversationId);
     if (notify) {
       _bumpConversationListRevision();
