@@ -395,10 +395,7 @@ class MessageGenerationService {
 
     final transientPrompt = ephemeralSystemPrompt?.trim();
     if (transientPrompt != null && transientPrompt.isNotEmpty) {
-      messageBuilderService.injectTransientSystemPrompt(
-        apiMessages,
-        transientPrompt,
-      );
+      messageBuilderService.injectProactiveCue(apiMessages, transientPrompt);
     }
 
     final mcpRouteSnapshot = generationController.captureMcpToolRoutes(

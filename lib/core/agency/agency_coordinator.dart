@@ -7,6 +7,7 @@ import '../database/business_preferences.dart';
 import 'agency_appraiser.dart';
 import 'agency_event.dart';
 import 'agency_event_bus.dart';
+import 'agency_wake_check.dart';
 
 class AgencyConsideration {
   const AgencyConsideration({required this.event, required this.appraisal});
@@ -213,6 +214,21 @@ class AgencyCoordinator {
     if (!appraisal.shouldConsider) return;
     _considerations.add(
       AgencyConsideration(event: event, appraisal: appraisal),
+    );
+  }
+
+  /// Delivery bookkeeping for self-wakes, so they share the same daily cap
+  /// and cooldown as event-driven proactive messages.
+  Future<AgencyPacing> pacing({DateTime? now}) async {
+    await _ensureStateReady();
+    _rollDay(now ?? DateTime.now());
+    final policy = _appraiser.policy;
+    return AgencyPacing(
+      lastProactiveAt: _lastProactiveMessageAt,
+      proactiveToday: _proactiveMessagesToday,
+      dailyCap: policy.dailyProactiveCap,
+      cooldown: policy.proactiveCooldown,
+      recentUserWindow: policy.recentUserWindow,
     );
   }
 

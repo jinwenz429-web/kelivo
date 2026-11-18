@@ -72,6 +72,8 @@ import 'health_data_settings_page.dart';
 import '../../settings/pages/phone_control_settings_page.dart';
 import 'package:Kelivo/theme/app_semantic_colors.dart';
 import 'package:Kelivo/shared/widgets/section_card.dart';
+import 'companion_agency_settings_page.dart';
+import '../../../shared/widgets/ios_settings_rows.dart';
 
 part 'assistant_settings_edit_basic_tab.dart';
 part '../widgets/assistant_gradient_settings.dart';

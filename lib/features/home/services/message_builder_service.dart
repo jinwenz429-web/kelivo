@@ -2631,6 +2631,30 @@ class MessageBuilderService {
     );
   }
 
+  /// Proactive turns continue after the assistant's own last message. Models
+  /// that reject an assistant-final request (no prefill) need a user turn to
+  /// answer, so the cue goes into a trailing user message that is never
+  /// stored. Otherwise it stays a transient system prompt.
+  void injectProactiveCue(List<Map<String, dynamic>> apiMessages, String cue) {
+    final content = cue.trim();
+    if (content.isEmpty) return;
+    final last = apiMessages.isEmpty ? null : apiMessages.last;
+    if (last == null || last['role'] != 'assistant') {
+      injectTransientSystemPrompt(apiMessages, content);
+      return;
+    }
+    final message = <String, dynamic>{
+      'role': 'user',
+      'content': '$proactiveCueOpening\n$content',
+    };
+    ContextSegmentTags.append(
+      message,
+      source: ContextSource.instructionInjection,
+      length: (message['content'] as String).length,
+    );
+    apiMessages.add(message);
+  }
+
   /// Keep the original single newline beside the persona when there is no
   /// intervening workspace or skills section. New sections use a blank line.
   void appendWorldBookAfterPrompt(
@@ -2782,3 +2806,7 @@ class MessageBuilderService {
     }
   }
 }
+
+/// Marks the hidden trailing user turn so the model does not mistake the cue
+/// for something the user said.
+const proactiveCueOpening = '（这一条不是对方发来的消息，是只有你能看到的提示。）';

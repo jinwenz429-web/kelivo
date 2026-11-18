@@ -19,6 +19,7 @@ import '../../core/services/scheduled_tasks_service.dart';
 import '../chat/utils/thinking_tag_parser.dart';
 import '../home/controllers/chat_actions.dart';
 import '../home/controllers/home_view_model.dart';
+import '../home/services/agency_wake_planner.dart';
 import '../home/services/ask_user_interaction_service.dart';
 import '../home/services/tool_approval_service.dart';
 
@@ -142,15 +143,34 @@ Future<Map<String, Object?>> runScheduledTask(
     final history = await chat.loadSelectedMessageProjections(conversation.id);
     cancellation.check();
     final lastUser = history.where((m) => m.role == 'user').lastOrNull;
-    final wake = await viewModel.sendProactiveAssistantMessage(
-      conversation: conversation,
-      assistant: assistant,
-      agencyInstruction: companionWakeInstruction(
+    final String instruction;
+    if (task.isAgencyWake) {
+      if (!assistant.companionAgencyEnabled) {
+        return {'conversationId': conversation.id, 'status': 'skipped'};
+      }
+      final planned = await planAgencyWake(
+        settings: settings,
+        assistant: assistant,
+        conversation: conversation,
+        history: history,
+      );
+      cancellation.check();
+      if (planned == null) {
+        return {'conversationId': conversation.id, 'status': 'skipped'};
+      }
+      instruction = planned;
+    } else {
+      instruction = companionWakeInstruction(
         now: DateTime.now(),
         note: task.prompt,
         lastMessageAt: history.lastOrNull?.timestamp,
         lastUserMessageAt: lastUser?.timestamp,
-      ),
+      );
+    }
+    final wake = await viewModel.sendProactiveAssistantMessage(
+      conversation: conversation,
+      assistant: assistant,
+      agencyInstruction: instruction,
       modelOverride: modelOverride,
       onGenerationStarted: onStarted,
       notify: task.notify,

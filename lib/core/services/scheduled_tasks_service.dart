@@ -340,8 +340,20 @@ class ScheduledTasksService extends ChangeNotifier {
     } finally {
       _active.remove(id);
       await refresh();
+      onRunFinished?.call(task);
     }
   }
+
+  /// Tasks the user created; built-in ones such as the agency self-wake
+  /// are managed elsewhere.
+  List<ScheduledTask> get userTasks => [
+    for (final task in tasks)
+      if (!task.isAgencyWake) task,
+  ];
+
+  /// Called after any run has been reported finished, e.g. so the agency
+  /// self-wake can pick its next random time (saving is refused mid-run).
+  void Function(ScheduledTask task)? onRunFinished;
 
   void _apply(Map<Object?, Object?> data) {
     if (_disposed) return;

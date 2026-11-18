@@ -6,6 +6,9 @@ enum ScheduledTaskUnavailablePolicy { remind, skip }
 
 enum ScheduledTaskRepeat { once, daily, weekdays, custom }
 
+/// Id of the built-in task that drives Companion Agency self-wakes.
+const agencyWakeTaskId = 'companion-agency-wake';
+
 class ScheduledTask {
   static const defaultPreparationWindowMinutes = Duration.minutesPerDay;
   static const defaultPreparationPrompt =
@@ -85,6 +88,9 @@ class ScheduledTask {
 
   bool get isCompanionWake =>
       companionWake && mode == ScheduledTaskMode.followUp;
+
+  /// The hidden Companion Agency self-wake; never listed with user tasks.
+  bool get isAgencyWake => id == agencyWakeTaskId;
 
   ScheduledTaskRepeat get repeat {
     if (onceDate != null) return ScheduledTaskRepeat.once;

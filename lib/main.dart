@@ -116,6 +116,9 @@ import 'dart:io'
 import 'core/services/mobile_background.dart';
 import 'core/services/notification_service.dart';
 import 'core/agency/agency_coordinator.dart';
+import 'core/agency/agency_follow_ups.dart';
+import 'core/agency/agency_settings.dart';
+import 'core/agency/agency_wake_check.dart';
 import 'core/agency/agency_world_state.dart';
 import 'features/home/controllers/chat_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -506,6 +509,9 @@ Future<void> main(List<String> arguments) async {
         ScheduledTasksService.configureDevice(businessPreferences);
         // Companion agency is process-wide: it lives for the whole app, not
         // for one home page, so it starts next to the preferences it persists to.
+        AgencySettingsStore.instance.attach(businessPreferences);
+        AgencyFollowUpStore.instance.attach(businessPreferences);
+        AgencyWakeMemoryStore.instance.attach(businessPreferences);
         AgencyWorldState.instance.start();
         unawaited(
           AgencyCoordinator.instance.start(

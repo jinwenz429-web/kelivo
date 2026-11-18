@@ -201,7 +201,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
           final status = await service.prepareNow(original.id);
           if (!mounted) return;
           final task =
-              service.tasks.where((t) => t.id == original.id).firstOrNull ??
+              service.userTasks.where((t) => t.id == original.id).firstOrNull ??
               original;
           final run = task.runs.where((r) => r.awaitingPublication).firstOrNull;
           final message = switch (status) {
@@ -269,7 +269,9 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
             listenable: service,
             builder: (ctx, _) {
               final task =
-                  service.tasks.where((t) => t.id == original.id).firstOrNull ??
+                  service.userTasks
+                      .where((t) => t.id == original.id)
+                      .firstOrNull ??
                   original;
               return _panel(
                 ctx,
@@ -425,7 +427,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
         children: [
           if (service.error != null) IosSectionFooter(text: service.error!),
           if (!service.loaded) IosSectionFooter(text: l.scheduledTasksLoading),
-          if (service.loaded && service.tasks.isEmpty)
+          if (service.loaded && service.userTasks.isEmpty)
             Padding(
               key: const ValueKey('desktop-scheduled-tasks-empty'),
               padding: const EdgeInsets.symmetric(vertical: 40),
@@ -455,7 +457,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
                 ],
               ),
             ),
-          for (final task in service.tasks)
+          for (final task in service.userTasks)
             Padding(
               padding: const EdgeInsets.only(bottom: 12),
               child: DesktopScheduledTaskTile(
@@ -599,7 +601,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
             ),
             const SizedBox(height: 20),
           ],
-          if (service.loaded && service.tasks.isEmpty) ...[
+          if (service.loaded && service.userTasks.isEmpty) ...[
             const SizedBox(height: 36),
             Icon(
               LucideIcons.clock,
@@ -626,7 +628,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
             ),
             const SizedBox(height: 40),
           ],
-          for (final task in service.tasks) ...[
+          for (final task in service.userTasks) ...[
             ScheduledTaskTile(
               name: task.name,
               time: task.timeLabel,

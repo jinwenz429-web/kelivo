@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
+import '../../../core/agency/agency_settings.dart';
 import '../../../core/models/assistant.dart';
 import 'local_tools_service.dart';
 
@@ -145,7 +146,8 @@ class AgencyRealitySampler {
         '${now.year.toString().padLeft(4, '0')}-'
         '${now.month.toString().padLeft(2, '0')}-'
         '${now.day.toString().padLeft(2, '0')}';
-    const thresholds = <int>[180, 300, 420];
+    final first = AgencySettingsStore.instance.value.screenTimeHours * 60;
+    final thresholds = <int>[first, first + 120, first + 240];
     int? crossed;
     for (final threshold in thresholds) {
       if (totalMinutes >= threshold) crossed = threshold;
@@ -199,7 +201,8 @@ class AgencyRealitySampler {
       final start = _parseDeviceDate(event['start']);
       if (start == null || start.isBefore(now)) continue;
       final until = start.difference(now);
-      if (until > const Duration(minutes: 90)) continue;
+      final lead = AgencySettingsStore.instance.value.calendarLeadMinutes;
+      if (until > Duration(minutes: lead)) continue;
 
       final key =
           '${event['id'] ?? event['title'] ?? ''}|'

@@ -26,6 +26,8 @@
      <!-- Assistant local tools: one-shot foreground location -->
      <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
      <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+     <!-- Companion Agency self-wake notices a new place while the app is closed. -->
+     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
      <!-- Assistant local tools: explicit, short Bluetooth LE scans. Android
           <= 11 uses location permission for BLE discovery; Android 12+ uses
           the dedicated nearby-device permissions below. -->

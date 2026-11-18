@@ -19,12 +19,15 @@ import '../../scheduled_tasks/scheduled_task_preparation_binding.dart';
 import '../../../core/services/scheduled_tasks_service.dart';
 import '../../scheduled_tasks/scheduled_task_runner.dart';
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart' show listEquals, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../core/agency/agency_coordinator.dart';
+import '../../../core/agency/agency_settings.dart';
+import '../../../core/agency/companion_wake.dart';
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
 import '../../../core/agency/agency_intention_gate.dart';
@@ -72,6 +75,7 @@ import 'generation_controller.dart';
 import 'scroll_controller.dart' as scroll_ctrl;
 import 'home_view_model.dart';
 import '../services/agency_reality_sampler.dart';
+import '../services/agency_wake_scheduler.dart';
 import '../services/context_usage_service.dart';
 import '../services/message_builder_service.dart';
 import '../services/message_generation_service.dart';
@@ -1453,6 +1457,14 @@ class HomePageController extends ChangeNotifier {
               onConversation,
             );
         await ScheduledTasksService.instance.attach(executor);
+        ScheduledTasksService.instance.onRunFinished = (task) {
+          if (task.isAgencyWake) unawaited(_syncAgencyWake(reroll: true));
+        };
+        if (!_context.mounted) return;
+        _agencyAssistants = _context.read<AssistantProvider>()
+          ..addListener(_onAgencyInputsChanged);
+        AgencySettingsStore.instance.addListener(_onAgencyInputsChanged);
+        unawaited(_syncAgencyWake());
       }
     } finally {
       _startupConversationPending = false;
@@ -4198,6 +4210,39 @@ class HomePageController extends ChangeNotifier {
     });
   }
 
+  final math.Random _agencyRandom = math.Random();
+  AssistantProvider? _agencyAssistants;
+  Timer? _agencySyncTimer;
+  int _agencyWakeWindow = -1;
+
+  /// Assistants and agency settings change in bursts while editing; settle
+  /// before touching the hidden self-wake task.
+  void _onAgencyInputsChanged() {
+    final settings = AgencySettingsStore.instance.value;
+    final window = settings.wakeMinMinutes * 10000 + settings.wakeMaxMinutes;
+    final reroll = _agencyWakeWindow != -1 && _agencyWakeWindow != window;
+    _agencyWakeWindow = window;
+    _agencySyncTimer?.cancel();
+    _agencySyncTimer = Timer(
+      const Duration(seconds: 2),
+      () => unawaited(_syncAgencyWake(reroll: reroll)),
+    );
+  }
+
+  Future<void> _syncAgencyWake({bool reroll = false}) async {
+    if (!_context.mounted) return;
+    final settings = AgencySettingsStore.instance.value;
+    _agencyWakeWindow =
+        settings.wakeMinMinutes * 10000 + settings.wakeMaxMinutes;
+    await AgencyWakeScheduler.sync(
+      service: ScheduledTasksService.instance,
+      chat: _chatService,
+      assistants:
+          (_agencyAssistants ?? _context.read<AssistantProvider>()).assistants,
+      reroll: reroll,
+    );
+  }
+
   Future<void> _sampleAgencyReality() async {
     if (!_canSampleAgencyReality) return;
     final assistants = _context.read<AssistantProvider>();
@@ -4308,10 +4353,27 @@ class HomePageController extends ChangeNotifier {
     AgencyConsideration consideration,
   ) async {
     if (!_chatInitialized || !_context.mounted) return;
-    final intention = _agencyIntentionGate.decide(consideration);
+    final agency = AgencySettingsStore.instance.value;
+    final intention = _agencyIntentionGate.decide(
+      consideration,
+      settings: agency,
+    );
     if (!intention.shouldMessage) return;
 
     final event = consideration.event;
+    final trigger = switch (event.kind) {
+      AgencyEventKind.calendarUpcoming => AgencyTrigger.calendar,
+      AgencyEventKind.screenTimeThreshold => AgencyTrigger.screenTime,
+      AgencyEventKind.batteryChanged => AgencyTrigger.lowBattery,
+      _ => null,
+    };
+    // Each occasion is a chance, not an order: "medium" comes about 70% of
+    // the time, "high" always, "low" about a third.
+    if (trigger != null) {
+      final setting = agency.trigger(trigger);
+      if (!setting.enabled) return;
+      if (_agencyRandom.nextDouble() >= 0.7 * setting.level.factor) return;
+    }
     final originAssistantId =
         event.payload['originAssistantId']?.toString().trim() ?? '';
     final originConversationId =
@@ -4340,10 +4402,17 @@ class HomePageController extends ChangeNotifier {
 
     final instruction = _agencyInstructionFor(event);
     if (instruction == null) return;
+    final note = agency.note.trim();
     await _viewModel.sendProactiveAssistantMessage(
       conversation: conversation,
       assistant: assistant,
-      agencyInstruction: instruction,
+      modelOverride: agency.modelOverride,
+      agencyInstruction: [
+        instruction,
+        if (note.isNotEmpty) 'What the user asked you to keep in mind:\n$note',
+        'If you would rather not interrupt right now, reply with only '
+            '$companionSilenceMarker and nothing else.',
+      ].join('\n\n'),
       agencyEventKey: event.dedupeKey,
       notify: true,
       showPreview: true,
@@ -4649,6 +4718,10 @@ class HomePageController extends ChangeNotifier {
     if (_scheduledExecutor case final executor?) {
       _scheduledPreparation?.dispose();
       ScheduledTasksService.instance.detach(executor);
+      ScheduledTasksService.instance.onRunFinished = null;
+      _agencyAssistants?.removeListener(_onAgencyInputsChanged);
+      AgencySettingsStore.instance.removeListener(_onAgencyInputsChanged);
+      _agencySyncTimer?.cancel();
     }
     final background = MobileBackgroundCoordinator.instance;
     if (background.visibleConversation == _visibleBackgroundConversation) {

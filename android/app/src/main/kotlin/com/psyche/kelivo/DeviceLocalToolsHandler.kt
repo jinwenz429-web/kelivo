@@ -182,6 +182,7 @@ class DeviceLocalToolsHandler(private val context: Context) {
                     }
                 }
                 "getScreenTime" -> handleScreenTime(argsJson, result)
+                "deviceSnapshot" -> result.success(deviceSnapshot().toString())
                 "queryCalendar" -> withCalendarPermission(
                     arrayOf(Manifest.permission.READ_CALENDAR),
                     result,
@@ -393,6 +394,39 @@ class DeviceLocalToolsHandler(private val context: Context) {
 
         lastBatterySignature = null
         lastNetworkSignature = null
+    }
+
+    /** One-shot phone state for a companion wake check; needs no permission. */
+    private fun deviceSnapshot(): JSONObject {
+        val json = JSONObject()
+        @Suppress("DEPRECATION")
+        val battery = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if (battery != null) {
+            val rawLevel = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            if (rawLevel >= 0 && scale > 0) {
+                json.put("batteryLevel", ((rawLevel * 100.0) / scale).toInt().coerceIn(0, 100))
+            }
+            val status = battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            val plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+            json.put(
+                "charging",
+                status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL ||
+                    plugged != 0,
+            )
+        }
+        val power = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        json.put("screenOn", power?.isInteractive == true)
+        val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val headphones = audio?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.any { device ->
+            isBluetoothAudioDevice(device) ||
+                device.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        } == true
+        json.put("headphones", headphones)
+        return json
     }
 
     private fun emitCurrentBatterySnapshot(force: Boolean) {
