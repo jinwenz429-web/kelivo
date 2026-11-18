@@ -238,6 +238,13 @@ void main() {
     expect(back.enabled(AgencyTrigger.lateNight), isFalse);
     expect(back.trigger(AgencyTrigger.lateNight).level, AgencyLevel.low);
     expect(back.enabled(AgencyTrigger.followUp), isTrue);
+    expect(back.regenerateOnDrift, isFalse);
+    expect(
+      AgencySettings.fromJson(
+        s.copyWith(regenerateOnDrift: true).toJson(),
+      ).regenerateOnDrift,
+      isTrue,
+    );
     expect(
       AgencySettings.fromJson({
         'wakeMinMinutes': 5,

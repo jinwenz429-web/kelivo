@@ -52,6 +52,7 @@ import 'ask_user_interaction_service.dart';
 import 'context_assembly.dart';
 import 'context_usage_service.dart';
 import 'message_builder_service.dart';
+import 'persona_guard_client.dart';
 import 'tool_approval_service.dart';
 import '../utils/model_display_helper.dart';
 
@@ -1202,7 +1203,13 @@ class MessageGenerationService {
       onToolCall: prepared.onToolCall,
       extraHeaders: buildConversationRequestHeaders(
         conversationId: assistantMessage.conversationId,
-        customHeaders: generationController.buildCustomHeaders(assistant),
+        customHeaders: {
+          ...?generationController.buildCustomHeaders(assistant),
+          ...PersonaGuardClient.headersFor(
+            conversationId: assistantMessage.conversationId,
+            messageId: assistantMessage.id,
+          ),
+        },
       ),
       extraBody: generationController.buildCustomBody(assistant),
       serviceTier: ConversationResponseSpeed.requestTier(

@@ -12,6 +12,14 @@ void main() {
       expect(isCompanionSilence('[Silent]'), isTrue);
     });
 
+    test('a diary alone is silence; a diary beside words is not', () {
+      expect(isCompanionSilence('[DIARY]她睡了[/DIARY]'), isTrue);
+      expect(isCompanionSilence('[静默]\n[DIARY]她睡了[/DIARY]'), isTrue);
+      expect(isCompanionSilence('醒了吗\n[DIARY]想她[/DIARY]'), isFalse);
+      expect(stripCompanionDiary('醒了吗\n[diary]\n想她\n[/DIARY]'), '醒了吗');
+      expect(hasCompanionDiary('醒了吗'), isFalse);
+    });
+
     test('a real message that mentions the word is not silence', () {
       expect(isCompanionSilence('今天好安静，[静默] 了一整天'), isFalse);
       expect(isCompanionSilence('醒了吗'), isFalse);
@@ -34,6 +42,7 @@ void main() {
       expect(text, contains('对方上一次说话是 1 天前'));
       expect(text, contains('看看我吃饭没有'));
       expect(text, contains(companionSilenceMarker));
+      expect(text, contains(companionDiaryHint));
     });
 
     test('falls back to the default note and skips unknown gaps', () {

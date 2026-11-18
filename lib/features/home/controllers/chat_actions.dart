@@ -3501,9 +3501,11 @@ class ChatActions {
             silent
                 ? BackgroundTaskOutcome.cancelled
                 : BackgroundTaskOutcome.completed,
-            replyPreview: ThinkingTagParser.parseWithRanges(
-              finalizedMessage.content,
-            ).visibleContent,
+            replyPreview: stripCompanionDiary(
+              ThinkingTagParser.parseWithRanges(
+                finalizedMessage.content,
+              ).visibleContent,
+            ),
           );
         } finally {
           _clearGenerationRuntimeState(finalizedMessage);

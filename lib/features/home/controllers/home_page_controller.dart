@@ -4412,6 +4412,7 @@ class HomePageController extends ChangeNotifier {
         if (note.isNotEmpty) 'What the user asked you to keep in mind:\n$note',
         'If you would rather not interrupt right now, reply with only '
             '$companionSilenceMarker and nothing else.',
+        companionDiaryHint,
       ].join('\n\n'),
       agencyEventKey: event.dedupeKey,
       notify: true,

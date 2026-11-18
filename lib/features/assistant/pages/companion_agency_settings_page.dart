@@ -176,6 +176,14 @@ class _CompanionAgencySettingsPageState
                 onTap: _pickModel,
               ),
               const IosRowDivider(),
+              IosSwitchRow(
+                icon: Lucide.Repeat,
+                label: '出戏时让它重说一次',
+                subtitle: '接口换成 pawwake 后再打开：它突然变回通用助手口吻时，自动再说一次',
+                value: _value.regenerateOnDrift,
+                onChanged: (on) => _set(_value.copyWith(regenerateOnDrift: on)),
+              ),
+              const IosRowDivider(),
               Padding(
                 padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
                 child: IosFormTextField(

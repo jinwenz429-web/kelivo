@@ -87,6 +87,7 @@ class AgencySettings {
     this.calendarLeadMinutes = 45,
     this.screenTimeHours = 5,
     this.lowBatteryPercent = 20,
+    this.regenerateOnDrift = false,
   });
 
   /// Model for proactive turns and follow-up extraction; null follows chat.
@@ -101,6 +102,10 @@ class AgencySettings {
   final int calendarLeadMinutes;
   final int screenTimeHours;
   final int lowBatteryPercent;
+
+  /// With a Pawwake gateway: ask after each reply whether it broke character
+  /// and, if so, have it say that line again once.
+  final bool regenerateOnDrift;
 
   AgencyTriggerSetting trigger(AgencyTrigger t) =>
       triggers[t] ?? const AgencyTriggerSetting();
@@ -135,6 +140,7 @@ class AgencySettings {
     int? calendarLeadMinutes,
     int? screenTimeHours,
     int? lowBatteryPercent,
+    bool? regenerateOnDrift,
   }) => AgencySettings(
     modelProvider: clearModel ? null : model?.providerKey ?? modelProvider,
     modelId: clearModel ? null : model?.modelId ?? modelId,
@@ -145,6 +151,7 @@ class AgencySettings {
     calendarLeadMinutes: calendarLeadMinutes ?? this.calendarLeadMinutes,
     screenTimeHours: screenTimeHours ?? this.screenTimeHours,
     lowBatteryPercent: lowBatteryPercent ?? this.lowBatteryPercent,
+    regenerateOnDrift: regenerateOnDrift ?? this.regenerateOnDrift,
   );
 
   AgencySettings withTrigger(AgencyTrigger t, AgencyTriggerSetting value) =>
@@ -162,6 +169,7 @@ class AgencySettings {
     'calendarLeadMinutes': calendarLeadMinutes,
     'screenTimeHours': screenTimeHours,
     'lowBatteryPercent': lowBatteryPercent,
+    'regenerateOnDrift': regenerateOnDrift,
   };
 
   static AgencySettings fromJson(Map<String, dynamic> json) {
@@ -188,6 +196,7 @@ class AgencySettings {
       calendarLeadMinutes: read('calendarLeadMinutes', 45, 5, 180),
       screenTimeHours: read('screenTimeHours', 5, 1, 12),
       lowBatteryPercent: read('lowBatteryPercent', 20, 5, 50),
+      regenerateOnDrift: json['regenerateOnDrift'] == true,
     );
   }
 }

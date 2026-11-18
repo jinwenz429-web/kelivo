@@ -30,6 +30,8 @@ import '../../../core/providers/assistant_provider.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/services/api/chat_api_service.dart';
 import '../../../core/services/chat/chat_service.dart';
+import '../services/persona_guard_client.dart';
+import '../../../core/agency/companion_wake.dart';
 import '../../../core/services/logging/flutter_logger.dart';
 import '../../../core/services/model_spec/model_spec_resolver.dart';
 import '../../../core/services/memory/memory_pipeline.dart';
@@ -496,12 +498,58 @@ class HomeViewModel extends ChangeNotifier {
     );
     await onAssistantMessageFinished?.call(message);
     _onMaybeOrganizeMemory(message.conversationId);
+    unawaited(_maybeRegenerateDrift(message));
+  }
+
+  /// With a Pawwake gateway: if the reply just broke character, have it say
+  /// that line again once, but only while it is still the last message.
+  Future<void> _maybeRegenerateDrift(ChatMessage message) async {
+    if (!PersonaGuardClient.enabled || PersonaGuardClient.isRetry(message.id)) {
+      return;
+    }
+    final providerKey = message.providerId;
+    final modelId = message.modelId;
+    if (providerKey == null || modelId == null) return;
+    final config = _contextProvider.read<SettingsProvider>().getProviderConfig(
+      providerKey,
+    );
+    final drifted = await PersonaGuardClient.shouldRegenerate(
+      config: config,
+      modelId: modelId,
+      messageId: message.id,
+    );
+    if (!drifted) return;
+    final tail = _chatController.messages.lastOrNull;
+    if (tail?.id != message.id || ChatActions.hasAnyActiveGeneration) return;
+    FlutterLogger.log('reply drifted, regenerating once', tag: 'PersonaGuard');
+    PersonaGuardClient.markRetry(
+      conversationId: message.conversationId,
+      originMessageId: message.id,
+    );
+    final ok = await regenerateAtMessage(tail!);
+    if (!ok) PersonaGuardClient.clearRetry(message.conversationId);
   }
 
   Future<void> _onProactiveAssistantMessageFinished(
     ChatMessage message,
     String? eventKey,
   ) async {
+    // The diary was for the companion (and the gateway that files it); the
+    // chat keeps only what it actually said.
+    if (hasCompanionDiary(message.content) &&
+        message.parts.every((part) => part is TextPart)) {
+      final said = stripCompanionDiary(message.content);
+      final updated = message.copyWith(
+        content: said,
+        parts: <MessagePart>[TextPart(said)],
+      );
+      _chatController.replaceMessageSnapshot(updated);
+      await _chatService.updateMessage(
+        message.id,
+        content: said,
+        parts: <MessagePart>[TextPart(said)],
+      );
+    }
     try {
       await AgencyCoordinator.instance.recordProactiveMessage(
         eventKey: eventKey,

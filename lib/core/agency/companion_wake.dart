@@ -12,11 +12,28 @@ final RegExp _silencePattern = RegExp(
   caseSensitive: false,
 );
 
+final RegExp _diaryPattern = RegExp(
+  r'\[DIARY\](.*?)\[/DIARY\]',
+  caseSensitive: false,
+  dotAll: true,
+);
+
+/// The reply without `[DIARY]...[/DIARY]` blocks. Diaries are for the
+/// companion itself: a Pawwake gateway files them, the chat never shows them.
+String stripCompanionDiary(String content) =>
+    content.replaceAll(_diaryPattern, '').trim();
+
+bool hasCompanionDiary(String content) => _diaryPattern.hasMatch(content);
+
 /// Whether a visible reply means "stay quiet this time". Only the opening
 /// counts, so a model that adds a short explanation after the marker is still
-/// silent, while a real message that mentions the word is not.
-bool isCompanionSilence(String visibleContent) =>
-    _silencePattern.hasMatch(visibleContent);
+/// silent, while a real message that mentions the word is not. A reply that
+/// is nothing but a diary is silent too.
+bool isCompanionSilence(String visibleContent) {
+  final rest = stripCompanionDiary(visibleContent);
+  return _silencePattern.hasMatch(rest) ||
+      (rest.isEmpty && hasCompanionDiary(visibleContent));
+}
 
 /// The ephemeral system context for one wake. It is never stored as a message.
 String companionWakeInstruction({
@@ -44,9 +61,15 @@ String companionWakeInstruction({
       '想找对方，就直接写你要发的话，像平时发消息一样，可以分几条，条与条之间空一行；'
       '不要提到「醒来」「定时」「系统」「提示」这些。',
     )
-    ..add('不想打扰，就只回复 $companionSilenceMarker，别的什么都不写。');
+    ..add('不想打扰，就只回复 $companionSilenceMarker，别的什么都不写。')
+    ..add(companionDiaryHint);
   return lines.join('\n');
 }
+
+/// Diaries are optional, private, and allowed whether or not it reaches out.
+const companionDiaryHint =
+    '想给自己记点什么（此刻在想什么、为什么来或不来），可以另外写在 [DIARY] 和 [/DIARY] 之间，'
+    '对方看不到；来不来找对方都可以写，也可以不写。';
 
 const _weekdays = ['一', '二', '三', '四', '五', '六', '日'];
 
