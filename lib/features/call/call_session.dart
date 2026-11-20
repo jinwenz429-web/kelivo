@@ -166,12 +166,12 @@ class CallSession extends ChangeNotifier {
     notifyListeners();
   }
 
-  void _onHeard(CallHeard heard) {
+  void _onHeard(CallHeard heard, {bool typed = false}) {
     if (_closed) return;
     _lastActivity = DateTime.now();
     final busy = _requestId != null || _voice.isSpeaking;
     // A cough or an "嗯" does not take over a reply already on its way.
-    if (busy && isSlightUtterance(heard.text)) return;
+    if (!typed && busy && isSlightUtterance(heard.text)) return;
     final soft = baseline.isSoft(heard.averageLevel);
     baseline.add(heard.averageLevel);
     _nudges = 0;
@@ -455,19 +455,37 @@ class CallSession extends ChangeNotifier {
     }
   }
 
+  /// Ends the call. Everything the caller relies on (the record, the ended
+  /// phase, silence) happens before the first await; releasing the audio
+  /// devices finishes in the background.
   Future<void> hangUp() async {
     if (_closed) return;
     _closed = true;
     _ticker?.cancel();
     _linger?.cancel();
     _cancelRequest(dropReplyLine: false);
+    final stopping = _voice.stop();
     final line = _replyLine;
     if (line != null && line.text.trim().isEmpty) record.lines.remove(line);
-    await _voice.dispose();
-    await _listener.close();
     record.endedAt = DateTime.now();
     _phase = CallPhase.ended;
     notifyListeners();
+    await stopping;
+    await Future.wait([_voice.dispose(), _listener.close()]);
+  }
+
+  /// A typed line, for when talking out loud is not an option. It cuts the
+  /// companion off like speaking would.
+  void sendText(String text) {
+    final typed = text.trim();
+    if (typed.isEmpty || _closed) return;
+    if (_phase == CallPhase.speaking ||
+        _phase == CallPhase.thinking ||
+        _phase == CallPhase.lingering) {
+      _linger?.cancel();
+      _interrupt();
+    }
+    _onHeard(CallHeard(typed, averageLevel: 0), typed: true);
   }
 
   void _setPhase(CallPhase phase) {

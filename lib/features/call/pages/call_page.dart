@@ -28,6 +28,7 @@ class CallPage extends StatefulWidget {
 class _CallPageState extends State<CallPage> {
   CallSession get session => widget.session;
   final ScrollController _scroll = ScrollController();
+  final TextEditingController _typing = TextEditingController();
   Timer? _clock;
   bool _ending = false;
 
@@ -47,9 +48,8 @@ class _CallPageState extends State<CallPage> {
 
   void _onSession() {
     if (!mounted) return;
-    if (session.phase == CallPhase.ended && !_ending) {
-      _ending = true;
-      Navigator.of(context).maybePop();
+    if (session.phase == CallPhase.ended) {
+      _leave();
       return;
     }
     setState(() {});
@@ -64,11 +64,26 @@ class _CallPageState extends State<CallPage> {
     });
   }
 
-  Future<void> _end() async {
-    if (_ending) return;
+  /// Hangs up and leaves at once; the audio devices are released after.
+  void _end() {
+    unawaited(session.hangUp());
+    _leave();
+  }
+
+  void _leave() {
+    if (_ending || !mounted) return;
     _ending = true;
-    await session.hangUp();
-    if (mounted) Navigator.of(context).maybePop();
+    FocusScope.of(context).unfocus();
+    // pop() rather than maybePop(): the PopScope below only guards the
+    // system back gesture.
+    Navigator.of(context).pop();
+  }
+
+  void _sendTyped() {
+    final text = _typing.text;
+    if (text.trim().isEmpty) return;
+    session.sendText(text);
+    _typing.clear();
   }
 
   @override
@@ -77,6 +92,7 @@ class _CallPageState extends State<CallPage> {
     session.removeListener(_onSession);
     unawaited(session.hangUp());
     _scroll.dispose();
+    _typing.dispose();
     super.dispose();
   }
 
@@ -110,7 +126,7 @@ class _CallPageState extends State<CallPage> {
     return PopScope(
       canPop: _ending,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) unawaited(_end());
+        if (!didPop) _end();
       },
       child: Scaffold(
         backgroundColor: Color.alphaBlend(
@@ -163,6 +179,7 @@ class _CallPageState extends State<CallPage> {
                 ),
               const SizedBox(height: 12),
               Expanded(child: _subtitles()),
+              _typeBox(),
               _controls(cs),
               const SizedBox(height: 20),
             ],
@@ -187,6 +204,50 @@ class _CallPageState extends State<CallPage> {
         padding: const EdgeInsets.fromLTRB(24, 40, 24, 16),
         itemCount: lines.length,
         itemBuilder: (context, index) => _line(lines[index]),
+      ),
+    );
+  }
+
+  Widget _typeBox() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+      child: Container(
+        padding: const EdgeInsets.only(left: 16, right: 4),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(22),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _typing,
+                minLines: 1,
+                maxLines: 3,
+                textInputAction: TextInputAction.send,
+                onSubmitted: (_) => _sendTyped(),
+                style: const TextStyle(color: Colors.white, fontSize: 15),
+                cursorColor: Colors.white,
+                decoration: InputDecoration(
+                  isDense: true,
+                  border: InputBorder.none,
+                  hintText: '不方便说话就打字…',
+                  hintStyle: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.4),
+                  ),
+                ),
+              ),
+            ),
+            IosIconButton(
+              icon: Lucide.ArrowUp,
+              size: 20,
+              minSize: 40,
+              color: Colors.white,
+              semanticLabel: '发送',
+              onTap: _sendTyped,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -280,12 +341,7 @@ class _CallPageState extends State<CallPage> {
             ],
           ),
           const SizedBox(height: 22),
-          round(
-            Lucide.PhoneOff,
-            '挂断',
-            () => unawaited(_end()),
-            color: const Color(0xFFE5484D),
-          ),
+          round(Lucide.PhoneOff, '挂断', _end, color: const Color(0xFFE5484D)),
         ],
       ),
     );

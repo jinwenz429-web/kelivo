@@ -17,6 +17,7 @@ class CallLine {
     this.favorite = false,
     this.interrupted = false,
     this.soft = false,
+    this.typed = false,
   }) : audio = audio ?? <String>[];
 
   /// 'user' or 'assistant'.
@@ -35,6 +36,9 @@ class CallLine {
   /// The user spoke noticeably softer than usual.
   final bool soft;
 
+  /// The user typed this line instead of saying it.
+  final bool typed;
+
   bool get isUser => role == 'user';
 
   Map<String, dynamic> toJson() => {
@@ -45,6 +49,7 @@ class CallLine {
     if (favorite) 'favorite': true,
     if (interrupted) 'interrupted': true,
     if (soft) 'soft': true,
+    if (typed) 'typed': true,
   };
 
   static CallLine fromJson(Map<String, dynamic> json) => CallLine(
@@ -57,6 +62,7 @@ class CallLine {
     favorite: json['favorite'] == true,
     interrupted: json['interrupted'] == true,
     soft: json['soft'] == true,
+    typed: json['typed'] == true,
   );
 }
 
