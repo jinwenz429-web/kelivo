@@ -665,11 +665,9 @@ class _HomePageState extends State<HomePage>
       final conversation = context.read<ChatService>().getConversation(
         call.conversationId,
       );
-      final assistantId =
-          conversation?.assistantId ?? assistants.currentAssistantId;
-      final assistant = assistantId == null
-          ? null
-          : assistants.getById(assistantId);
+      final assistant = assistants.resolveConversationAssistant(
+        conversation?.assistantId,
+      );
       final IncomingCallChoice? choice = service.answerRequested
           ? const AnswerCall()
           : await Navigator.of(context).push<IncomingCallChoice>(

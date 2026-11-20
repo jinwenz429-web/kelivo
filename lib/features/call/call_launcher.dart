@@ -18,6 +18,7 @@ import '../../core/providers/user_provider.dart';
 import '../../core/services/chat/chat_service.dart';
 import '../../shared/widgets/snackbar.dart';
 import '../home/services/local_tools_service.dart' show DeviceLocalTools;
+import '../home/utils/model_display_helper.dart' show resolveChatModel;
 import 'call_records.dart';
 import 'call_session.dart';
 import 'call_settings.dart';
@@ -59,15 +60,18 @@ CallSetup? resolveCallSetup(BuildContext context, String conversationId) {
   final assistants = context.read<AssistantProvider>();
   final settings = context.read<SettingsProvider>();
   final conversation = chat.getConversation(conversationId);
-  final assistantId =
-      conversation?.assistantId ?? assistants.currentAssistantId;
-  final assistant = assistantId == null
-      ? null
-      : assistants.getById(assistantId);
+  final assistant = assistants.resolveConversationAssistant(
+    conversation?.assistantId,
+  );
   if (assistant == null) return null;
-  final providerKey =
-      assistant.chatModelProvider ?? settings.currentModelProvider;
-  final modelId = assistant.chatModelId ?? settings.currentModelId;
+  // The same chain the chat itself uses: conversation pin, assistant, global.
+  final model = resolveChatModel(
+    settings,
+    conversation: conversation,
+    assistant: assistant,
+  );
+  final providerKey = model.providerKey;
+  final modelId = model.modelId;
   if (providerKey == null || modelId == null) return null;
   return CallSetup(
     conversationId: conversationId,

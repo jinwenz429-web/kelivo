@@ -1137,11 +1137,9 @@ class HomeViewModel extends ChangeNotifier {
     );
   }
 
-  Assistant? _assistantFor(Conversation conversation) {
-    final assistants = _contextProvider.read<AssistantProvider>();
-    final id = conversation.assistantId ?? assistants.currentAssistantId;
-    return id == null ? null : assistants.getById(id);
-  }
+  Assistant? _assistantFor(Conversation conversation) => _contextProvider
+      .read<AssistantProvider>()
+      .resolveConversationAssistant(conversation.assistantId);
 
   Future<void> deleteMessages({
     required Set<String> messageIds,
