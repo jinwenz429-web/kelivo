@@ -1,4 +1,7 @@
 import '../../../core/models/native_compaction.dart';
+import '../../call/call_settings.dart';
+import '../../call/call_text.dart' show callMissedCue, companionCallWakeHint;
+import '../../call/incoming_call.dart';
 import '../../../core/models/provider_oauth.dart';
 import '../../../core/models/carried_original.dart';
 import '../../../core/services/api/providers/openai/responses_request.dart';
@@ -161,6 +164,7 @@ class HomeViewModel extends ChangeNotifier {
     _chatActions.onProactiveAssistantMessageFinished =
         _onProactiveAssistantMessageFinished;
     _chatActions.onProactiveSilence = _onProactiveSilence;
+    _chatActions.onProactiveCall = _onProactiveCall;
     _chatActions.onFileProcessingStarted = _onFileProcessingStarted;
     _chatActions.onFileProcessingFinished = _onFileProcessingFinished;
     _chatService.contextCompression.isConversationBusy = _isConversationBusy;
@@ -671,6 +675,7 @@ class HomeViewModel extends ChangeNotifier {
     ValueChanged<String>? onGenerationStarted,
     bool notify = true,
     bool showPreview = true,
+    bool allowCall = true,
   }) async {
     if (_chatController.isConversationLoading(conversation.id) ||
         _chatActions.activeStreamingMessageId(conversation.id) != null) {
@@ -692,9 +697,13 @@ class HomeViewModel extends ChangeNotifier {
     if (anchor == null || anchor.role != 'assistant' || anchor.isStreaming) {
       return ChatActionResult.error('proactive_requires_assistant_tail');
     }
-    final instruction = agencyInstruction.trim();
+    var instruction = agencyInstruction.trim();
     if (instruction.isEmpty) {
       return ChatActionResult.error('proactive_empty_instruction');
+    }
+    if (allowCall &&
+        CallSettingsStore.instance.value.mayCallAt(DateTime.now())) {
+      instruction = '$instruction\n\n$companionCallWakeHint';
     }
     final result = await _chatActions.regenerateAtMessage(
       message: anchor,
@@ -1085,6 +1094,54 @@ class HomeViewModel extends ChangeNotifier {
   /// a fresh single-version reply, so removing it touches nothing else.
   Future<void> _onProactiveSilence(ChatMessage message) =>
       deleteMessages(messageIds: {message.id});
+
+  /// A self-wake chose to phone: ring, and if nobody answers, record the
+  /// missed call and let it decide whether to leave a message.
+  Future<void> _onProactiveCall(ChatMessage message, String reason) async {
+    final store = CallSettingsStore.instance;
+    final now = DateTime.now();
+    // Do-not-disturb or the daily limit may have changed since the wake began.
+    if (!store.value.mayCallAt(now)) return;
+    await store.update(store.value.copyWith(lastCompanionCallAt: now));
+    final conversation = _chatService.getConversation(message.conversationId);
+    if (conversation == null) return;
+    final assistant = _assistantFor(conversation);
+    await IncomingCallService.instance.ring(
+      IncomingCallService.create(
+        conversationId: conversation.id,
+        assistantName: assistant?.name ?? '',
+        reason: reason,
+      ),
+      onMissed: _onCallMissed,
+    );
+  }
+
+  Future<void> _onCallMissed(IncomingCall call) async {
+    final conversation = _chatService.getConversation(call.conversationId);
+    if (conversation == null) return;
+    await _chatService.addMessage(
+      conversationId: call.conversationId,
+      role: 'assistant',
+      content: callMissedCard,
+    );
+    if (currentConversation?.id == call.conversationId) {
+      await _chatController.refreshTimelineAfterMutation();
+    }
+    final assistant = _assistantFor(conversation);
+    if (assistant == null) return;
+    await sendProactiveAssistantMessage(
+      conversation: conversation,
+      assistant: assistant,
+      agencyInstruction: callMissedCue(reason: call.reason),
+      allowCall: false,
+    );
+  }
+
+  Assistant? _assistantFor(Conversation conversation) {
+    final assistants = _contextProvider.read<AssistantProvider>();
+    final id = conversation.assistantId ?? assistants.currentAssistantId;
+    return id == null ? null : assistants.getById(id);
+  }
 
   Future<void> deleteMessages({
     required Set<String> messageIds,

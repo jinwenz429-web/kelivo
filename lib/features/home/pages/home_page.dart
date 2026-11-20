@@ -1,4 +1,9 @@
 import '../services/composer_document_route.dart';
+import '../../call/call_launcher.dart';
+import '../../call/call_records.dart' show CallDirection;
+import '../../call/incoming_call.dart';
+import '../../call/pages/call_records_page.dart';
+import '../../call/pages/incoming_call_page.dart';
 import '../../chat/controllers/conversation_find_controller.dart';
 import '../../chat/models/conversation_find_candidate.dart';
 import '../../chat/services/conversation_find_service.dart';
@@ -561,6 +566,9 @@ class _HomePageState extends State<HomePage>
     _inputController.addListener(_syncQuoteHighlights);
     _controller.onRevealConversation = () => _drawerController.jumpTo(0);
     _controller.addListener(_onControllerChanged);
+    IncomingCallService.instance.addListener(_onIncomingCall);
+    IncomingCallService.instance.onDeclined = _onCallDeclined;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onIncomingCall());
     _drawerController.addListener(_onDrawerValueChanged);
 
     _chatReady = _controller.initChat();
@@ -615,8 +623,102 @@ class _HomePageState extends State<HomePage>
     _controller.onDidPopNext();
   }
 
+  // ---------------------------------------------------------------------------
+  // Voice calls
+
+  bool _incomingCallShown = false;
+
+  Future<void> _startCall() async {
+    final id = _controller.currentConversation?.id;
+    if (id == null) {
+      showAppSnackBar(context, message: '先开一个对话再打电话');
+      return;
+    }
+    await startCall(context, conversationId: id);
+    if (mounted) await _afterCall(id);
+  }
+
+  Future<void> _afterCall(String conversationId) async {
+    if (_controller.currentConversation?.id == conversationId) {
+      await _controller.chatController.refreshTimelineAfterMutation();
+      _controller.forceScrollToBottomSoon(animate: false);
+    }
+  }
+
+  void _openCallRecords() {
+    final id = _controller.currentConversation?.id;
+    if (id == null) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => CallRecordsPage(conversationId: id),
+      ),
+    );
+  }
+
+  Future<void> _onIncomingCall() async {
+    final service = IncomingCallService.instance;
+    final call = service.pending;
+    if (call == null || _incomingCallShown || !mounted) return;
+    _incomingCallShown = true;
+    try {
+      final assistants = context.read<AssistantProvider>();
+      final conversation = context.read<ChatService>().getConversation(
+        call.conversationId,
+      );
+      final assistantId =
+          conversation?.assistantId ?? assistants.currentAssistantId;
+      final assistant = assistantId == null
+          ? null
+          : assistants.getById(assistantId);
+      final IncomingCallChoice? choice = service.answerRequested
+          ? const AnswerCall()
+          : await Navigator.of(context).push<IncomingCallChoice>(
+              MaterialPageRoute(
+                fullscreenDialog: true,
+                builder: (_) =>
+                    IncomingCallPage(call: call, assistant: assistant),
+              ),
+            );
+      if (!mounted) return;
+      switch (choice) {
+        case AnswerCall():
+          final answered = service.answer();
+          if (answered == null) return;
+          await _controller.switchConversationAnimated(answered.conversationId);
+          if (!mounted) return;
+          await startCall(
+            context,
+            conversationId: answered.conversationId,
+            reason: answered.reason,
+            direction: CallDirection.incoming,
+          );
+          if (mounted) await _afterCall(answered.conversationId);
+        case DeclineCall(:final note):
+          await service.decline(note);
+        case null:
+          break;
+      }
+    } finally {
+      _incomingCallShown = false;
+    }
+  }
+
+  /// The decline reason travels back as her words, so it knows why.
+  Future<void> _onCallDeclined(IncomingCall call, String note) async {
+    if (!mounted) return;
+    await _controller.switchConversationAnimated(call.conversationId);
+    if (!mounted) return;
+    await _controller.sendMessage(
+      ChatInputData(text: note.isEmpty ? '📞 挂了你的电话' : '📞 挂了你的电话：$note'),
+    );
+  }
+
   @override
   void dispose() {
+    IncomingCallService.instance.removeListener(_onIncomingCall);
+    if (IncomingCallService.instance.onDeclined == _onCallDeclined) {
+      IncomingCallService.instance.onDeclined = null;
+    }
     try {
       WidgetsBinding.instance.removeObserver(this);
     } catch (_) {}
@@ -1075,6 +1177,8 @@ class _HomePageState extends State<HomePage>
         await _controller.createNewConversationAnimated();
       },
       onOpenMiniMap: _openMiniMap,
+      onStartCall: _startCall,
+      onOpenCallRecords: _openCallRecords,
       onCreateNewConversation: () async {
         await _controller.createNewConversationAnimated();
         if (mounted) {

@@ -52,6 +52,7 @@ import '../../../utils/assistant_regex.dart';
 import '../../../core/models/assistant_regex.dart';
 import '../services/ask_user_interaction_service.dart';
 import '../../../core/agency/companion_wake.dart';
+import '../../call/call_text.dart' show companionCallReason;
 import '../../chat/utils/thinking_tag_parser.dart';
 import '../services/context_usage_service.dart';
 import '../services/message_generation_service.dart';
@@ -396,6 +397,10 @@ class ChatActions {
   /// persisted reply is only the marker and should be removed; no completion
   /// callback or notification fires for it.
   FutureOr<void> Function(ChatMessage message)? onProactiveSilence;
+
+  /// Called after a proactive turn chose to phone instead ("[来电] why").
+  /// The marker reply is removed like a silent one first.
+  FutureOr<void> Function(ChatMessage message, String reason)? onProactiveCall;
 
   /// Called when file processing starts for the assistant message [messageId].
   void Function(String messageId)? onFileProcessingStarted;
@@ -3459,13 +3464,14 @@ class ChatActions {
         ),
       );
     }
+    final visible = ThinkingTagParser.parseWithRanges(
+      finalizedMessage.content,
+    ).visibleContent;
+    final callReason = wasProactive
+        ? companionCallReason(stripCompanionDiary(visible))
+        : null;
     final silent =
-        wasProactive &&
-        isCompanionSilence(
-          ThinkingTagParser.parseWithRanges(
-            finalizedMessage.content,
-          ).visibleContent,
-        );
+        wasProactive && (callReason != null || isCompanionSilence(visible));
     try {
       await _finalizeStreamingCheckpoint(
         finalizedMessage,
@@ -3525,6 +3531,9 @@ class ChatActions {
       // silent marker reply must still happen once the message is persisted.
       if (silent && state.terminalPersisted) {
         await onProactiveSilence?.call(finalizedMessage);
+        if (callReason != null) {
+          await onProactiveCall?.call(finalizedMessage, callReason);
+        }
       }
     }
   });

@@ -21,6 +21,13 @@ class Lucide {
   static const IconData X = lucide.LucideIcons.x;
   static const IconData Ban = lucide.LucideIcons.ban;
   static const IconData Mic = lucide.LucideIcons.mic;
+  static const IconData Hand = lucide.LucideIcons.hand;
+  static const IconData Headphones = lucide.LucideIcons.headphones;
+  static const IconData MicOff = lucide.LucideIcons.micOff;
+  static const IconData PhoneOff = lucide.LucideIcons.phoneOff;
+  static const IconData PhoneIncoming = lucide.LucideIcons.phoneIncoming;
+  static const IconData PhoneMissed = lucide.LucideIcons.phoneMissed;
+  static const IconData Star = lucide.LucideIcons.star;
   static const IconData ArrowUp = lucide.LucideIcons.arrowUp;
   static const IconData ArrowLeft = lucide.LucideIcons.arrowLeft;
   static const IconData ArrowRight = lucide.LucideIcons.arrowRight;

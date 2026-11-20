@@ -41,6 +41,8 @@ class HomeMobileScaffold extends StatelessWidget {
     required this.onSelectConversation,
     required this.onNewConversation,
     required this.onOpenMiniMap,
+    required this.onStartCall,
+    required this.onOpenCallRecords,
     required this.onCreateNewConversation,
     required this.onToggleTemporaryConversation,
     required this.onSelectModel,
@@ -68,6 +70,8 @@ class HomeMobileScaffold extends StatelessWidget {
   final void Function(String id) onSelectConversation;
   final VoidCallback onNewConversation;
   final VoidCallback onOpenMiniMap;
+  final VoidCallback onStartCall;
+  final VoidCallback onOpenCallRecords;
   final Future<void> Function() onCreateNewConversation;
   final Future<void> Function() onToggleTemporaryConversation;
   final VoidCallback onSelectModel;
@@ -269,6 +273,14 @@ class HomeMobileScaffold extends StatelessWidget {
               ],
             ),
       actions: [
+        IosIconButton(
+          size: 20,
+          minSize: 44,
+          onTap: onStartCall,
+          onLongPress: onOpenCallRecords,
+          semanticLabel: '打电话（长按看通话记录）',
+          icon: Lucide.Phone,
+        ),
         IosIconButton(
           size: 20,
           minSize: 44,

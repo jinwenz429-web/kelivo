@@ -118,6 +118,8 @@ import 'core/services/notification_service.dart';
 import 'core/agency/agency_coordinator.dart';
 import 'core/agency/agency_follow_ups.dart';
 import 'core/agency/agency_settings.dart';
+import 'features/call/call_settings.dart';
+import 'features/call/incoming_call.dart';
 import 'core/agency/agency_wake_check.dart';
 import 'core/agency/agency_world_state.dart';
 import 'features/home/controllers/chat_actions.dart';
@@ -513,6 +515,9 @@ Future<void> main(List<String> arguments) async {
         AgencyFollowUpStore.instance.attach(businessPreferences);
         AgencyWakeMemoryStore.instance.attach(businessPreferences);
         AgencyWorldState.instance.start();
+        CallSettingsStore.instance.attach(businessPreferences);
+        NotificationService.responseInterceptor =
+            IncomingCallService.instance.handleNotificationResponse;
         unawaited(
           AgencyCoordinator.instance.start(
             busy: () => ChatActions.hasAnyActiveGeneration,

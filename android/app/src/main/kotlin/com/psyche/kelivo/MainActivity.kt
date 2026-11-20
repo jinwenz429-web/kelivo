@@ -133,6 +133,7 @@ class MainActivity : FlutterActivity() {
          OAuthHandler.configure(this, flutterEngine.dartExecutor.binaryMessenger)
          kelivo.backgroundRuntime.attachActivity(this)
          deviceLocalToolsHandler = kelivo.deviceTools.also { it.attachActivity(this) }
+         com.psyche.kelivo.call.CallForegroundService.register(applicationContext, flutterEngine.dartExecutor.binaryMessenger)
          workspacePlugin = kelivo.workspace.also { it.attachActivity(this) }
         processTextChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, processTextChannelName)
         processTextChannel?.setMethodCallHandler { call, result ->

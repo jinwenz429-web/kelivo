@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import '../../call/pages/call_page.dart' show CallSettingsPanel;
+import '../../../shared/widgets/custom_bottom_sheet.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -182,6 +184,18 @@ class _CompanionAgencySettingsPageState
                 subtitle: '接口换成 pawwake 后再打开：它突然变回通用助手口吻时，自动再说一次',
                 value: _value.regenerateOnDrift,
                 onChanged: (on) => _set(_value.copyWith(regenerateOnDrift: on)),
+              ),
+              const IosRowDivider(),
+              IosNavRow(
+                icon: Lucide.Phone,
+                label: '打电话',
+                subtitle: '允许它主动打给你、勿扰、通话里的嗓子和开口方式',
+                onTap: () => showCustomBottomSheet<void>(
+                  context: context,
+                  title: '通话设置',
+                  builder: (context, scroll) =>
+                      CallSettingsPanel(scrollController: scroll),
+                ),
               ),
               const IosRowDivider(),
               Padding(

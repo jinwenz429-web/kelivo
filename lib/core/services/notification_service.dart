@@ -183,7 +183,30 @@ class NotificationService {
     );
   }
 
+  /// Lets a feature claim its own notification taps (incoming calls) before
+  /// the chat and scheduled-task routing runs. Returns true when handled.
+  static bool Function(NotificationResponse response)? responseInterceptor;
+
+  static final Set<String> _createdChannels = <String>{};
+
+  /// The plugin, initialized, with [channel] created (Android only).
+  static Future<FlutterLocalNotificationsPlugin?> pluginForCalls(
+    AndroidNotificationChannel channel,
+  ) async {
+    if (!Platform.isAndroid) return null;
+    await ensureInitialized();
+    if (_createdChannels.add(channel.id)) {
+      await _plugin
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >()
+          ?.createNotificationChannel(channel);
+    }
+    return _plugin;
+  }
+
   static void _handleNotificationResponse(NotificationResponse response) {
+    if (responseInterceptor?.call(response) == true) return;
     final runId = scheduledRunIdFromPayload(response.payload);
     if (runId != null) {
       if (_scheduledRunTapController.hasListener) {

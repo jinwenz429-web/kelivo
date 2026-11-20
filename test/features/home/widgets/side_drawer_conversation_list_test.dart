@@ -236,6 +236,8 @@ void main() {
                   onSelectConversation: (id) => onSelectConversation?.call(id),
                   onNewConversation: () {},
                   onOpenMiniMap: () {},
+                  onStartCall: () {},
+                  onOpenCallRecords: () {},
                   onCreateNewConversation: () async {},
                   onToggleTemporaryConversation: () async {},
                   onSelectModel: () {},
