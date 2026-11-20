@@ -8,6 +8,7 @@ import '../../core/services/tts/network_tts.dart';
 import '../../core/providers/tts_provider.dart'
     show ttsAudioFileExtensionForMime;
 import 'call_settings.dart';
+import 'call_text.dart' show CallTagDialect;
 
 /// One sentence of the companion's reply, synthesized ahead and played in order.
 class CallUtterance {
@@ -75,10 +76,25 @@ class CallVoice {
     return TtsServiceOptions.fromJson(json);
   }
 
-  /// Whether the service reads ElevenLabs audio tags.
-  static bool readsAudioTags(TtsServiceOptions service) =>
-      service.kind == NetworkTtsKind.elevenlabs &&
-      (service.toJson()['modelId'] ?? '').toString() == 'eleven_v3';
+  /// Which sound tags the service performs: ElevenLabs v3 reads `[laughs]`,
+  /// MiniMax speech-2.8 reads `(laughs)`, `(breath)` and the like.
+  static CallTagDialect audioTagDialect(TtsServiceOptions service) {
+    final json = service.toJson();
+    switch (service.kind) {
+      case NetworkTtsKind.elevenlabs:
+        return (json['modelId'] ?? '').toString() == 'eleven_v3'
+            ? CallTagDialect.elevenLabs
+            : CallTagDialect.none;
+      case NetworkTtsKind.minimax:
+        return (json['model'] ?? '').toString().trim().toLowerCase().startsWith(
+              'speech-2.8',
+            )
+            ? CallTagDialect.miniMax
+            : CallTagDialect.none;
+      default:
+        return CallTagDialect.none;
+    }
+  }
 
   Future<void> prepare() async {
     await audioDirectory.create(recursive: true);

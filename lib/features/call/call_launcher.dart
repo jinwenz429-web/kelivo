@@ -184,7 +184,7 @@ Future<void> startCall(
     systemPrompt: [
       if (basePrompt.isNotEmpty) basePrompt,
       callSystemInstructions(
-        audioTags: CallVoice.readsAudioTags(
+        audioTags: CallVoice.audioTagDialect(
           CallVoice.withCallModel(tts, callSettings.voiceModel),
         ),
         userName: setup.userName,

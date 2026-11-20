@@ -30,16 +30,60 @@ void main() {
   group('speech and display text', () {
     test('actions are dropped from speech but kept on screen', () {
       const raw = '*揉了揉你的头* 乖（笑）[laughs] 早点睡。';
-      expect(callSpeechText(raw, keepAudioTags: true), '乖 [laughs] 早点睡。');
-      expect(callSpeechText(raw, keepAudioTags: false), '乖 早点睡。');
+      expect(
+        callSpeechText(raw, tags: CallTagDialect.elevenLabs),
+        '乖 [laughs] 早点睡。',
+      );
+      expect(callSpeechText(raw, tags: CallTagDialect.none), '乖 早点睡。');
       expect(callDisplayText(raw), '揉了揉你的头 乖（笑）早点睡。');
     });
 
     test('an English aside in parentheses is still read', () {
       expect(
-        callSpeechText('就是那首 (Leave the Door Open) 嘛', keepAudioTags: false),
+        callSpeechText(
+          '就是那首 (Leave the Door Open) 嘛',
+          tags: CallTagDialect.none,
+        ),
         '就是那首 (Leave the Door Open) 嘛',
       );
+    });
+
+    test('MiniMax gets round-bracket tags, renamed where needed', () {
+      const raw = '[breath] 你别闹……[chuckles] 好啦[sighs]，睡吧。';
+      expect(
+        callSpeechText(raw, tags: CallTagDialect.miniMax),
+        '(breath) 你别闹……(chuckle) 好啦(sighs)，睡吧。',
+      );
+      expect(callDisplayText(raw), '你别闹……好啦，睡吧。');
+    });
+
+    test('tags an engine cannot perform are dropped', () {
+      expect(
+        callSpeechText('[whispers] 我在 [pant]', tags: CallTagDialect.miniMax),
+        '我在 (pant)',
+      );
+      expect(
+        callSpeechText('[whispers] 我在 [pant]', tags: CallTagDialect.elevenLabs),
+        '[whispers] 我在',
+      );
+    });
+
+    test('MiniMax-style tags written directly are hidden and kept', () {
+      const raw = '嗯 (clear-throat) 我说完了 [clear throat]';
+      expect(callDisplayText(raw), '嗯 我说完了');
+      expect(
+        callSpeechText(raw, tags: CallTagDialect.miniMax),
+        '嗯 (clear-throat) 我说完了 (clear-throat)',
+      );
+      expect(callSpeechText(raw, tags: CallTagDialect.none), '嗯 我说完了');
+    });
+
+    test('the prompt lists tags only for an engine that performs them', () {
+      String prompt(CallTagDialect d) =>
+          callSystemInstructions(audioTags: d, userName: '锦');
+      expect(prompt(CallTagDialect.none), isNot(contains('[laughs]')));
+      expect(prompt(CallTagDialect.miniMax), contains('[pant]'));
+      expect(prompt(CallTagDialect.elevenLabs), contains('[whispers]'));
     });
 
     test('tags alone have no words', () {

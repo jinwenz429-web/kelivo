@@ -6,8 +6,19 @@ import 'package:flutter/widgets.dart' show StringCharacters;
 
 import '../home/services/message_builder_service.dart' show proactiveCueOpening;
 
-/// ElevenLabs v3 audio tags the companion may use. Anything else in square
-/// brackets is left alone (it may be ordinary text).
+/// Which voice engine is reading, and so which sound tags it performs.
+enum CallTagDialect {
+  /// Tags would be read out as words: drop them all.
+  none,
+
+  /// ElevenLabs v3: `[laughs]`, `[whispers]` …
+  elevenLabs,
+
+  /// MiniMax speech-2.8: `(laughs)`, `(breath)`, `(pant)` …
+  miniMax,
+}
+
+/// ElevenLabs v3 audio tags the companion may use.
 const callAudioTags = <String>[
   'laughs',
   'chuckles',
@@ -24,10 +35,111 @@ const callAudioTags = <String>[
   'gasps',
 ];
 
+/// MiniMax speech-2.8 interjection tags (the full official list).
+const miniMaxAudioTags = <String>[
+  'laughs',
+  'chuckle',
+  'sighs',
+  'breath',
+  'inhale',
+  'exhale',
+  'pant',
+  'gasps',
+  'sniffs',
+  'emm',
+  'humming',
+  'groans',
+  'coughs',
+  'clear-throat',
+  'lip-smacking',
+  'snorts',
+  'hissing',
+  'sneezes',
+  'burps',
+];
+
+/// Tags offered to the companion in the prompt, by dialect. The companion
+/// always writes square brackets; MiniMax tags are converted when spoken.
+const _promptTags = <CallTagDialect, List<String>>{
+  CallTagDialect.elevenLabs: [
+    'laughs',
+    'chuckles',
+    'sighs',
+    'whispers',
+    'softly',
+    'hesitates',
+    'gasps',
+  ],
+  CallTagDialect.miniMax: [
+    'laughs',
+    'chuckle',
+    'sighs',
+    'breath',
+    'inhale',
+    'exhale',
+    'pant',
+    'gasps',
+    'sniffs',
+    'emm',
+    'humming',
+  ],
+};
+
+/// ElevenLabs-style names that MiniMax spells differently.
+const _miniMaxAliases = <String, String>{
+  'chuckles': 'chuckle',
+  'clears-throat': 'clear-throat',
+  'sigh': 'sighs',
+  'laugh': 'laughs',
+  'gasp': 'gasps',
+  'breathes': 'breath',
+  'breathing': 'breath',
+  'panting': 'pant',
+  'hums': 'humming',
+};
+
+String _tagKey(String name) =>
+    name.trim().toLowerCase().replaceAll(RegExp(r'[\s_]+'), '-');
+
+final Set<String> _elevenLabsKeys = callAudioTags.map(_tagKey).toSet();
+final Set<String> _miniMaxKeys = miniMaxAudioTags.map(_tagKey).toSet();
+
+String _tagAlternatives(Iterable<String> keys) =>
+    keys.map((k) => k.split('-').map(RegExp.escape).join(r'[\s_-]+')).join('|');
+
+/// Any known tag, in square brackets (how the companion is told to write
+/// them) or in ASCII parentheses with a MiniMax name (in case it copies
+/// MiniMax's own style). Unknown bracketed text is left alone.
 final RegExp _audioTagPattern = RegExp(
-  r'\[\s*(' + callAudioTags.map(RegExp.escape).join('|') + r')\s*\]\s*',
+  r'(?:\[\s*(' +
+      _tagAlternatives({
+        ..._elevenLabsKeys,
+        ..._miniMaxKeys,
+        ..._miniMaxAliases.keys,
+      }) +
+      r')\s*\]|\(\s*(' +
+      _tagAlternatives(_miniMaxKeys) +
+      r')\s*\))\s*',
   caseSensitive: false,
 );
+
+/// Rewrites tags for [dialect]: kept as `[x]` for ElevenLabs, turned into
+/// `(x)` for MiniMax, dropped when the engine cannot perform them.
+String _applyTags(String text, CallTagDialect dialect) =>
+    text.replaceAllMapped(_audioTagPattern, (m) {
+      final key = _tagKey(m.group(1) ?? m.group(2)!);
+      final gap = m.group(0)! != m.group(0)!.trimRight() ? ' ' : '';
+      switch (dialect) {
+        case CallTagDialect.none:
+          return '';
+        case CallTagDialect.elevenLabs:
+          final name = key.replaceAll('-', ' ');
+          return _elevenLabsKeys.contains(key) ? '[$name]$gap' : '';
+        case CallTagDialect.miniMax:
+          final name = _miniMaxAliases[key] ?? key;
+          return _miniMaxKeys.contains(name) ? '($name)$gap' : '';
+      }
+    });
 
 /// Stage directions: *...*, （...）and (...) that hold no Latin letters
 /// (an English aside in parentheses is more likely real speech).
@@ -50,10 +162,9 @@ String callDisplayText(String raw) => raw
     .trim();
 
 /// What is read aloud: no actions, emoji or markdown. Audio tags are kept
-/// only for a model that understands them.
-String callSpeechText(String raw, {required bool keepAudioTags}) {
-  var text = raw.replaceAll(_actionPattern, ' ');
-  if (!keepAudioTags) text = text.replaceAll(_audioTagPattern, '');
+/// only for an engine that performs them, in that engine's own form.
+String callSpeechText(String raw, {required CallTagDialect tags}) {
+  final text = _applyTags(raw.replaceAll(_actionPattern, ' '), tags);
   return text
       .replaceAll(_markdownPattern, '')
       .replaceAll(_emojiPattern, '')
@@ -124,7 +235,7 @@ class CallSentenceSplitter {
 
 /// Call instructions appended to the assistant's own system prompt.
 String callSystemInstructions({
-  required bool audioTags,
+  required CallTagDialect audioTags,
   required String userName,
 }) {
   final lines = <String>[
@@ -146,11 +257,14 @@ String callSystemInstructions({
     )
     ..add('- 对方那句话前面要是有〔小声〕，说明对方在压低声音说话，你也放轻声音、说短一点。')
     ..add('- 电话里不要调用工具，不要发图片、卡片，只说话。');
-  if (audioTags) {
+  final tags = _promptTags[audioTags];
+  if (tags != null) {
+    final what = audioTags == CallTagDialect.miniMax
+        ? '想笑、叹气、呼吸重了、喘、吸鼻子时，可以在句子里放声音标签，会被念成真的笑声、叹气、呼吸声'
+        : '想笑、叹气、压低声音时，可以在句子里放声音标签，会被念成真的笑声、叹气';
     lines.add(
-      '- 想笑、叹气、压低声音时，可以在句子里放声音标签，会被念成真的笑声、叹气：'
-      '${callAudioTags.take(7).map((t) => '[$t]').join(' ')}。'
-      '用半角英文方括号，一段最多一两个，只在情绪真的变了的地方放，别每句都放。',
+      '- $what：${tags.map((t) => '[$t]').join(' ')}。'
+      '用半角英文方括号，放在声音该出现的位置；一段最多一两个，只在情绪真的变了的地方放，别每句都放。',
     );
   }
   return lines.join('\n');

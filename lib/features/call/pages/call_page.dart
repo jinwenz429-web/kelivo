@@ -419,7 +419,10 @@ class CallSettingsPanel extends StatelessWidget {
               onChanged: (i) =>
                   set(s.copyWith(voiceModel: CallVoiceModel.values[i])),
             ),
-            caption('v3 会笑、叹气、压低声音，开口慢一点；Flash 接话快，情绪平一些。下一通电话生效。'),
+            caption(
+              'v3 会笑、叹气、压低声音，开口慢一点；Flash 接话快，情绪平一些。下一通电话生效。'
+              '朗读用 MiniMax 时这里不管用：模型选 speech-2.8（hd 或 turbo）就会有笑声、叹气、呼吸和喘息。',
+            ),
             caption('听你说话的灵敏度'),
             SegmentedTabs(
               tabs: const [

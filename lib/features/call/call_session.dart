@@ -79,7 +79,7 @@ class CallSession extends ChangeNotifier {
   final String? openingReason;
   final void Function(bool on)? onDndChanged;
 
-  late final bool _audioTags = CallVoice.readsAudioTags(ttsService);
+  late final CallTagDialect _audioTags = CallVoice.audioTagDialect(ttsService);
   late CallVoice _voice;
   late CallListener _listener;
   bool _speakerMode;
@@ -317,7 +317,7 @@ class CallSession extends ChangeNotifier {
     if (markers.contains(CallMarker.dndOn)) onDndChanged?.call(true);
     if (markers.contains(CallMarker.dndOff)) onDndChanged?.call(false);
     final display = callDisplayText(text);
-    final speech = callSpeechText(text, keepAudioTags: _audioTags);
+    final speech = callSpeechText(text, tags: _audioTags);
     if (!callHasWords(speech)) return;
     _replyUtterances.add(_voice.say(speech, display));
     final line = _replyLine;
