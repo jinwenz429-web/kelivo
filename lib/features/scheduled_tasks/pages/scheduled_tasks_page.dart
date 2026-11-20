@@ -1,3 +1,5 @@
+import '../../../shared/utils/attachment_read_labels.dart';
+import '../../../core/services/chat/document_text_extractor.dart';
 import 'dart:async';
 import '../../../desktop/desktop_context_menu.dart';
 import '../../../desktop/widgets/desktop_scheduled_task_tile.dart';
@@ -23,6 +25,7 @@ import '../../../shared/widgets/snackbar.dart';
 import '../widgets/scheduled_task_tile.dart';
 import '../../settings/pages/mobile_background_settings_page.dart';
 import '../../settings/widgets/custom_theme_widgets.dart';
+import 'package:Kelivo/theme/app_font_weights.dart';
 
 String _repeatLabel(ScheduledTask task, AppLocalizations l) {
   if (task.onceDate != null) return scheduledRepeatLabel(task.repeat, l);
@@ -198,7 +201,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
           final status = await service.prepareNow(original.id);
           if (!mounted) return;
           final task =
-              service.tasks.where((t) => t.id == original.id).firstOrNull ??
+              service.userTasks.where((t) => t.id == original.id).firstOrNull ??
               original;
           final run = task.runs.where((r) => r.awaitingPublication).firstOrNull;
           final message = switch (status) {
@@ -266,7 +269,9 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
             listenable: service,
             builder: (ctx, _) {
               final task =
-                  service.tasks.where((t) => t.id == original.id).firstOrNull ??
+                  service.userTasks
+                      .where((t) => t.id == original.id)
+                      .firstOrNull ??
                   original;
               return _panel(
                 ctx,
@@ -369,6 +374,8 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
     _ => l.scheduledTasksFailed,
   };
   String _error(String value, AppLocalizations l) {
+    final attachment = AttachmentReadError.fromMessage(value);
+    if (attachment != null) return attachment.message(l);
     if (value == 'preparation_context_changed') {
       return l.scheduledTasksPreparationContextChanged;
     }
@@ -420,7 +427,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
         children: [
           if (service.error != null) IosSectionFooter(text: service.error!),
           if (!service.loaded) IosSectionFooter(text: l.scheduledTasksLoading),
-          if (service.loaded && service.tasks.isEmpty)
+          if (service.loaded && service.userTasks.isEmpty)
             Padding(
               key: const ValueKey('desktop-scheduled-tasks-empty'),
               padding: const EdgeInsets.symmetric(vertical: 40),
@@ -450,7 +457,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
                 ],
               ),
             ),
-          for (final task in service.tasks)
+          for (final task in service.userTasks)
             Padding(
               padding: const EdgeInsets.only(bottom: 12),
               child: DesktopScheduledTaskTile(
@@ -594,7 +601,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
             ),
             const SizedBox(height: 20),
           ],
-          if (service.loaded && service.tasks.isEmpty) ...[
+          if (service.loaded && service.userTasks.isEmpty) ...[
             const SizedBox(height: 36),
             Icon(
               LucideIcons.clock,
@@ -607,7 +614,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 20,
-                fontWeight: FontWeight.w600,
+                fontWeight: AppFontWeights.semibold,
                 color: cs.onSurface,
               ),
             ),
@@ -621,7 +628,7 @@ class _ScheduledTasksPageState extends State<ScheduledTasksPage>
             ),
             const SizedBox(height: 40),
           ],
-          for (final task in service.tasks) ...[
+          for (final task in service.userTasks) ...[
             ScheduledTaskTile(
               name: task.name,
               time: task.timeLabel,

@@ -69,6 +69,20 @@ class _LocalToolsTab extends StatelessWidget {
       children: [
         SectionCard(
           children: [
+            if (LocalToolsService.isAvailableOnThisPlatform(
+              LocalToolNames.browser,
+            )) ...[
+              _LocalToolRow(
+                icon: Lucide.Globe,
+                title: l10n.browserToolTitle,
+                subtitle: l10n.browserToolSubtitle,
+                enabled: assistant.localToolIds.contains(
+                  LocalToolNames.browser,
+                ),
+                onChanged: (value) => toggleTool(LocalToolNames.browser, value),
+              ),
+              _iosDivider(context),
+            ],
             _LocalToolRow(
               icon: Lucide.WandSparkles,
               title: 'Companion Agency',
@@ -78,6 +92,19 @@ class _LocalToolsTab extends StatelessWidget {
                 assistant.copyWith(companionAgencyEnabled: value),
               ),
             ),
+            if (assistant.companionAgencyEnabled) ...[
+              _iosDivider(context),
+              IosNavRow(
+                icon: Lucide.SlidersHorizontal,
+                label: '它什么时候来找你',
+                subtitle: '模型、给它的话、每种触发的开关和主动程度',
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const CompanionAgencySettingsPage(),
+                  ),
+                ),
+              ),
+            ],
             _iosDivider(context),
             _LocalToolRow(
               icon: Lucide.clock,

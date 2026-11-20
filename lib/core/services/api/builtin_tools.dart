@@ -1,3 +1,4 @@
+import '../../models/image_generation_options.dart';
 import '../../models/model_spec.dart';
 import '../../models/provider_oauth.dart';
 import '../../providers/settings_provider.dart';
@@ -158,6 +159,53 @@ abstract class BuiltInToolsHelper {
       ...BuiltInToolNames.parseFromOverride(cfg.modelOverrides[modelId]),
     };
   }
+
+  /// Strip tool-related overrides from an already merged custom request body.
+  static void removeToolOverrides(
+    Map<String, dynamic> body,
+    ProviderConfig cfg,
+  ) {
+    for (final key in const [
+      'tools',
+      'tool_choice',
+      'parallel_tool_calls',
+      'max_tool_calls',
+      'functions',
+      'function_call',
+      'toolConfig',
+      'tool_config',
+      'search_options',
+      'web_search_options',
+    ]) {
+      body.remove(key);
+    }
+    if (body['enable_search'] != false) body.remove('enable_search');
+    final include = body['include'];
+    if (include is List && include.contains('web_search_call.action.sources')) {
+      final remaining = include
+          .where((item) => item != 'web_search_call.action.sources')
+          .toList();
+      if (remaining.isEmpty) {
+        body.remove('include');
+      } else {
+        body['include'] = remaining;
+      }
+    }
+    final plugins = body['plugins'];
+    if (plugins is List && isOpenRouterProvider(cfg)) {
+      // An explicit disable overrides OpenRouter's account-level web plugin.
+      body['plugins'] = [
+        for (final plugin in plugins)
+          if (plugin is Map && isOpenRouterWebPlugin(plugin))
+            {...plugin, 'enabled': false}
+          else
+            plugin,
+      ];
+    }
+  }
+
+  static bool isOpenRouterWebPlugin(Map plugin) =>
+      (plugin['id'] ?? '').toString().trim().toLowerCase() == 'web';
 
   static bool isDashScopeProvider(ProviderConfig? cfg) {
     if (cfg == null) return false;
@@ -372,7 +420,11 @@ abstract class BuiltInToolsHelper {
     }
 
     if (configured.contains(BuiltInToolNames.imageGeneration)) {
-      add({'type': 'image_generation'});
+      final override = cfg.modelOverrides[modelId];
+      final options = ImageGenerationOptions.fromJson(
+        override is Map ? override['imageGeneration'] : null,
+      );
+      add({'type': 'image_generation', ...options.toJson()});
     }
     if (!configured.contains(BuiltInToolNames.search)) {
       return BuiltInToolsRequestPayload(tools: tools);
@@ -501,6 +553,34 @@ abstract class BuiltInToolsHelper {
     }
     if (!requireSupport) return true;
     return supportsBuiltInSearchForModel(cfg: cfg, modelId: modelId);
+  }
+
+  /// Whether this model request already carries a provider-native page reader.
+  static bool isBuiltInFetchEnabled({
+    required ProviderConfig? cfg,
+    required String? modelId,
+  }) {
+    if (cfg == null || modelId == null || !_isChatModel(cfg, modelId)) {
+      return false;
+    }
+    final enabled = _enabledTools(cfg, modelId);
+    final kind = ProviderConfig.classify(
+      cfg.id,
+      explicitType: cfg.providerType,
+    );
+    if (kind == ProviderKind.google) {
+      return enabled.contains(BuiltInToolNames.urlContext);
+    }
+    if (kind == ProviderKind.claude) {
+      return claudeServerToolEntries(
+        cfg: cfg,
+        modelId: modelId,
+        enabled: enabled,
+      ).any((tool) => tool['name'] == BuiltInToolNames.webFetch);
+    }
+    return kind == ProviderKind.openai &&
+        isOpenRouterProvider(cfg) &&
+        enabled.contains(BuiltInToolNames.webFetch);
   }
 
   /// Upstream model id when [cfg] talks to the official Claude API, or null

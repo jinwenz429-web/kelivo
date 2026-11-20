@@ -9,6 +9,7 @@ import 'dart:ui' as ui;
 import '../../../l10n/app_localizations.dart';
 import '../../../shared/widgets/interactive_drawer.dart';
 import '../widgets/side_drawer.dart';
+import '../widgets/conversation_title_builder.dart';
 import '../../../icons/lucide_adapter.dart';
 import '../../../core/providers/user_provider.dart';
 import '../../../core/providers/settings_provider.dart';
@@ -32,7 +33,7 @@ class HomeMobileScaffold extends StatelessWidget {
     required this.drawerController,
     required this.assistantPickerCloseTick,
     required this.loadingConversationIds,
-    required this.title,
+    required this.conversationId,
     required this.providerName,
     required this.modelDisplay,
     required this.onToggleDrawer,
@@ -40,6 +41,8 @@ class HomeMobileScaffold extends StatelessWidget {
     required this.onSelectConversation,
     required this.onNewConversation,
     required this.onOpenMiniMap,
+    required this.onStartCall,
+    required this.onOpenCallRecords,
     required this.onCreateNewConversation,
     required this.onToggleTemporaryConversation,
     required this.onSelectModel,
@@ -59,7 +62,7 @@ class HomeMobileScaffold extends StatelessWidget {
   final InteractiveDrawerController drawerController;
   final ValueNotifier<int> assistantPickerCloseTick;
   final Set<String> loadingConversationIds;
-  final String title;
+  final String? conversationId;
   final String? providerName;
   final String? modelDisplay;
   final VoidCallback onToggleDrawer;
@@ -67,6 +70,8 @@ class HomeMobileScaffold extends StatelessWidget {
   final void Function(String id) onSelectConversation;
   final VoidCallback onNewConversation;
   final VoidCallback onOpenMiniMap;
+  final VoidCallback onStartCall;
+  final VoidCallback onOpenCallRecords;
   final Future<void> Function() onCreateNewConversation;
   final Future<void> Function() onToggleTemporaryConversation;
   final VoidCallback onSelectModel;
@@ -77,7 +82,11 @@ class HomeMobileScaffold extends StatelessWidget {
   final ValueChanged<String> onGlobalSearchQueryChanged;
   final VoidCallback onEnterGlobalSearch;
   final VoidCallback onExitGlobalSearch;
-  final Future<void> Function(String conversationId, String messageId)
+  final Future<void> Function(
+    String conversationId,
+    String messageId,
+    String? surfaceKey,
+  )
   onOpenGlobalSearchResult;
   final PreferredSizeWidget? appBarOverride;
   final Widget body;
@@ -103,10 +112,15 @@ class HomeMobileScaffold extends StatelessWidget {
         onGlobalSearchQueryChanged: onGlobalSearchQueryChanged,
         onEnterGlobalSearch: onEnterGlobalSearch,
         onExitGlobalSearch: onExitGlobalSearch,
-        onOpenGlobalSearchResult: (conversationId, messageId) async {
-          await onOpenGlobalSearchResult(conversationId, messageId);
-          drawerController.close();
-        },
+        onOpenGlobalSearchResult:
+            (conversationId, messageId, surfaceKey) async {
+              await onOpenGlobalSearchResult(
+                conversationId,
+                messageId,
+                surfaceKey,
+              );
+              drawerController.close();
+            },
         onSelectConversation: (id, {closeDrawer = true}) {
           onSelectConversation(id);
           if (closeDrawer) drawerController.close();
@@ -145,6 +159,17 @@ class HomeMobileScaffold extends StatelessWidget {
     final useNewAssistantAvatarUx = context
         .watch<SettingsProvider>()
         .useNewAssistantAvatarUx;
+    final conversationTitle = ConversationTitleBuilder(
+      conversationId: conversationId,
+      isTemporary: temporaryConversationEnabled,
+      builder: (context, title) => AnimatedTextSwap(
+        text: title,
+        style: TextStyle(
+          fontSize: isDesktopPlatform ? 14 : 16,
+          fontWeight: AppFontWeights.medium,
+        ),
+      ),
+    );
 
     return AppBar(
       systemOverlayStyle: (Theme.of(context).brightness == Brightness.dark)
@@ -192,13 +217,7 @@ class HomeMobileScaffold extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      AnimatedTextSwap(
-                        text: title,
-                        style: TextStyle(
-                          fontSize: isDesktopPlatform ? 14 : 16,
-                          fontWeight: AppFontWeights.medium,
-                        ),
-                      ),
+                      conversationTitle,
                       if (providerName != null && modelDisplay != null)
                         Padding(
                           padding: const EdgeInsets.only(top: 2),
@@ -229,13 +248,7 @@ class HomeMobileScaffold extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                AnimatedTextSwap(
-                  text: title,
-                  style: TextStyle(
-                    fontSize: isDesktopPlatform ? 14 : 16,
-                    fontWeight: AppFontWeights.medium,
-                  ),
-                ),
+                conversationTitle,
                 if (providerName != null && modelDisplay != null)
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
@@ -260,6 +273,14 @@ class HomeMobileScaffold extends StatelessWidget {
               ],
             ),
       actions: [
+        IosIconButton(
+          size: 20,
+          minSize: 44,
+          onTap: onStartCall,
+          onLongPress: onOpenCallRecords,
+          semanticLabel: '打电话（长按看通话记录）',
+          icon: Lucide.Phone,
+        ),
         IosIconButton(
           size: 20,
           minSize: 44,
@@ -293,6 +314,7 @@ class HomeMobileScaffold extends StatelessWidget {
                 )
               : null,
         ),
+
         const SizedBox(width: 4),
       ],
     );

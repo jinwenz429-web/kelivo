@@ -10,8 +10,7 @@ import 'package:path_provider_platform_interface/path_provider_platform_interfac
 import 'package:Kelivo/core/models/workspace.dart';
 import 'package:Kelivo/core/models/workspace_binding.dart';
 import 'package:Kelivo/core/services/api/tool_result_content.dart';
-import 'package:Kelivo/core/services/workspace/host_file_tools.dart';
-import 'package:Kelivo/core/services/workspace/workspace_image.dart';
+import 'package:Kelivo/core/services/tool_image.dart';
 import 'package:Kelivo/core/services/workspace/workspace_paths.dart';
 import 'package:Kelivo/core/services/workspace/workspace_tools_service.dart';
 import 'package:Kelivo/utils/mcp_structured_image.dart';
@@ -163,46 +162,39 @@ void main() {
     },
   );
 
-  test(
-    'rejects disabled tools and paths escaping sandbox zones',
-    () async {
+  test('rejects disabled tools and paths escaping sandbox zones', () async {
+    expect(
+      jsonDecode(
+        (await view('x.png', ctx: context(disabled: true))).content,
+      )['error'],
+      'tool_disabled',
+    );
+    final ctx = context(sandboxed: true);
+    for (final path in [
+      '/workspace/../outside.png',
+      '/etc/passwd',
+      '/workspace/a\u0000.png',
+    ]) {
       expect(
-        jsonDecode(
-          (await view('x.png', ctx: context(disabled: true))).content,
-        )['error'],
-        'tool_disabled',
-      );
-      final ctx = context(sandboxed: true);
-      for (final path in [
-        '/workspace/../outside.png',
-        '/etc/passwd',
-        '/workspace/a\u0000.png',
-      ]) {
-        expect(
-          jsonDecode((await view(path, ctx: ctx)).content)['error'],
-          'path_error',
-        );
-      }
-      await Link(p.join(workspace.path, 'link.png')).create('/etc/hosts');
-      expect(
-        jsonDecode(
-          (await view('/workspace/link.png', ctx: ctx)).content,
-        )['error'],
+        jsonDecode((await view(path, ctx: ctx)).content)['error'],
         'path_error',
       );
-    },
-    skip: Platform.isWindows,
-  );
+    }
+    await Link(p.join(workspace.path, 'link.png')).create('/etc/hosts');
+    expect(
+      jsonDecode(
+        (await view('/workspace/link.png', ctx: ctx)).content,
+      )['error'],
+      'path_outside',
+    );
+  }, skip: Platform.isWindows);
 
   test('rejects oversized input before decoding', () async {
     final file = File(p.join(workspace.path, 'huge.png'));
     final handle = await file.open(mode: FileMode.write);
-    await handle.truncate(WorkspaceImage.maxFileBytes + 1);
+    await handle.truncate(ToolImage.maxFileBytes + 1);
     await handle.close();
-    expect(
-      () => WorkspaceImage.read(file.path),
-      throwsA(isA<HostFileException>()),
-    );
+    expect(() => ToolImage.read(file.path), throwsA(isA<ToolImageException>()));
   });
 
   test(
@@ -238,8 +230,8 @@ void main() {
       await file.writeAsBytes(
         img.encodeBmp(img.Image(width: 3000, height: 30)),
       );
-      final image = await WorkspaceImage.read(file.path);
-      expect(image.width, WorkspaceImage.maxLongEdge);
+      final image = await ToolImage.read(file.path);
+      expect(image.width, ToolImage.maxLongEdge);
       expect(image.height, 20);
       expect(image.mime, 'image/png');
       expect(img.decodePng(image.bytes), isNotNull);
@@ -296,8 +288,8 @@ void main() {
   test('very thin images retain at least one pixel after resizing', () async {
     final file = File(p.join(workspace.path, 'thin.png'));
     await file.writeAsBytes(img.encodePng(img.Image(width: 5000, height: 1)));
-    final image = await WorkspaceImage.read(file.path);
-    expect((image.width, image.height), (2048, 1));
+    final image = await ToolImage.read(file.path);
+    expect((image.width, image.height), (ToolImage.maxLongEdge, 1));
     expect(img.decodeImage(image.bytes), isNotNull);
   });
 
@@ -335,7 +327,7 @@ void main() {
     );
     final gif = img.decodeGif(await file.readAsBytes(), frame: 0)!;
     expect(gif.getPixel(0, 0).r, 255, reason: 'fixture first frame');
-    final result = await WorkspaceImage.read(file.path);
+    final result = await ToolImage.read(file.path);
     final decoded = img.decodePng(result.bytes)!;
     expect(decoded.numFrames, 1);
     expect(decoded.getPixel(0, 0).r, 255);

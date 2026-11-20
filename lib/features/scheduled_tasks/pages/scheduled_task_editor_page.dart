@@ -12,6 +12,7 @@ import '../../../desktop/widgets/desktop_scheduled_task_form.dart';
 import '../../../desktop/widgets/desktop_select_dropdown.dart';
 import '../../../shared/widgets/ios_switch.dart';
 import '../../workspace/widgets/desktop_workspace_text_field.dart';
+import '../../../core/agency/companion_wake.dart';
 import '../../../core/models/assistant.dart';
 import '../../../core/models/conversation.dart';
 import '../../../core/models/scheduled_task.dart';
@@ -103,6 +104,8 @@ class _ScheduledTaskEditorPageState extends State<ScheduledTaskEditorPage> {
       widget.task?.unavailablePolicy ?? ScheduledTaskUnavailablePolicy.skip;
   late bool notify = widget.task?.notify ?? true;
   late bool showPreview = widget.task?.showPreview ?? true;
+  late bool companionWake = widget.task?.companionWake ?? false;
+  bool get _wake => companionWake && mode == ScheduledTaskMode.followUp;
   late int preparationWindow =
       widget.task?.preparationWindowMinutes ??
       ScheduledTask.defaultPreparationWindowMinutes;
@@ -337,7 +340,9 @@ class _ScheduledTaskEditorPageState extends State<ScheduledTaskEditorPage> {
     if (name.text.trim().isEmpty ||
         name.text.trim().length > 200 ||
         assistant == null ||
-        (mode != ScheduledTaskMode.regenerate && prompt.text.trim().isEmpty) ||
+        (mode != ScheduledTaskMode.regenerate &&
+            !_wake &&
+            prompt.text.trim().isEmpty) ||
         prompt.text.trim().length > 32000 ||
         (repeat == ScheduledTaskRepeat.custom && days.isEmpty)) {
       validation = l.scheduledTasksInvalid;
@@ -381,7 +386,10 @@ class _ScheduledTaskEditorPageState extends State<ScheduledTaskEditorPage> {
         ScheduledTask(
           id: widget.task?.id ?? const Uuid().v4(),
           name: name.text.trim(),
-          prompt: prompt.text.trim(),
+          // A wake note is optional, but the schedule store requires a prompt.
+          prompt: _wake && prompt.text.trim().isEmpty
+              ? companionWakeDefaultNote
+              : prompt.text.trim(),
           assistantId: assistantId!,
           hour: minutes ~/ 60,
           minute: minutes % 60,
@@ -406,6 +414,7 @@ class _ScheduledTaskEditorPageState extends State<ScheduledTaskEditorPage> {
           unavailablePolicy: unavailablePolicy,
           notify: notify,
           showPreview: showPreview,
+          companionWake: _wake,
           preparationWindowMinutes: preparationWindow,
           maxPrepareAttempts: preparationAttempts,
           preparationCooldownMinutes: preparationCooldown,
@@ -516,6 +525,15 @@ class _ScheduledTaskEditorPageState extends State<ScheduledTaskEditorPage> {
               onTap: () => _perform(_pickConversation),
             ),
           ],
+          if (mode == ScheduledTaskMode.followUp) ...[
+            const IosRowDivider(),
+            _toggle(
+              l.scheduledTasksCompanionWake,
+              companionWake,
+              (v) => companionWake = v,
+              tip: l.scheduledTasksCompanionWakeTip,
+            ),
+          ],
           if (mode == ScheduledTaskMode.regenerate) ...[
             const IosRowDivider(),
             IosNavRow(
@@ -553,8 +571,10 @@ class _ScheduledTaskEditorPageState extends State<ScheduledTaskEditorPage> {
         SectionCard(
           children: [
             IosFormTextField(
-              label: l.scheduledTasksPrompt,
-              hintText: l.scheduledTasksPromptHint,
+              label: _wake ? l.scheduledTasksWakeNote : l.scheduledTasksPrompt,
+              hintText: _wake
+                  ? l.scheduledTasksWakeNoteHint
+                  : l.scheduledTasksPromptHint,
               controller: prompt,
               inlineLabel: false,
               minLines: 4,

@@ -1,14 +1,12 @@
 import 'agency_appraiser.dart';
 import 'agency_coordinator.dart';
 import 'agency_event.dart';
+import 'agency_settings.dart';
 
 enum AgencyIntentionAction { rest, retain, message }
 
 class AgencyIntention {
-  const AgencyIntention({
-    required this.action,
-    required this.reason,
-  });
+  const AgencyIntention({required this.action, required this.reason});
 
   final AgencyIntentionAction action;
   final String reason;
@@ -26,7 +24,10 @@ class AgencyIntention {
 class AgencyIntentionGate {
   const AgencyIntentionGate();
 
-  AgencyIntention decide(AgencyConsideration consideration) {
+  AgencyIntention decide(
+    AgencyConsideration consideration, {
+    AgencySettings settings = const AgencySettings(),
+  }) {
     final event = consideration.event;
 
     switch (event.kind) {
@@ -38,7 +39,7 @@ class AgencyIntentionGate {
             reason: 'invalid_calendar_time',
           );
         }
-        if (minutesUntil <= 45 || event.urgency >= 0.9) {
+        if (minutesUntil <= settings.calendarLeadMinutes) {
           return const AgencyIntention(
             action: AgencyIntentionAction.message,
             reason: 'calendar_near',
@@ -51,7 +52,7 @@ class AgencyIntentionGate {
 
       case AgencyEventKind.screenTimeThreshold:
         final threshold = _asInt(event.payload['thresholdMinutes']) ?? 0;
-        if (threshold >= 300) {
+        if (threshold >= settings.screenTimeHours * 60) {
           return const AgencyIntention(
             action: AgencyIntentionAction.message,
             reason: 'screen_time_high',
@@ -65,7 +66,7 @@ class AgencyIntentionGate {
       case AgencyEventKind.batteryChanged:
         final charging = event.payload['charging'] == true;
         final level = _asInt(event.payload['level']) ?? 100;
-        if (!charging && level <= 20) {
+        if (!charging && level <= settings.lowBatteryPercent) {
           return const AgencyIntention(
             action: AgencyIntentionAction.message,
             reason: 'battery_low',

@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../../../core/agency/agency_event.dart';
 import '../../../core/agency/agency_event_bus.dart';
+import '../../../core/agency/agency_settings.dart';
 import '../../../core/models/assistant.dart';
 import 'local_tools_service.dart';
 
@@ -40,8 +41,7 @@ class AgencyRealitySampler {
            calendarSupported ?? (() => DeviceLocalTools.calendarSupported),
        _locationSupported =
            locationSupported ?? (() => DeviceLocalTools.locationSupported),
-       _invokeDeviceTool =
-           invokeDeviceTool ?? DeviceLocalTools.invokeJsonTool;
+       _invokeDeviceTool = invokeDeviceTool ?? DeviceLocalTools.invokeJsonTool;
 
   final AgencyEventBus _bus;
   final AgencyPermissionCheck _hasUsageStatsPermission;
@@ -53,8 +53,7 @@ class AgencyRealitySampler {
   final AgencyDeviceInvoker _invokeDeviceTool;
   final Duration minimumInterval;
 
-  final Map<String, DateTime> _lastSampleAtByOrigin =
-      <String, DateTime>{};
+  final Map<String, DateTime> _lastSampleAtByOrigin = <String, DateTime>{};
   final Set<String> _samplingOrigins = <String>{};
 
   Future<void> sample({
@@ -70,12 +69,15 @@ class AgencyRealitySampler {
       return;
     }
 
-    final wantsCalendar =
-        assistant.localToolIds.contains(LocalToolNames.calendarQuery);
-    final wantsScreenTime =
-        assistant.localToolIds.contains(LocalToolNames.screenTime);
-    final wantsLocation =
-        assistant.localToolIds.contains(LocalToolNames.currentLocation);
+    final wantsCalendar = assistant.localToolIds.contains(
+      LocalToolNames.calendarQuery,
+    );
+    final wantsScreenTime = assistant.localToolIds.contains(
+      LocalToolNames.screenTime,
+    );
+    final wantsLocation = assistant.localToolIds.contains(
+      LocalToolNames.currentLocation,
+    );
     if (!wantsCalendar && !wantsScreenTime && !wantsLocation) return;
 
     final clock = now ?? DateTime.now();
@@ -144,7 +146,8 @@ class AgencyRealitySampler {
         '${now.year.toString().padLeft(4, '0')}-'
         '${now.month.toString().padLeft(2, '0')}-'
         '${now.day.toString().padLeft(2, '0')}';
-    const thresholds = <int>[180, 300, 420];
+    final first = AgencySettingsStore.instance.value.screenTimeHours * 60;
+    final thresholds = <int>[first, first + 120, first + 240];
     int? crossed;
     for (final threshold in thresholds) {
       if (totalMinutes >= threshold) crossed = threshold;
@@ -155,8 +158,7 @@ class AgencyRealitySampler {
       AgencyEvent(
         kind: AgencyEventKind.screenTimeThreshold,
         source: 'kelivo_screen_time',
-        dedupeKey:
-            'screen:$assistantId:$conversationId:$dayKey:$crossed',
+        dedupeKey: 'screen:$assistantId:$conversationId:$dayKey:$crossed',
         urgency: switch (crossed) {
           >= 420 => 0.82,
           >= 300 => 0.72,
@@ -199,7 +201,8 @@ class AgencyRealitySampler {
       final start = _parseDeviceDate(event['start']);
       if (start == null || start.isBefore(now)) continue;
       final until = start.difference(now);
-      if (until > const Duration(minutes: 90)) continue;
+      final lead = AgencySettingsStore.instance.value.calendarLeadMinutes;
+      if (until > Duration(minutes: lead)) continue;
 
       final key =
           '${event['id'] ?? event['title'] ?? ''}|'
@@ -210,8 +213,7 @@ class AgencyRealitySampler {
         AgencyEvent(
           kind: AgencyEventKind.calendarUpcoming,
           source: 'kelivo_calendar',
-          dedupeKey:
-              'calendar:$assistantId:$conversationId:$key',
+          dedupeKey: 'calendar:$assistantId:$conversationId:$key',
           urgency: minutesUntil <= 30 ? 0.86 : 0.74,
           payload: <String, Object?>{
             'originAssistantId': assistantId,

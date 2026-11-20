@@ -2,16 +2,17 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
 import '../database/business_preferences.dart';
 import '../database/business_repository.dart';
 import '../models/backup.dart';
 import '../services/backup/backup_cancel_token.dart';
+import '../services/backup/backup_encryption.dart';
 import '../services/backup/backup_task_progress.dart';
 import '../services/backup/data_sync.dart';
 import '../services/backup/s3_client.dart';
-import '../services/backup/temporary_restore_file.dart';
+import '../services/backup/backup_staging.dart';
+import '../services/backup/backup_partials.dart';
 import '../services/chat/chat_service.dart';
 
 class S3BackupProvider extends ChangeNotifier {
@@ -32,7 +33,7 @@ class S3BackupProvider extends ChangeNotifier {
          businessRepository: businessRepository,
          businessPreferences: businessPreferences,
        ),
-       _client = const S3BackupClient(),
+       _client = S3BackupClient(partials: BackupPartials(businessPreferences)),
        _cfg = initialConfig ?? const S3Config();
 
   S3Config get config => _cfg;
@@ -62,26 +63,12 @@ class S3BackupProvider extends ChangeNotifier {
     return path;
   }
 
-  Future<Directory> _ensureTempDir() async {
-    Directory dir = await getTemporaryDirectory();
-    if (!await dir.exists()) {
-      try {
-        await dir.create(recursive: true);
-      } catch (_) {}
-    }
-    if (!await dir.exists()) {
-      dir = await Directory.systemTemp.createTemp('kelivo_tmp_');
-    }
-    return dir;
+  WebDavConfig _scopeAsWebdavConfig() {
+    // DataSync uses the same selection for local, WebDAV and S3 backups.
+    return WebDavConfig(scope: _cfg.scope);
   }
 
-  WebDavConfig _scopeAsWebdavConfig() {
-    // DataSync currently uses WebDavConfig for include flags; other fields are ignored.
-    return WebDavConfig(
-      includeChats: _cfg.includeChats,
-      includeFiles: _cfg.includeFiles,
-    );
-  }
+  Future<void> cleanPartials(S3Config cfg) => _client.cleanPartials(cfg);
 
   Future<void> test() async {
     _busy = true;
@@ -99,6 +86,7 @@ class S3BackupProvider extends ChangeNotifier {
   }
 
   Future<bool> backup({
+    String? password,
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
   }) async {
@@ -106,17 +94,19 @@ class S3BackupProvider extends ChangeNotifier {
     _message = null;
     notifyListeners();
     File? file;
+    final cfg = _cfg;
     try {
       file = await _dataSync.prepareBackupFile(
-        _scopeAsWebdavConfig(),
+        WebDavConfig(scope: cfg.scope),
+        password: password,
         onProgress: onProgress,
         cancelToken: cancelToken,
       );
-      final prefix = _normalizePrefix(_cfg.prefix);
+      final prefix = _normalizePrefix(cfg.prefix);
       final key = '$prefix${p.basename(file.path)}';
       // Use file-stream upload to avoid loading entire ZIP into memory.
       await _client.uploadFile(
-        _cfg,
+        cfg,
         key: key,
         file: file,
         onProgress: onProgress,
@@ -152,6 +142,7 @@ class S3BackupProvider extends ChangeNotifier {
     BackupProgressSink? onProgress,
     BackupCancelToken? cancelToken,
     ForwardCompatibilityPrompt? onForwardCompatibility,
+    BackupPasswordPrompt? onPassword,
   }) async {
     _busy = true;
     _message = null;
@@ -159,8 +150,7 @@ class S3BackupProvider extends ChangeNotifier {
     File? file;
     try {
       final key = _keyFromItem(item);
-      final tmp = await _ensureTempDir();
-      file = await createTemporaryRestoreFile(tmp);
+      file = await BackupStaging.createDownload();
       // Download directly to file to avoid holding entire object in memory.
       await _client.downloadToFile(
         _cfg,
@@ -177,6 +167,8 @@ class S3BackupProvider extends ChangeNotifier {
         onProgress: onProgress,
         cancelToken: cancelToken,
         onForwardCompatibility: onForwardCompatibility,
+        onPassword: onPassword,
+        requireEncrypted: key.toLowerCase().endsWith('.kbackup'),
       );
       _message = 'Restored';
     } catch (e) {
@@ -184,6 +176,7 @@ class S3BackupProvider extends ChangeNotifier {
       _message = e.toString();
       rethrow;
     } finally {
+      if (file != null) BackupStaging.release(file.path);
       try {
         if (file != null && await file.exists()) {
           await file.delete();

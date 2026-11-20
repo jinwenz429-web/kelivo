@@ -1,6 +1,8 @@
 import 'dart:convert';
 
 import 'app_database.dart';
+import '../models/backup_scope.dart';
+import 'backup_content_filter.dart';
 import 'business_data.dart';
 import 'business_repository.dart';
 
@@ -9,13 +11,25 @@ final class BackupPortability {
   BackupPortability._();
 
   static const devicePreferenceKeys = {
+    'backup_encryption_enabled_v1',
+    'backup_auto_enabled_v1',
+    'backup_auto_destination_v1',
+    'backup_auto_last_destination_v1',
+    'backup_auto_local_dir_v1',
+    'backup_auto_local_bookmark_v1',
+    'backup_auto_local_retention_v1',
+    'backup_password_forget_pending_v1',
+    'backup_password_remember_manual_v1',
+    'backup_password_verifier_v1',
+    'backup_install_id_v1',
+    'backup_outstanding_partial_v1',
     'desktop_scheduled_tasks_v1',
     'scheduled_task_results_v1',
     'environment_state_v1',
     'environment_disk_usage_v1',
     'environment_rootfs_selection_v1',
     'environment_proot_options_v1',
-    'environment_variables_v1',
+    'environment_native_shell_path_v1',
   };
 
   static bool _isLinked(BusinessEntityValue row) =>
@@ -85,13 +99,19 @@ final class BackupPortability {
 
   /// Only call on a temporary database, never the live database. This also
   /// handles old backups whose raw SQLite payload still has device-only rows.
-  static Future<void> sanitizeDatabase(AppDatabase database) async {
+  static Future<void> sanitizeDatabase(
+    AppDatabase database, {
+    BackupScope scope = const BackupScope(),
+  }) async {
     // Erase removed payloads from SQLite cells as well as its logical rows.
     await database.customStatement('PRAGMA secure_delete = ON;');
     await database.transaction(() async {
-      await BusinessRepository(database).transformSnapshot(portable);
+      await BusinessRepository(database).transformSnapshot(
+        (snapshot) =>
+            portable(BackupContentFilter.selectSnapshot(snapshot, scope)),
+      );
       await database.customStatement(
-        "DELETE FROM extension_entity_rows WHERE kind = 'externalMounts';",
+        "DELETE FROM extension_entity_rows WHERE kind IN ('externalMounts', 'composerDraft', 'composerNewEntry', 'composerShareReceipt', 'composerPrivateFile');",
       );
       // Chat history remains readable, but imported chats cannot inherit a
       // directory grant or silently authorize shell execution on this device.
@@ -105,12 +125,13 @@ final class BackupPortability {
             )
           THEN json_remove(extras_json, '\$."workspace.id"',
             '\$."workspace.cwd"', '\$."workspace.tools_used"',
-            '\$."workspace.allowAll"')
-          ELSE json_remove(extras_json, '\$."workspace.allowAll"')
+            '\$."workspace.allowAll"', '\$."tools.permission_mode"')
+          ELSE json_remove(extras_json, '\$."workspace.allowAll"', '\$."tools.permission_mode"')
         END
         WHERE json_valid(extras_json)
           AND (json_type(extras_json, '\$."workspace.id"') IS NOT NULL
-            OR json_type(extras_json, '\$."workspace.allowAll"') IS NOT NULL);
+            OR json_type(extras_json, '\$."workspace.allowAll"') IS NOT NULL
+            OR json_type(extras_json, '\$."tools.permission_mode"') IS NOT NULL);
       ''');
     });
   }

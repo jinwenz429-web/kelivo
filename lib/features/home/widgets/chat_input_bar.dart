@@ -1,4 +1,21 @@
+import '../../../shared/utils/attachment_read_labels.dart';
+import '../../../core/models/image_edit_document.dart';
+import '../../chat/pages/image_viewer_page.dart';
+import '../../chat/pages/image_editor_page.dart';
+import '../../chat/models/image_viewer_draft_mode.dart';
+import '../../chat/utils/image_edit_renderer.dart';
+import '../../../core/models/compression_config.dart';
+import '../../../core/services/chat/chat_service.dart';
+import '../../chat/controllers/quote_editing_controller.dart';
+import '../../intelligent_ui/models/ui_context_attachment.dart';
+import '../../intelligent_ui/host/ui_composer_context_chip.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+import '../../../theme/app_semantic_colors.dart';
+import 'package:Kelivo/features/chat/widgets/tool_permission_widgets.dart';
+import '../services/composer_clipboard.dart';
+import 'package:Kelivo/shared/text_input/message_editing_controller.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, listEquals;
 import 'package:flutter/rendering.dart';
 import '../../../core/services/incoming_share_service.dart';
 import 'composer_attachment_card.dart';
@@ -21,6 +38,7 @@ import '../../../shared/responsive/breakpoints.dart';
 import 'dart:async';
 import 'dart:io';
 import '../../../core/models/chat_input_data.dart';
+import '../../../core/models/quote_ref.dart';
 import '../../../core/models/model_spec.dart';
 import '../../../core/models/reasoning_request.dart';
 import '../../../core/services/api/reasoning/reasoning_level_options.dart';
@@ -41,27 +59,178 @@ import '../../../shared/widgets/interactive_drawer.dart';
 import '../../../shared/widgets/ios_tactile.dart';
 import '../../../shared/widgets/snackbar.dart';
 import '../../../utils/app_directories.dart';
+import '../../../utils/platform_utils.dart';
 import 'package:super_clipboard/super_clipboard.dart';
+import 'package:re_editor/re_editor.dart' show CodeEditorTapRegion;
 import '../../../desktop/desktop_context_menu.dart';
 import '../../../shared/widgets/context_usage_ring.dart';
+import '../../../shared/widgets/long_message_editor.dart';
+import '../../../shared/widgets/app_text_selection_toolbar.dart';
 import '../services/context_usage_service.dart';
+import '../services/composer_document_route.dart';
+import '../../../core/services/chat/document_text_extractor.dart';
 import 'package:Kelivo/theme/app_font_weights.dart';
+import '../../../core/models/composer_draft.dart';
+import '../../../core/database/composer_draft_store.dart';
 
 class ChatInputBarController {
+  ChatInputBarController();
+  late final DocumentExtractionCache documentCache = DocumentExtractionCache();
+  ChatInputBarController._captured(
+    this._origin,
+    this._owner,
+    this._edit,
+    this._inputEpoch, {
+    this.persistent = true,
+  });
+  ChatInputBarController? _origin;
+  String? _owner;
+  String? _edit;
+  int? _inputEpoch;
+  ChatInputBarController get _root => _origin ?? this;
+  bool persistent = false;
+  int _localInputEpoch = 0;
+  bool get isValid {
+    if (_origin == null) return true;
+    if (!persistent) {
+      return _root._localInputEpoch == _inputEpoch &&
+          _root.draftOwnerId == _owner;
+    }
+    return _root.draftStore?.isInputCurrent(
+          _owner!,
+          _inputEpoch!,
+          editMessageId: _edit,
+        ) ??
+        false;
+  }
+
+  bool get _currentTarget =>
+      isValid &&
+      _root.isAttached &&
+      !_root.restoringDraft &&
+      (_origin == null ||
+          (_root.draftOwnerId == _owner &&
+              (!persistent ||
+                  _root.draftStore?.peek(_owner!)?.editMessageId == _edit)));
+  ChatInputBarController capture() {
+    final owner = _root.draftOwnerId;
+    if (owner == null || _root.draftStore?.peek(owner) == null) {
+      return ChatInputBarController._captured(
+        _root,
+        owner,
+        null,
+        _root._localInputEpoch,
+        persistent: false,
+      );
+    }
+    final edit = _root.draftStore?.peek(owner)?.editMessageId;
+    return ChatInputBarController._captured(
+      _root,
+      owner,
+      edit,
+      _root.draftStore?.inputEpoch(owner, editMessageId: edit) ?? 0,
+    );
+  }
+
+  void _mutate(ComposerDraftInput Function(ComposerDraftInput) change) {
+    final owner = _owner ?? draftOwnerId;
+    if (!isValid) return;
+    if (owner == null ||
+        (_origin != null && !persistent) ||
+        _root.draftStore?.peek(owner) == null) {
+      final root = _root;
+      final next = change(
+        root.snapshotDraft(
+          root._state?._controller.text ?? root._pendingDraft?.text ?? '',
+        ),
+      );
+      root.restoreDraft(next, resetHistory: false);
+      root.onDraftChanged?.call();
+      return;
+    }
+    final edit = _origin == null
+        ? _root.draftStore?.peek(owner)?.editMessageId
+        : _edit;
+    _root.draftStore?.mutateCaptured(
+      owner,
+      _inputEpoch ?? _root.draftStore!.inputEpoch(owner, editMessageId: edit),
+      edit,
+      change,
+    );
+    if (_root._state == null &&
+        _root.draftOwnerId == owner &&
+        _root.draftStore?.peek(owner)?.editMessageId == edit) {
+      _root._pendingDraft = _root.draftStore?.peek(owner)?.active;
+    }
+  }
+
+  ComposerDraftStore? draftStore;
+  String? draftOwnerId;
+  bool _restoringDraft = false;
+  // An overwrite pauses editing independently of an in-progress/failed load.
+  // Releasing that pause must not change the draft restoration state.
+  bool get restoringDraft => _restoringDraft || draftStore?.suspended == true;
+  set restoringDraft(bool value) => _restoringDraft = value;
+  VoidCallback? onDraftChanged;
+  VoidCallback? onRecoverDraft;
+  VoidCallback? onDiscardRecoveredDraft;
+  VoidCallback? onRetrySave;
+  Future<DraftSubmission?> Function(ComposerDraftInput)? onBeginSubmission;
+  ComposerDraftInput snapshotDraft(String text) =>
+      _state?._snapshotDraft(text) ??
+      _pendingDraft?.copyWith(text: text) ??
+      ComposerDraftInput(text: text);
+  ComposerDraftInput? _pendingDraft;
+  void restoreDraft(ComposerDraftInput input, {bool resetHistory = true}) {
+    if (resetHistory) _localInputEpoch++;
+    if (_state == null) {
+      _pendingDraft = input;
+    } else {
+      _state!._restoreDraft(input, resetHistory: resetHistory);
+    }
+  }
+
+  Future<Directory> uploadDirectory() =>
+      _root.draftStore != null && (_owner ?? _root.draftOwnerId) != null
+      ? _root.draftStore!.directoryFor((_owner ?? _root.draftOwnerId)!)
+      : AppDirectories.getUploadDirectory();
   final shareImport = ValueNotifier<ShareImportProgress?>(null);
   final sharedDraftAction = ValueNotifier<VoidCallback?>(null);
   VoidCallback? cancelShareImport;
 
   _ChatInputBarState? _state;
-  void _bind(_ChatInputBarState s) => _state = s;
-  void _unbind(_ChatInputBarState s) {
-    if (identical(_state, s)) _state = null;
+  void _bind(_ChatInputBarState s) {
+    _state = s;
+    final pending = _pendingDraft;
+    _pendingDraft = null;
+    if (pending != null) s._restoreDraft(pending);
   }
 
-  bool get allowImagesApiRouting => _state?._allowImagesApiRouting ?? true;
+  void _unbind(_ChatInputBarState s) {
+    if (!identical(_state, s)) return;
+    _pendingDraft = s._snapshotDraft(s._controller.text);
+    _state = null;
+  }
+
+  bool get allowImagesApiRouting =>
+      _state?._allowImagesApiRouting ??
+      _pendingDraft?.allowImagesApiRouting ??
+      true;
   bool get isAttached => _state != null;
-  bool get hasDraftMedia => _state?._hasDraftMedia ?? false;
-  bool get hasUnreadyImages => _state?._hasUnreadyImages ?? false;
+  bool get hasDraftMedia =>
+      _state?._hasDraftMedia ??
+      ((_pendingDraft?.images.isNotEmpty ?? false) ||
+          (_pendingDraft?.documents.isNotEmpty ?? false));
+  void finishInputSession() {
+    final state = _root._state;
+    state?._nativeOwner?.detachView();
+    state?._abandonVoiceSession();
+  }
+
+  bool get hasUnreadyImages =>
+      _state?._hasUnreadyImages ??
+      (_pendingDraft?.images.any((image) => image.processing || image.failed) ??
+          false);
 
   /// Snapshot for comparing media across an asynchronous draft handoff.
   /// Unlike snapshotInput, this includes unready images and pending pastes.
@@ -78,30 +247,434 @@ class ChatInputBarController {
     ];
   }
 
-  void addImages(List<String> paths) => _state?._addImages(paths);
+  void addImages(List<String> paths) {
+    if (_currentTarget) {
+      _root._state?._addImages(paths);
+    } else {
+      _mutate(
+        (input) => input.copyWith(
+          images: [
+            ...input.images,
+            for (final path in paths) DraftImage(path: path, sourcePath: path),
+          ],
+        ),
+      );
+    }
+  }
+
   void enqueueImages(
     List<String> paths,
     ImageCompressConfig config, {
     bool deleteSourcesAfterProcessing = false,
-  }) => _state?._enqueueImages(
-    paths,
-    config,
-    deleteSourcesAfterProcessing: deleteSourcesAfterProcessing,
-  );
+    Map<int, ImageEditDocument> editsByIndex = const {},
+  }) {
+    if (_currentTarget) {
+      _root._state?._enqueueImages(
+        paths,
+        config,
+        deleteSourcesAfterProcessing: deleteSourcesAfterProcessing,
+        editsByIndex: editsByIndex,
+      );
+    } else {
+      _mutate(
+        (input) => input.copyWith(
+          images: [
+            ...input.images,
+            for (final (index, path) in paths.indexed)
+              DraftImage(
+                path: path,
+                sourcePath: path,
+                edits: editsByIndex[index] ?? const ImageEditDocument(),
+                processing: true,
+              ),
+          ],
+        ),
+      );
+      unawaited(
+        _processCapturedImages(
+          paths,
+          config,
+          deleteSourcesAfterProcessing,
+          editsByIndex,
+        ),
+      );
+    }
+  }
+
+  Future<void> _processCapturedImages(
+    List<String> paths,
+    ImageCompressConfig config,
+    bool deleteSources,
+    Map<int, ImageEditDocument> editsByIndex,
+  ) async {
+    for (final (index, path) in paths.indexed) {
+      final edits = editsByIndex[index] ?? const ImageEditDocument();
+      UploadWrite? saved;
+      String? original;
+      UploadWrite? sourceCopy;
+      try {
+        final prepared = await ImageEditRenderer.prepareDraft(
+          path,
+          await uploadDirectory(),
+          config,
+          edits,
+          ownsSource: deleteSources,
+          reuseSourceInPlace: persistent,
+        );
+        sourceCopy = prepared?.source;
+        original = sourceCopy?.path;
+        saved = prepared?.image;
+      } catch (_) {}
+      _replaceProcessedImage(path, saved?.path, edits, originalPath: original);
+      if (persistent) {
+        await _root.draftStore!.releaseReplacedFiles(_owner!, [
+          path,
+          for (final write in [sourceCopy, saved].whereType<UploadWrite>())
+            if (!write.reused) write.path,
+        ]);
+      } else if (!isValid) {
+        for (final write in [sourceCopy, saved].whereType<UploadWrite>()) {
+          if (!write.reused) {
+            await UploadDedupe.deleteIfUnshared(write.path);
+          }
+        }
+      }
+      // Private source copies are reclaimed after a later durable snapshot.
+      if (deleteSources &&
+          original != path &&
+          _root.draftStore == null &&
+          saved?.path != path &&
+          saved != null) {
+        await UploadDedupe.deleteIfUnshared(path);
+      }
+    }
+  }
+
+  void _replaceProcessedImage(
+    String source,
+    String? result,
+    ImageEditDocument edits, {
+    String? originalPath,
+  }) {
+    _mutate(
+      (input) => input.copyWith(
+        images: [
+          for (final image in input.images)
+            if ((image.path == source ||
+                    (_owner != null &&
+                        (_root.draftStore?.sameOwnedFile(
+                              _owner!,
+                              image.path,
+                              source,
+                            ) ??
+                            false))) &&
+                image.processing &&
+                image.edits.sameValue(edits))
+              image.copyWith(
+                path: result ?? source,
+                sourcePath: originalPath ?? image.sourcePath ?? source,
+                processing: false,
+                failed: result == null,
+              )
+            else
+              image,
+        ],
+      ),
+    );
+  }
+
   void clearImages() => _state?._clearImages();
-  void addFiles(List<DocumentAttachment> docs) => _state?._addFiles(docs);
+  void addFiles(List<DocumentAttachment> docs) {
+    if (_currentTarget) {
+      _root._state?._addFiles(docs);
+    } else {
+      _mutate(
+        (input) => input.copyWith(documents: [...input.documents, ...docs]),
+      );
+    }
+  }
+
+  void insertText(String text) {
+    text = text.replaceAll(quotePlaceholder, '');
+    if (_currentTarget) {
+      _root._state?._insertPastedText(text);
+    } else {
+      _mutate(
+        (input) => input.copyWith(
+          text: input.text + text,
+          selectionBase: input.text.length + text.length,
+          selectionExtent: input.text.length + text.length,
+        ),
+      );
+    }
+  }
+
   void clearFiles() => _state?._clearFiles();
   void restoreInput(ChatInputData input) => _state?._restoreInput(input);
-  ChatInputData snapshotInput(String text) =>
-      _state?._snapshotInput(text) ?? ChatInputData(text: text.trim());
-  void clearDraft() => _state?._clearDraft();
+  ChatInputData snapshotInput(String text) {
+    if (_state != null) return _state!._snapshotInput(text);
+    final draft = snapshotDraft(text);
+    return ChatInputData(
+      text: text.trim(),
+      imagePaths: [
+        for (final image in draft.images)
+          if (!image.processing && !image.failed) image.path,
+      ],
+      documents: draft.documents,
+      allowImagesApiRouting: draft.allowImagesApiRouting,
+      uiContext: draft.uiContext,
+      quotes: draft.quotes,
+    );
+  }
+
+  bool get hasUiContext =>
+      (_state?._uiContext ?? _pendingDraft?.uiContext) != null;
+
+  bool get isComposing =>
+      !(_root._state?._controller.value.composing.isCollapsed ?? true);
+
+  bool get _canStageDraft {
+    final state = _root._state;
+    return _currentTarget &&
+        state != null &&
+        !state._composerLocked &&
+        !state._isSubmitting &&
+        !state._ownsVoiceSession &&
+        !state._finishingVoice &&
+        (state._nativeOwner?.pending ?? 0) == 0 &&
+        !(state._controller is MessageEditingController &&
+            (state._controller as MessageEditingController).isInputPaused);
+  }
+
+  /// Flush accepted native work before a preview. A captured controller can
+  /// only stage into the still-visible owner/edit/input epoch.
+  Future<ComposerDraftInput?> prepareExternalDraft() async {
+    if (!_canStageDraft) return null;
+    final state = _root._state!;
+    final value = await state._controller.flushMessageInput();
+    if (!_canStageDraft ||
+        !identical(state, _root._state) ||
+        !value.composing.isCollapsed) {
+      return null;
+    }
+    return state._snapshotDraft(value.text);
+  }
+
+  bool applyExternalDraft(
+    ComposerDraftInput expected,
+    ComposerDraftInput next,
+  ) {
+    if (!_canStageDraft) return false;
+    final state = _root._state!;
+    if (!state._controller.value.composing.isCollapsed ||
+        !state._snapshotDraft(state._controller.text).sameValue(expected)) {
+      return false;
+    }
+    state.setState(() {
+      state._uiContext = next.uiContext;
+      state._controller.value = TextEditingValue(
+        text: next.text,
+        selection: TextSelection.collapsed(offset: next.text.length),
+      );
+    });
+    _root.onDraftChanged?.call();
+    // A draft can be prepared from an expanded UI route. Keep that route's
+    // keyboard focus until it closes; a covered composer must not steal Esc.
+    if (ModalRoute.of(state.context)?.isCurrent != false) {
+      state.widget.focusNode?.requestFocus();
+    }
+    return true;
+  }
+
+  void clearDraft() {
+    _localInputEpoch++;
+    final owner = draftOwnerId;
+    if (owner != null) {
+      draftStore?.invalidateInputOperations(
+        owner,
+        editMessageId: draftStore?.peek(owner)?.editMessageId,
+      );
+    }
+    _state?._clearDraft();
+  }
+}
+
+/// Keeps accepted clipboard/content work alive without retaining a renderer's
+/// context. View-only commands are detached when their composer goes away;
+/// the untouched document is then saved by its owner instead of sent elsewhere.
+class _NativeComposerOwner extends ChangeNotifier {
+  _NativeComposerOwner(this.document, this.media, this.conversationId);
+  final MessageEditingController document;
+  final ChatInputBarController media;
+  final String? conversationId;
+  late ImageCompressConfig config;
+  bool longPasteAsFile = false;
+  int longPasteThreshold = 0;
+  int pending = 0;
+  ValueChanged<TextEditingValue>? submit;
+  VoidCallback? escape;
+
+  void detachView() {
+    submit = null;
+    escape = null;
+  }
+
+  Future<void> command(String command, TextEditingValue snapshot) async {
+    switch (command) {
+      case 'submit':
+        if (pending == 0) submit?.call(snapshot);
+      case 'escape':
+        if (snapshot.composing.isCollapsed) escape?.call();
+      case 'paste':
+        final target = media.capture();
+        final compression = config;
+        final asFile = longPasteAsFile;
+        final threshold = longPasteThreshold;
+        pending++;
+        notifyListeners();
+        try {
+          final data = await ComposerClipboard.read();
+          if (!target.isValid) return;
+          if (data.bytes != null) {
+            await _registerImage(
+              target,
+              compression,
+              data.format!,
+              data.bytes!,
+            );
+          } else if (data.paths.isNotEmpty) {
+            target.enqueueImages(
+              data.paths,
+              compression,
+              deleteSourcesAfterProcessing: true,
+            );
+          } else if (data.text case final text? when text.isNotEmpty) {
+            await _registerText(target, text, asFile, threshold);
+          }
+        } on PlatformException catch (error) {
+          debugPrint('Clipboard paste failed: $error');
+        } on FileSystemException catch (error) {
+          debugPrint('Clipboard attachment failed: $error');
+        } finally {
+          pending--;
+          notifyListeners();
+        }
+    }
+  }
+
+  Future<void> insertContent(KeyboardInsertedContent content) async {
+    final format = switch (content.mimeType.toLowerCase()) {
+      'image/png' => 'png',
+      'image/jpeg' || 'image/jpg' => 'jpg',
+      'image/gif' => 'gif',
+      'image/webp' => 'webp',
+      _ => null,
+    };
+    final bytes = content.data;
+    if (format == null || bytes == null || bytes.isEmpty) return;
+    final target = media.capture();
+    final compression = config;
+    pending++;
+    notifyListeners();
+    try {
+      await _registerImage(target, compression, format, bytes);
+    } on FileSystemException catch (error) {
+      debugPrint('Keyboard attachment failed: $error');
+    } finally {
+      pending--;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _registerImage(
+    ChatInputBarController target,
+    ImageCompressConfig compression,
+    String format,
+    Uint8List bytes,
+  ) async {
+    final file = await ComposerClipboard.reserve(
+      await target.uploadDirectory(),
+      'paste',
+      format == 'jpeg' ? 'jpg' : format,
+    );
+    var registered = false;
+    try {
+      await file.writeAsBytes(bytes, flush: true);
+      if (!target.isValid) return;
+      target.enqueueImages(
+        [file.path],
+        compression,
+        deleteSourcesAfterProcessing: true,
+      );
+      registered = true;
+    } finally {
+      if (!registered) await ComposerClipboard.discard(file);
+    }
+  }
+
+  Future<void> _registerText(
+    ChatInputBarController target,
+    String text,
+    bool asFile,
+    int threshold,
+  ) async {
+    if (asFile && text.characters.take(threshold + 1).length > threshold) {
+      File? file;
+      var registered = false;
+      try {
+        file = await ComposerClipboard.reserve(
+          await target.uploadDirectory(),
+          'pasted',
+          'txt',
+        );
+        await file.writeAsString(text, flush: true);
+        if (!target.isValid) return;
+        target.addFiles([
+          DocumentAttachment(
+            path: file.path,
+            fileName: p.basename(file.path),
+            mime: 'text/plain',
+          ),
+        ]);
+        registered = true;
+        return;
+      } on FileSystemException {
+        // Preserve text if creating a text attachment fails.
+      } finally {
+        if (!registered && file != null) await ComposerClipboard.discard(file);
+      }
+    }
+    if (!target.isValid) return;
+    final range = document.selection.isValid
+        ? document.selection
+        : TextSelection.collapsed(offset: document.text.length);
+    document.value = document.value
+        .replaced(range, text)
+        .copyWith(composing: TextRange.empty);
+  }
 }
 
 class _DraftImage {
-  _DraftImage({required this.id, required this.path});
+  _DraftImage({
+    required this.id,
+    required this.path,
+    this.sourcePath,
+    bool? sourceIsOriginal,
+    this.edits = const ImageEditDocument(),
+    this.quality,
+    this.customQuality,
+  }) : sourceIsOriginal = sourceIsOriginal ?? (sourcePath != null);
 
   final int id;
   String path;
+  String? sourcePath;
+  final bool sourceIsOriginal;
+  final ownedFiles = <String>{};
+  bool changingQuality = false;
+  ImageEditDocument edits;
+  ImageUploadQuality? quality;
+  int? customQuality;
+  int qualityRevision = 0;
 }
 
 class _ImageProcessingTask {
@@ -109,16 +682,28 @@ class _ImageProcessingTask {
     required this.id,
     required this.sourcePath,
     required this.config,
+    required this.edits,
     required this.deleteSourceAfterProcessing,
+    this.target,
   });
 
   final int id;
   final String sourcePath;
   final ImageCompressConfig config;
+  final ImageEditDocument edits;
+  final ChatInputBarController? target;
 
   /// Only ever true for app-owned temp sources (clipboard paste temps);
   /// user-picked files must never be flagged for deletion.
   final bool deleteSourceAfterProcessing;
+}
+
+class _DocumentCheck {
+  _DocumentCheck(this.file);
+  final DocumentAttachment file;
+  bool pending = true;
+  AttachmentReadError? error;
+  int? truncatedCount;
 }
 
 class ChatInputBar extends StatefulWidget {
@@ -135,11 +720,13 @@ class ChatInputBar extends StatefulWidget {
     this.onOpenWorkspace,
     this.showWorkspaceButton = false,
     this.workspaceActive = false,
+    this.documentRoute = regularDocumentRoute,
     this.onOpenSkills,
     this.skillsActive = false,
     this.onOpenSearch,
     this.onMore,
     this.onConfigureReasoning,
+    this.reasoningButtonKey,
     this.onOpenContextUsage,
     this.moreOpen = false,
     this.focusNode,
@@ -150,6 +737,9 @@ class ChatInputBar extends StatefulWidget {
     this.loading = false,
     this.hasQueuedInput = false,
     this.queuedPreviewText,
+    this.queuedStatusLabel,
+    this.queuedSubtitle,
+    this.queuedPaused = false,
     this.onCancelQueuedInput,
     this.onExpandedChanged,
     this.reasoningActive = false,
@@ -158,15 +748,18 @@ class ChatInputBar extends StatefulWidget {
     this.supportsReasoning = true,
     this.showToolsButton = false,
     this.toolsActive = false,
+    this.toolsConnectionIssue = false,
     this.showMiniMapButton = false,
     this.onOpenMiniMap,
     this.onPickCamera,
     this.onPickPhotos,
     this.onUploadFiles,
+    this.onOpenBrowser,
     this.onToggleLearningMode,
     this.onOpenWorldBook,
     this.onClearContext,
     this.onCompressContext,
+    this.onContextOperations,
     this.onLongPressLearning,
     this.learningModeActive = false,
     this.worldBookActive = false,
@@ -195,11 +788,13 @@ class ChatInputBar extends StatefulWidget {
   final VoidCallback? onOpenWorkspace;
   final bool showWorkspaceButton;
   final bool workspaceActive;
+  final ComposerDocumentRoute documentRoute;
   final VoidCallback? onOpenSkills;
   final bool skillsActive;
   final VoidCallback? onOpenSearch;
   final VoidCallback? onMore;
   final VoidCallback? onConfigureReasoning;
+  final GlobalKey? reasoningButtonKey;
   final VoidCallback? onOpenContextUsage;
   final bool moreOpen;
   final FocusNode? focusNode;
@@ -210,6 +805,9 @@ class ChatInputBar extends StatefulWidget {
   final bool loading;
   final bool hasQueuedInput;
   final String? queuedPreviewText;
+  final String? queuedStatusLabel;
+  final String? queuedSubtitle;
+  final bool queuedPaused;
   final VoidCallback? onCancelQueuedInput;
 
   /// Reports when the composer starts filling the chat area and when it has
@@ -221,15 +819,18 @@ class ChatInputBar extends StatefulWidget {
   final bool supportsReasoning;
   final bool showToolsButton;
   final bool toolsActive;
+  final bool toolsConnectionIssue;
   final bool showMiniMapButton;
   final VoidCallback? onOpenMiniMap;
   final VoidCallback? onPickCamera;
   final VoidCallback? onPickPhotos;
   final VoidCallback? onUploadFiles;
+  final VoidCallback? onOpenBrowser;
   final VoidCallback? onToggleLearningMode;
   final VoidCallback? onOpenWorldBook;
   final VoidCallback? onClearContext;
   final VoidCallback? onCompressContext;
+  final VoidCallback? onContextOperations;
   final VoidCallback? onLongPressLearning;
   final bool learningModeActive;
   final bool worldBookActive;
@@ -257,6 +858,12 @@ class ChatInputBar extends StatefulWidget {
 
 class _ChatInputBarState extends State<ChatInputBar>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
+  @override
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    widget.mediaController?.onDraftChanged?.call();
+  }
+
   late TextEditingController _controller;
 
   // Expanding grows the whole composer to fill the height its host allows,
@@ -273,6 +880,23 @@ class _ChatInputBarState extends State<ChatInputBar>
   InteractiveDrawerController? _hostDrawer;
   final GlobalKey _composerKey = GlobalKey();
   final GlobalKey _textAreaKey = GlobalKey();
+  var _longEditorKey = GlobalKey<LongMessageEditorState>();
+
+  void _resetInputHistory() {
+    final controller = _controller;
+    if (controller is MessageEditingController && controller.history != null) {
+      controller.resetHistory();
+    } else {
+      // The stock backend owns history in its widget tree. Replace that tree
+      // together with its render bindings, as before the Android transport.
+      _longEditorKey = GlobalKey<LongMessageEditorState>();
+    }
+  }
+
+  final _ownedNativeMedia = ChatInputBarController();
+  _NativeComposerOwner? _nativeOwner;
+  ChatInputBarController get _nativeMedia =>
+      widget.mediaController ?? _ownedNativeMedia;
   late final AnimationController _expandController = AnimationController(
     vsync: this,
     duration: const Duration(milliseconds: 320),
@@ -316,6 +940,8 @@ class _ChatInputBarState extends State<ChatInputBar>
   Future<void> _textPasteWriteTail = Future<void>.value();
   final List<DocumentAttachment> _docs =
       <DocumentAttachment>[]; // files to upload
+  final _documentChecks = <String, _DocumentCheck>{};
+  bool _checkingDocuments = false;
   final Map<LogicalKeyboardKey, Timer?> _repeatTimers = {};
   static const Duration _repeatInitialDelay = Duration(milliseconds: 300);
   static const Duration _repeatPeriod = Duration(milliseconds: 35);
@@ -326,16 +952,23 @@ class _ChatInputBarState extends State<ChatInputBar>
   final GlobalKey _contextMgmtAnchorKey = GlobalKey(
     debugLabel: 'context-mgmt-anchor',
   );
+  bool _contextManagementMenuOpen = false;
+  bool _savingAutoCompression = false;
   static const double _imageRemoveButtonSize = 18;
   // Suppress context menu briefly after app resume to avoid flickering
   bool _suppressContextMenu = false;
+  UiContextAttachment? _uiContext;
   bool _isSubmitting = false;
   int _submitSerial = 0;
   String? _imageModeModelKey;
   String? _lastImageModeModelKey;
   String? _dismissedImageModeModelKey;
+  bool? _restoredRoutingChoice;
+  final Set<String> _missingDocumentPaths = {};
 
-  bool get _composerLocked => widget.hasQueuedInput;
+  bool get _composerLocked =>
+      widget.hasQueuedInput ||
+      (widget.mediaController?.restoringDraft ?? false);
 
   Color _inputFillColor({
     required ThemeData theme,
@@ -385,6 +1018,10 @@ class _ChatInputBarState extends State<ChatInputBar>
       _lastImageModeModelKey = nextKey;
     }
     _imageModeModelKey = nextKey;
+    if (_restoredRoutingChoice != null) {
+      _dismissedImageModeModelKey = _restoredRoutingChoice! ? null : nextKey;
+      _restoredRoutingChoice = null;
+    }
     return supported;
   }
 
@@ -394,28 +1031,106 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   bool get _allowImagesApiRouting {
+    if (_restoredRoutingChoice != null) return _restoredRoutingChoice!;
     final key = _imageModeModelKey;
     return key == null || key != _dismissedImageModeModelKey;
   }
 
   bool get _hasDraftMedia => _images.isNotEmpty || _docs.isNotEmpty;
   bool get _hasUnreadyImages =>
+      _images.any((image) => image.changingQuality) ||
       _processingImageIds.isNotEmpty ||
       _failedImageIds.isNotEmpty ||
       _pendingImagePasteIds.isNotEmpty ||
-      _pendingTextPasteIds.isNotEmpty;
+      _pendingTextPasteIds.isNotEmpty ||
+      (_nativeOwner?.pending ?? 0) != 0;
+
+  bool get _hasUnreadyAttachments =>
+      _hasUnreadyImages ||
+      _documentChecks.values.any(
+        (check) => check.pending || check.error != null,
+      );
+
+  void _onNativeOwnerChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _configureNativeOwner(BuildContext context) {
+    final controller = _controller;
+    if (controller is! MessageEditingController ||
+        !controller.nativeInputEnabled) {
+      return;
+    }
+    if (controller.isInputPaused) return;
+    final settings = context.read<SettingsProvider>();
+    var owner = _nativeOwner;
+    if (owner == null ||
+        owner.conversationId != widget.conversationId ||
+        !identical(owner.document, controller)) {
+      owner?.detachView();
+      owner?.removeListener(_onNativeOwnerChanged);
+      owner = _NativeComposerOwner(
+        controller,
+        _nativeMedia,
+        widget.conversationId,
+      );
+      _nativeOwner = owner;
+      owner.addListener(_onNativeOwnerChanged);
+    }
+    owner.config = settings.resolveImageCompressConfig();
+    owner.longPasteAsFile = settings.longPasteAsFile;
+    owner.longPasteThreshold = settings.longPasteAsFileThreshold;
+    owner.submit = (snapshot) {
+      unawaited(_handleSend(orderedValue: snapshot));
+    };
+    owner.escape = () {
+      if (mounted && _isExpanded && _controller.value.composing.isCollapsed) {
+        _setExpanded(false);
+      }
+    };
+    final wide = MediaQuery.sizeOf(context).width >= AppBreakpoints.tablet;
+    controller.configureOwner(
+      onCommand: owner.command,
+      onContent: owner.insertContent,
+      enter: wide
+          ? (settings.desktopSendShortcut == DesktopSendShortcut.ctrlEnter
+                ? 'controlSend'
+                : 'send')
+          : 'newline',
+      commands: const ['undo', 'redo', 'paste', 'escape', 'submit'],
+    );
+  }
 
   // Instance method for onChanged to avoid recreating the callback on every build
   void _onTextChanged(String _) => setState(() {});
 
+  AppLocalizations? _usageLocalizations;
   String? _usageDraftConversationId;
   String? _usageDraftText;
+  List<QuoteRef> _observedQuotes = const [];
+
+  void _onQuoteEdits() {
+    if (_controller is! QuoteEditingController) return;
+    final next = (_controller as QuoteEditingController).quotes;
+    if (listEquals(next, _observedQuotes)) return;
+    _observedQuotes = next;
+    if (mounted) setState(() {});
+  }
 
   void _syncUsageDraft() {
-    if (!mounted) return;
+    final l10n = _usageLocalizations;
+    // A pending draft can restore from _bind during initState, before the
+    // inherited locale is available. didChangeDependencies publishes it next.
+    if (!mounted || l10n == null) return;
     final id = widget.conversationId;
     if (id == null || id.isEmpty) return;
-    final text = _controller.text;
+    final text = _controller is QuoteEditingController
+        ? formatQuotedMessage(
+            _controller.text,
+            (_controller as QuoteEditingController).quotes,
+            quoteMarker: l10n.selectionQuoteMarker,
+          )
+        : _controller.text;
     if (_usageDraftConversationId == id && _usageDraftText == text) return;
     _usageDraftConversationId = id;
     _usageDraftText = text;
@@ -426,7 +1141,10 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (paths.isEmpty) return;
     setState(() {
       _images.addAll(
-        paths.map((path) => _DraftImage(id: _nextImageId++, path: path)),
+        paths.map(
+          (path) =>
+              _DraftImage(id: _nextImageId++, path: path, sourcePath: path),
+        ),
       );
     });
   }
@@ -435,11 +1153,18 @@ class _ChatInputBarState extends State<ChatInputBar>
     List<String> paths,
     ImageCompressConfig config, {
     required bool deleteSourcesAfterProcessing,
+    Map<int, ImageEditDocument> editsByIndex = const {},
   }) {
     if (paths.isEmpty) return;
     setState(() {
-      for (final path in paths) {
-        final image = _DraftImage(id: _nextImageId++, path: path);
+      for (final (index, path) in paths.indexed) {
+        final image = _DraftImage(
+          id: _nextImageId++,
+          path: path,
+          sourcePath: path,
+          edits: editsByIndex[index] ?? const ImageEditDocument(),
+        );
+        if (deleteSourcesAfterProcessing) image.ownedFiles.add(path);
         _images.add(image);
         _processingImageIds.add(image.id);
         _imageProcessingQueue.add(
@@ -447,7 +1172,9 @@ class _ChatInputBarState extends State<ChatInputBar>
             id: image.id,
             sourcePath: path,
             config: config,
+            edits: image.edits,
             deleteSourceAfterProcessing: deleteSourcesAfterProcessing,
+            target: widget.mediaController?.capture(),
           ),
         );
       }
@@ -468,17 +1195,30 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   Future<void> _processImage(_ImageProcessingTask task) async {
     UploadWrite? saved;
+    String? originalPath;
+    UploadWrite? sourceCopy;
     try {
-      final dir = await AppDirectories.getUploadDirectory();
-      saved = await ImageCompressor.compressToUploadDir(
+      final dir =
+          await (task.target?.uploadDirectory() ??
+              AppDirectories.getUploadDirectory());
+      final prepared = await ImageEditRenderer.prepareDraft(
         task.sourcePath,
         dir,
         task.config,
+        task.edits,
+        ownsSource: task.deleteSourceAfterProcessing,
+        reuseSourceInPlace: task.target?.persistent ?? false,
       );
+      sourceCopy = prepared?.source;
+      originalPath = sourceCopy?.path;
+      saved = prepared?.image;
     } catch (_) {
       saved = null;
     } finally {
       if (task.deleteSourceAfterProcessing &&
+          originalPath != null &&
+          originalPath != task.sourcePath &&
+          widget.mediaController?.draftStore == null &&
           (saved == null ||
               !p.equals(
                 p.normalize(p.absolute(task.sourcePath)),
@@ -493,36 +1233,52 @@ class _ChatInputBarState extends State<ChatInputBar>
     final index = mounted
         ? _images.indexWhere((image) => image.id == task.id)
         : -1;
-    final taskIsActive = index >= 0 && _processingImageIds.contains(task.id);
-    // Only a copy this task created, that no other import has resolved to in
-    // the meantime, may be cleaned up.
-    if (!taskIsActive &&
-        savedPath != null &&
-        !saved!.reused &&
-        !UploadDedupe.isShared(savedPath) &&
-        !p.equals(
-          p.normalize(p.absolute(task.sourcePath)),
-          p.normalize(p.absolute(savedPath)),
-        )) {
-      try {
-        await File(savedPath).delete();
-      } catch (error) {
-        debugPrint(
-          '[ChatInputBar] Failed to delete discarded compressed image $savedPath: $error',
+    final taskIsActive =
+        index >= 0 &&
+        _processingImageIds.contains(task.id) &&
+        (task.target?._currentTarget ?? true);
+    if (!taskIsActive) {
+      final target = task.target;
+      final files = [sourceCopy, saved].whereType<UploadWrite>();
+      if (target != null && target.persistent) {
+        target._replaceProcessedImage(
+          task.sourcePath,
+          savedPath,
+          task.edits,
+          originalPath: originalPath,
         );
+        await _releaseReplacedImageFiles(target, [
+          task.sourcePath,
+          for (final write in files)
+            if (!write.reused) write.path,
+        ]);
+      } else {
+        for (final write in files) {
+          if (!write.reused) await UploadDedupe.deleteIfUnshared(write.path);
+        }
       }
+      if (mounted) _pumpImageProcessingQueue();
+      return;
     }
 
-    if (!mounted) return;
-    if (taskIsActive) {
-      setState(() {
-        _processingImageIds.remove(task.id);
-        if (savedPath == null) {
-          _failedImageIds.add(task.id);
-        } else {
-          _images[index].path = savedPath;
+    setState(() {
+      _processingImageIds.remove(task.id);
+      for (final write in [sourceCopy, saved].whereType<UploadWrite>()) {
+        if (!write.reused) {
+          _images[index].ownedFiles.add(write.path);
         }
-      });
+      }
+      if (originalPath != null) _images[index].sourcePath = originalPath;
+      if (savedPath == null) {
+        if (originalPath != null) _images[index].path = originalPath;
+        _failedImageIds.add(task.id);
+      } else {
+        _images[index].path = savedPath;
+        _images[index].sourcePath = originalPath;
+      }
+    });
+    if (task.target?.persistent == true && task.sourcePath != originalPath) {
+      unawaited(_releaseReplacedImageFiles(task.target!, [task.sourcePath]));
     }
     _pumpImageProcessingQueue();
   }
@@ -536,35 +1292,124 @@ class _ChatInputBarState extends State<ChatInputBar>
     _failedImageIds.removeAll(discarded);
     _imageProcessingQueue.removeWhere((task) => discarded.contains(task.id));
     for (final task in discardedQueuedTasks) {
-      if (task.deleteSourceAfterProcessing) {
+      if (task.deleteSourceAfterProcessing &&
+          widget.mediaController?.draftStore == null) {
         unawaited(_deleteTemporaryImageSource(task.sourcePath));
       }
     }
   }
 
   void _clearImages() {
+    final target = (widget.mediaController ?? _ownedNativeMedia).capture();
+    final retired = _ownedImagePaths(target, _images);
     setState(() {
       _pendingImagePasteIds.clear();
       _discardImageState(_images.map((image) => image.id));
       _images.clear();
     });
+    unawaited(_releaseReplacedImageFiles(target, retired));
+  }
+
+  /// Reconcile by file identity. Results from removed files, another draft or
+  /// a different model/workspace route must never update the current cards.
+  void _syncDocumentChecks({bool reset = false}) {
+    if (reset) _documentChecks.clear();
+    final needed = {
+      for (final doc in _docs)
+        if (widget.documentRoute.needsLocalText(doc)) doc.path: doc,
+    };
+    _documentChecks.removeWhere(
+      (path, check) =>
+          !needed.containsKey(path) ||
+          needed[path]!.mime != check.file.mime ||
+          needed[path]!.fileName != check.file.fileName,
+    );
+    for (final doc in needed.values) {
+      _documentChecks.putIfAbsent(doc.path, () => _DocumentCheck(doc));
+    }
+    if (!_checkingDocuments && _documentChecks.isNotEmpty) {
+      unawaited(_checkDocuments());
+    }
+  }
+
+  Future<void> _checkDocuments() async {
+    _checkingDocuments = true;
+    try {
+      while (mounted) {
+        final check = _documentChecks.values
+            .where((c) => c.pending)
+            .firstOrNull;
+        if (check == null) return;
+        int? count;
+        AttachmentReadError? error;
+        try {
+          final result = await (widget.mediaController ?? _ownedNativeMedia)
+              .documentCache
+              .read(check.file);
+          if (result.truncated) count = result.count;
+        } on AttachmentReadError catch (e) {
+          error = e;
+        }
+        if (!mounted) return;
+        if (!identical(_documentChecks[check.file.path], check)) continue;
+        // Analysis is transient; don't schedule a draft write on completion.
+        super.setState(() {
+          check.pending = false;
+          check.error = error;
+          check.truncatedCount = count;
+        });
+      }
+    } finally {
+      _checkingDocuments = false;
+    }
+  }
+
+  ComposerAttachmentNotice? _documentNotice(DocumentAttachment file) {
+    final check = _documentChecks[file.path];
+    final l = AppLocalizations.of(context)!;
+    final error = check?.error;
+    if (error != null) {
+      return (
+        label: error.shortMessage(l),
+        detail: error.message(
+          l,
+          workspaceUnavailable:
+              widget.documentRoute.workspaceBound &&
+              !widget.documentRoute.workspaceFiles,
+        ),
+        failed: true,
+      );
+    }
+    final count = check?.truncatedCount;
+    return count == null
+        ? null
+        : (
+            label: l.attachmentTruncatedCard,
+            detail: l.attachmentTruncatedNotice(count),
+            failed: false,
+          );
   }
 
   void _addFiles(List<DocumentAttachment> docs) {
     if (docs.isEmpty) return;
-    setState(() => _docs.addAll(docs));
+    setState(() {
+      _docs.addAll(docs);
+      _syncDocumentChecks();
+    });
   }
 
   void _clearFiles() {
     setState(() {
       _pendingTextPasteIds.clear();
       _docs.clear();
+      _documentChecks.clear();
     });
   }
 
   void _restoreInput(ChatInputData input) {
     setState(() {
       _draftReplacementRevision++;
+      _uiContext = input.uiContext;
       _abandonVoiceSession();
       _pendingImagePasteIds.clear();
       _pendingTextPasteIds.clear();
@@ -584,6 +1429,7 @@ class _ChatInputBarState extends State<ChatInputBar>
       _docs
         ..clear()
         ..addAll(input.documents);
+      _syncDocumentChecks(reset: true);
     });
   }
 
@@ -598,43 +1444,190 @@ class _ChatInputBarState extends State<ChatInputBar>
       ],
       documents: List<DocumentAttachment>.of(_docs),
       allowImagesApiRouting: _allowImagesApiRouting,
+      uiContext: _uiContext,
+      quotes: _controller is QuoteEditingController
+          ? (_controller as QuoteEditingController).quotes
+          : const [],
     );
   }
 
+  ComposerDraftInput _snapshotDraft(String text) => ComposerDraftInput(
+    text: text,
+    quotes: _controller is QuoteEditingController
+        ? (_controller as QuoteEditingController).quotes
+        : const [],
+    selectionBase: _controller.selection.baseOffset,
+    selectionExtent: _controller.selection.extentOffset,
+    images: [
+      for (final image in _images)
+        DraftImage(
+          path: image.path,
+          sourcePath: image.sourcePath,
+          sourceIsOriginal: image.sourceIsOriginal,
+          edits: image.edits,
+          quality: image.quality,
+          customQuality: image.customQuality,
+          processing: _processingImageIds.contains(image.id),
+          failed: _failedImageIds.contains(image.id),
+        ),
+    ],
+    documents: List.of(_docs),
+    allowImagesApiRouting: _allowImagesApiRouting,
+    uiContext: _uiContext,
+  );
+
+  void _restoreDraft(ComposerDraftInput input, {bool resetHistory = true}) {
+    if (_controller case final QuoteEditingController quotes) {
+      quotes.restore(
+        TextEditingValue(
+          text: input.text,
+          selection: TextSelection(
+            baseOffset: input.selectionBase < 0
+                ? input.text.length
+                : input.selectionBase.clamp(0, input.text.length),
+            extentOffset: input.selectionExtent < 0
+                ? input.text.length
+                : input.selectionExtent.clamp(0, input.text.length),
+          ),
+        ),
+        input.quotes,
+      );
+    }
+    if (resetHistory) _resetInputHistory();
+    final config = context
+        .read<SettingsProvider>()
+        .resolveImageCompressConfig();
+    final documents = [
+      for (final doc in input.documents)
+        DocumentAttachment(
+          path: isRemoteOrDataUri(doc.path)
+              ? doc.path
+              : SandboxPathResolver.resolveForIo(doc.path) ?? doc.path,
+          fileName: doc.fileName,
+          mime: doc.mime,
+        ),
+    ];
+    _missingDocumentPaths
+      ..clear()
+      ..addAll(
+        documents
+            .where(
+              (doc) =>
+                  !isRemoteOrDataUri(doc.path) &&
+                  !SandboxPathResolver.localFileExists(doc.path),
+            )
+            .map((doc) => doc.path),
+      );
+    setState(() {
+      _draftReplacementRevision++;
+      _uiContext = input.uiContext;
+      if (resetHistory) {
+        _abandonVoiceSession();
+        _pendingImagePasteIds.clear();
+        _pendingTextPasteIds.clear();
+      }
+      _discardImageState(_images.map((image) => image.id));
+      _images.clear();
+      for (final saved in input.images) {
+        final path = SandboxPathResolver.fix(saved.path);
+        final source = saved.sourcePath == null
+            ? null
+            : SandboxPathResolver.fix(saved.sourcePath!);
+        final sourceAvailable = source != null && File(source).existsSync();
+        final currentAvailable =
+            isRemoteOrDataUri(path) || File(path).existsSync();
+        final keepSource =
+            source != null && (sourceAvailable || !currentAvailable);
+        final image = _DraftImage(
+          id: _nextImageId++,
+          path: path,
+          sourcePath: keepSource ? source : path,
+          sourceIsOriginal: keepSource && saved.sourceIsOriginal,
+          edits: keepSource ? saved.edits : const ImageEditDocument(),
+          quality: saved.quality,
+          customQuality: saved.customQuality,
+        );
+        _images.add(image);
+        if (saved.failed || !currentAvailable) {
+          _failedImageIds.add(image.id);
+        } else if (saved.processing) {
+          _processingImageIds.add(image.id);
+          _imageProcessingQueue.add(
+            _ImageProcessingTask(
+              id: image.id,
+              sourcePath: image.sourcePath ?? path,
+              config: config,
+              edits: image.edits,
+              deleteSourceAfterProcessing: false,
+              target: widget.mediaController?.capture(),
+            ),
+          );
+        }
+      }
+      _docs
+        ..clear()
+        ..addAll(documents);
+      _syncDocumentChecks(reset: resetHistory);
+      _restoredRoutingChoice = input.allowImagesApiRouting;
+    });
+    _pumpImageProcessingQueue();
+  }
+
   void _clearDraft() {
+    final target = (widget.mediaController ?? _ownedNativeMedia).capture();
+    final retired = _ownedImagePaths(target, _images);
     widget.mediaController?.sharedDraftAction.value = null;
     setState(() {
       _draftReplacementRevision++;
       _abandonVoiceSession();
+      _uiContext = null;
       _controller.clear();
       _pendingImagePasteIds.clear();
       _pendingTextPasteIds.clear();
       _discardImageState(_images.map((image) => image.id));
       _images.clear();
       _docs.clear();
+      _documentChecks.clear();
     });
+    unawaited(_releaseReplacedImageFiles(target, retired));
   }
 
   void _removeImageAt(int index) {
+    final target = (widget.mediaController ?? _ownedNativeMedia).capture();
+    final retired = _ownedImagePaths(target, [_images[index]]);
     setState(() {
       final image = _images.removeAt(index);
       _discardImageState([image.id]);
     });
+    unawaited(_releaseReplacedImageFiles(target, retired));
   }
 
   void _removeDocumentAt(int index) {
-    setState(() => _docs.removeAt(index));
+    setState(() {
+      _docs.removeAt(index);
+      _syncDocumentChecks();
+    });
   }
 
   @override
   void initState() {
     super.initState();
-    _controller = widget.controller ?? TextEditingController();
+    _controller = widget.controller ?? QuoteEditingController();
     _controller.addListener(_syncUsageDraft);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _syncUsageDraft());
+    _controller.addListener(_onQuoteEdits);
     widget.mediaController?._bind(this);
+    if (widget.mediaController == null) _ownedNativeMedia._bind(this);
     widget.asrProvider?.addListener(_handleAsrChanged);
     WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final l10n = AppLocalizations.of(context)!;
+    if (identical(_usageLocalizations, l10n)) return;
+    _usageLocalizations = l10n;
+    WidgetsBinding.instance.addPostFrameCallback((_) => _syncUsageDraft());
   }
 
   @override
@@ -643,8 +1636,11 @@ class _ChatInputBarState extends State<ChatInputBar>
     // When app resumes from background, suppress context menu briefly to avoid flickering
     if (state == AppLifecycleState.resumed) {
       _suppressContextMenu = true;
-      // Also unfocus to reset any stuck toolbar state
-      widget.focusNode?.unfocus();
+      // Only iOS needs this toolbar reset. Desktop must retain the focus
+      // restored by Flutter after switching windows (for example, Alt+Tab).
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        widget.focusNode?.unfocus();
+      }
       // Re-enable context menu after a short delay
       Future.delayed(const Duration(milliseconds: 300), () {
         if (mounted) {
@@ -655,14 +1651,23 @@ class _ChatInputBarState extends State<ChatInputBar>
         state == AppLifecycleState.paused) {
       // When going to background, hide any open toolbar
       _suppressContextMenu = true;
-      widget.focusNode?.unfocus();
-      if (_ownsVoiceSession) unawaited(_cancelVoiceInput());
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        widget.focusNode?.unfocus();
+      }
+      if (_ownsVoiceSession) _abandonVoiceSession();
     }
   }
 
   @override
   void dispose() {
+    // Multi-selection temporarily removes the widget. Retain its complete
+    // draft before clearing processing/failure state for disposed image tasks.
+    widget.mediaController?._unbind(this);
+    if (widget.mediaController == null) _ownedNativeMedia._unbind(this);
+    _nativeOwner?.detachView();
+    _nativeOwner?.removeListener(_onNativeOwnerChanged);
     _controller.removeListener(_syncUsageDraft);
+    _controller.removeListener(_onQuoteEdits);
     WidgetsBinding.instance.removeObserver(this);
     _stopVoiceLevelSampling();
     final asr = widget.asrProvider;
@@ -680,7 +1685,6 @@ class _ChatInputBarState extends State<ChatInputBar>
     _imageProcessingQueue.clear();
     _processingImageIds.clear();
     _failedImageIds.clear();
-    widget.mediaController?._unbind(this);
     // A host told the composer is expanded must hear it ended, or it keeps
     // ignoring the input bar's height after this one is replaced.
     if (!_expandController.isDismissed) widget.onExpandedChanged?.call(false);
@@ -696,8 +1700,16 @@ class _ChatInputBarState extends State<ChatInputBar>
   @override
   void didUpdateWidget(covariant ChatInputBar oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.documentRoute != widget.documentRoute ||
+        oldWidget.conversationId != widget.conversationId) {
+      _syncDocumentChecks(reset: true);
+    }
     final previousConversationId = oldWidget.conversationId;
     final nextConversationId = widget.conversationId;
+    if (previousConversationId != nextConversationId) {
+      _nativeOwner?.detachView();
+      if (widget.mediaController == null) _ownedNativeMedia._localInputEpoch++;
+    }
     if (previousConversationId != nextConversationId) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _syncUsageDraft());
     }
@@ -762,6 +1774,10 @@ class _ChatInputBarState extends State<ChatInputBar>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _expandCheckScheduled = false;
       if (!mounted || _expandedLayout) return;
+      if (_longEditorKey.currentState?.usesLineEditor ?? false) {
+        if (!_canExpand) setState(() => _canExpand = true);
+        return;
+      }
       final editable = _findRenderEditable();
       if (editable == null || !editable.hasSize) return;
       // Judge the text at the width it has while the button is shown. The
@@ -772,15 +1788,23 @@ class _ChatInputBarState extends State<ChatInputBar>
           ? editable.size.width
           : editable.size.width -
                 (_expandButtonExtent + AppSpacing.xs - AppSpacing.md);
-      final canExpand =
-          editable.getMaxIntrinsicHeight(buttonWidth) >
-          editable.preferredLineHeight * 2.5;
+      // With the button already present, the field has exactly buttonWidth.
+      // Reuse its completed layout instead of shaping the whole draft again.
+      // Only the initial probe needs to measure the hypothetical narrower field.
+      final height = _canExpand
+          ? editable.size.height + editable.maxScrollExtent
+          : editable.getMaxIntrinsicHeight(buttonWidth);
+      final canExpand = height > editable.preferredLineHeight * 2.5;
       if (canExpand != _canExpand) setState(() => _canExpand = canExpand);
     });
   }
 
   void _setExpanded(bool expanded) {
     if (expanded == _isExpanded) return;
+    // The field keeps focus across the toggle, so a context menu would stay
+    // open while the text under it jumps.
+    ContextMenuController.removeAny();
+    _longEditorKey.currentState?.hideToolbar();
     final composer = _composerKey.currentContext?.findRenderObject();
     final textArea = _textAreaKey.currentContext?.findRenderObject();
     final editable = _findRenderEditable();
@@ -805,6 +1829,23 @@ class _ChatInputBarState extends State<ChatInputBar>
       } else if (_expandController.isDismissed) {
         _expandFromHeight = composer.size.height;
         _textAreaChrome = textArea.size.height - editable.size.height;
+      }
+    } else if (composer is RenderBox &&
+        composer.hasSize &&
+        textArea is RenderBox &&
+        textArea.hasSize &&
+        (_longEditorKey.currentState?.usesLineEditor ?? false)) {
+      final collapsedText =
+          _longEditorKey.currentState!.preferredLineHeight * _collapsedMaxLines;
+      if (!expanded) {
+        _expandFromHeight =
+            composer.size.height -
+            textArea.size.height +
+            _textAreaChrome +
+            collapsedText;
+      } else if (_expandController.isDismissed) {
+        _expandFromHeight = composer.size.height;
+        _textAreaChrome = textArea.size.height - collapsedText;
       }
     }
     if (expanded && _expandController.isDismissed) {
@@ -1121,7 +2162,9 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   Future<DocumentAttachment> _saveVoiceRecording(Uint8List wav) async {
-    final dir = await AppDirectories.getUploadDirectory();
+    final dir =
+        await (widget.mediaController?.capture().uploadDirectory() ??
+            AppDirectories.getUploadDirectory());
     await dir.create(recursive: true);
     final now = DateTime.now();
     String two(int value) => value.toString().padLeft(2, '0');
@@ -1277,7 +2320,7 @@ class _ChatInputBarState extends State<ChatInputBar>
         const SizedBox(width: 8),
         // Send: transcribe (or attach the audio) and send right away
         _CompactSendButton(
-          enabled: canFinish,
+          enabled: canFinish && !_hasUnreadyAttachments,
           onSend: () => unawaited(
             _voiceTranscribes
                 ? _finishVoiceInput(sendAfter: true)
@@ -1293,47 +2336,153 @@ class _ChatInputBarState extends State<ChatInputBar>
     );
   }
 
-  Future<void> _handleSend() async {
-    if (_isSubmitting ||
-        _hasUnreadyImages ||
+  Future<void> _handleSend({TextEditingValue? orderedValue}) async {
+    final controller = _controller;
+    if (orderedValue == null && controller is MessageEditingController) {
+      if (controller.isInputPaused) return;
+      if (controller.hasNativeInput) {
+        await controller.performCommand('submit');
+        return;
+      }
+    }
+    if (_composerLocked ||
+        _isSubmitting ||
+        _hasUnreadyAttachments ||
         _ownsVoiceSession ||
         _finishingVoice) {
       return;
     }
-    final submittedValue = _controller.value;
+    if (_docs.any(
+      (doc) =>
+          !isRemoteOrDataUri(doc.path) &&
+          !SandboxPathResolver.localFileExists(doc.path),
+    )) {
+      showAppSnackBar(
+        context,
+        message: AppLocalizations.of(context)!.composerDraftMissingFile,
+        type: NotificationType.warning,
+      );
+      return;
+    }
+    final submittedValue = orderedValue ?? _controller.value;
+    if (_controller is QuoteEditingController &&
+        (_controller as QuoteEditingController).quotes.length >
+            maxMessageQuotes) {
+      showAppSnackBar(
+        context,
+        message: AppLocalizations.of(context)!.quoteLimit,
+      );
+      return;
+    }
     final submittedText = submittedValue.text;
+    final send = widget.onSend;
     final text = submittedText.trim();
-    if (text.isEmpty && _images.isEmpty && _docs.isEmpty) return;
+    if (text.isEmpty &&
+        _images.isEmpty &&
+        _docs.isEmpty &&
+        _uiContext == null) {
+      return;
+    }
+    final submissionTarget = (widget.mediaController ?? _ownedNativeMedia)
+        .capture();
     final submittedImages = List<_DraftImage>.of(_images);
     final submittedImageIds = submittedImages.map((image) => image.id).toSet();
     final submittedDocuments = List<DocumentAttachment>.of(_docs);
+    final submittedDraft = _snapshotDraft(submittedText);
     final submittedDraftRevision = _draftReplacementRevision;
     final submitSerial = ++_submitSerial;
     _isSubmitting = true;
+    final beginSubmission = widget.mediaController?.onBeginSubmission;
+    Future<DraftSubmission?>? pendingSubmission;
+    var persistentSubmission = false;
+    try {
+      pendingSubmission = beginSubmission?.call(submittedDraft);
+      persistentSubmission =
+          widget.mediaController?.draftStore
+              ?.peek(widget.mediaController?.draftOwnerId ?? '')
+              ?.pending !=
+          null;
+    } catch (_) {
+      _isSubmitting = false;
+      return;
+    }
     // Attachments leave the composer with the text, not when the send future
     // completes: that future now resolves at send time, but the draft must not
     // depend on it at all. A rejected send puts everything back below.
     setState(() {
+      _resetInputHistory();
+      _uiContext = null;
       _controller.clear();
       _images.removeWhere((image) => submittedImageIds.contains(image.id));
       for (final document in submittedDocuments) {
         _docs.remove(document);
       }
+      _syncDocumentChecks();
     });
+
+    Future<void> restoreRejected() async {
+      if (persistentSubmission) return;
+      if (controller is MessageEditingController && controller.isDraining) {
+        await controller.flushInput();
+      }
+      // The network reply is not input work. It may arrive during a close or
+      // draft switch; restore only after accepted input settles, to its owner.
+      if (!mounted ||
+          submitSerial != _submitSerial ||
+          _draftReplacementRevision != submittedDraftRevision ||
+          !identical(controller, _controller)) {
+        return;
+      }
+      setState(
+        () => _restoreSubmittedDraft(
+          submittedValue,
+          submittedImages,
+          submittedDocuments,
+          submittedDraft.uiContext,
+        ),
+      );
+    }
+
     try {
-      final result =
-          await widget.onSend?.call(
-            ChatInputData(
-              text: text,
-              imagePaths: submittedImages.map((image) => image.path).toList(),
-              documents: List<DocumentAttachment>.of(submittedDocuments),
-              allowImagesApiRouting: _allowImagesApiRouting,
-            ),
-          ) ??
-          ChatInputSubmissionResult.rejected;
+      final ChatInputSubmissionResult result;
+      try {
+        final draftSubmission = await pendingSubmission;
+        result =
+            await send?.call(
+              ChatInputData(
+                text: text,
+                imagePaths: submittedImages.map((image) => image.path).toList(),
+                documents: List<DocumentAttachment>.of(submittedDocuments),
+                allowImagesApiRouting: submittedDraft.allowImagesApiRouting,
+                draftSubmission: draftSubmission,
+                uiContext: submittedDraft.uiContext,
+                quotes: submittedDraft.quotes,
+              ),
+            ) ??
+            ChatInputSubmissionResult.rejected;
+      } catch (_) {
+        await restoreRejected();
+        // Persistent submissions report storage errors next to the editor.
+        if (!persistentSubmission) rethrow;
+        return;
+      }
+      final accepted =
+          result == ChatInputSubmissionResult.sent ||
+          result == ChatInputSubmissionResult.queued;
+      if (accepted) {
+        final retained = {
+          for (final image in submittedImages) image.path,
+          for (final doc in submittedDocuments) doc.path,
+        };
+        unawaited(
+          _releaseReplacedImageFiles(
+            submissionTarget,
+            _ownedImagePaths(submissionTarget, submittedImages, keep: retained),
+          ),
+        );
+      }
       if (!mounted || submitSerial != _submitSerial) return;
-      if (result == ChatInputSubmissionResult.sent ||
-          result == ChatInputSubmissionResult.queued) {
+      if (accepted) {
         if (_draftReplacementRevision != submittedDraftRevision) return;
         widget.mediaController?.sharedDraftAction.value = null;
         _discardImageState(submittedImageIds);
@@ -1352,28 +2501,9 @@ class _ChatInputBarState extends State<ChatInputBar>
             widget.focusNode?.requestFocus();
           }
         } catch (_) {}
-      } else if (_draftReplacementRevision == submittedDraftRevision) {
-        setState(
-          () => _restoreSubmittedDraft(
-            submittedValue,
-            submittedImages,
-            submittedDocuments,
-          ),
-        );
+      } else {
+        await restoreRejected();
       }
-    } catch (_) {
-      if (mounted &&
-          submitSerial == _submitSerial &&
-          _draftReplacementRevision == submittedDraftRevision) {
-        setState(
-          () => _restoreSubmittedDraft(
-            submittedValue,
-            submittedImages,
-            submittedDocuments,
-          ),
-        );
-      }
-      rethrow;
     } finally {
       if (submitSerial == _submitSerial) {
         _isSubmitting = false;
@@ -1387,7 +2517,9 @@ class _ChatInputBarState extends State<ChatInputBar>
     TextEditingValue submittedValue,
     List<_DraftImage> submittedImages,
     List<DocumentAttachment> submittedDocuments,
+    UiContextAttachment? submittedUiContext,
   ) {
+    _uiContext = submittedUiContext;
     _restoreSubmittedText(submittedValue);
     final existingImageIds = _images.map((image) => image.id).toSet();
     _images.insertAll(
@@ -1398,6 +2530,7 @@ class _ChatInputBarState extends State<ChatInputBar>
       0,
       submittedDocuments.where((document) => !_docs.contains(document)),
     );
+    _syncDocumentChecks();
   }
 
   void _restoreSubmittedText(TextEditingValue submittedValue) {
@@ -1419,11 +2552,19 @@ class _ChatInputBarState extends State<ChatInputBar>
             end: currentValue.composing.end + offset,
           )
         : currentValue.composing;
-    _controller.value = currentValue.copyWith(
-      text: submittedValue.text + currentValue.text,
-      selection: selection,
-      composing: composing,
-    );
+    _controller.value =
+        currentValue is QuoteEditingValue && submittedValue is QuoteEditingValue
+        ? QuoteEditingValue(
+            text: submittedValue.text + currentValue.text,
+            quotes: [...submittedValue.quotes, ...currentValue.quotes],
+            selection: selection,
+            composing: composing,
+          )
+        : currentValue.copyWith(
+            text: submittedValue.text + currentValue.text,
+            selection: selection,
+            composing: composing,
+          );
   }
 
   void _insertNewlineAtCursor() {
@@ -1451,6 +2592,12 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   // Keep the caret visible after programmatic edits (e.g., Shift+Enter insert)
   void _ensureCaretVisible() {
+    if (_longEditorKey.currentState?.usesLineEditor ?? false) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _longEditorKey.currentState?.ensureCaretVisible();
+      });
+      return;
+    }
     try {
       final selection = _controller.selection;
       if (!selection.isValid) return;
@@ -1471,12 +2618,18 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   // Instance method for contextMenuBuilder to avoid flickering caused by recreating
   // the callback on every build. See: https://github.com/flutter/flutter/issues/150551
-  Widget _buildContextMenu(BuildContext context, EditableTextState state) {
+  Widget _buildMessageContextMenu(
+    BuildContext context,
+    TextSelectionToolbarAnchors anchors,
+    List<ContextMenuButtonItem> defaultItems,
+    VoidCallback hideToolbar,
+    VoidCallback onNativeDismiss,
+  ) {
     // Suppress context menu during app lifecycle transitions to avoid flickering
     if (_suppressContextMenu) {
       return const SizedBox.shrink();
     }
-    if (Platform.isIOS) {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
       final items = <ContextMenuButtonItem>[];
       try {
         final appL10n = AppLocalizations.of(context)!;
@@ -1502,7 +2655,7 @@ class _ChatInputBarState extends State<ChatInputBar>
                     selection: TextSelection.collapsed(offset: start),
                   );
                 } catch (_) {}
-                state.hideToolbar();
+                hideToolbar();
               },
               label: materialL10n.cutButtonLabel,
             ),
@@ -1520,7 +2673,7 @@ class _ChatInputBarState extends State<ChatInputBar>
                   final text = value.text.substring(start, end);
                   await Clipboard.setData(ClipboardData(text: text));
                 } catch (_) {}
-                state.hideToolbar();
+                hideToolbar();
               },
               label: materialL10n.copyButtonLabel,
             ),
@@ -1532,7 +2685,7 @@ class _ChatInputBarState extends State<ChatInputBar>
           ContextMenuButtonItem(
             onPressed: () {
               _handlePasteFromClipboard();
-              state.hideToolbar();
+              hideToolbar();
             },
             label: materialL10n.pasteButtonLabel,
           ),
@@ -1543,7 +2696,7 @@ class _ChatInputBarState extends State<ChatInputBar>
           ContextMenuButtonItem(
             onPressed: () {
               _insertNewlineAtCursor();
-              state.hideToolbar();
+              hideToolbar();
             },
             label: appL10n.chatInputBarInsertNewline,
           ),
@@ -1560,33 +2713,37 @@ class _ChatInputBarState extends State<ChatInputBar>
                     extentOffset: value.text.length,
                   );
                 } catch (_) {}
-                state.hideToolbar();
+                hideToolbar();
               },
               label: materialL10n.selectAllButtonLabel,
             ),
           );
         }
       } catch (_) {}
-      return AdaptiveTextSelectionToolbar.buttonItems(
-        anchors: state.contextMenuAnchors,
+      return AppTextSelectionToolbar(
+        anchors: anchors,
         buttonItems: items,
+        selectionContext: context,
+        onDismiss: onNativeDismiss,
       );
     }
 
-    final items = state.contextMenuButtonItems
+    final items = defaultItems
         .map((item) {
           if (item.type != ContextMenuButtonType.paste) return item;
           return item.copyWith(
             onPressed: () {
               unawaited(_handlePasteFromClipboard());
-              state.hideToolbar();
+              hideToolbar();
             },
           );
         })
         .toList(growable: false);
-    return AdaptiveTextSelectionToolbar.buttonItems(
-      anchors: state.contextMenuAnchors,
+    return AppTextSelectionToolbar(
+      anchors: anchors,
       buttonItems: items,
+      selectionContext: context,
+      onDismiss: onNativeDismiss,
     );
   }
 
@@ -1614,9 +2771,10 @@ class _ChatInputBarState extends State<ChatInputBar>
       return KeyEventResult.handled;
     }
 
-    // Enter handling on tablet/desktop: configurable shortcut
-    if (isEnter && isTabletOrDesktop) {
+    // Desktop send shortcuts must survive resizing below the tablet breakpoint.
+    if (isEnter && (PlatformUtils.isDesktopTarget || isTabletOrDesktop)) {
       if (!isDown) return KeyEventResult.handled; // ignore key up
+      if (_composerLocked || _ownsVoiceSession) return KeyEventResult.handled;
       // Respect IME composition (e.g., Chinese Pinyin). If composing, let IME handle Enter.
       final composing = _controller.value.composing;
       final composingActive = composing.isValid && !composing.isCollapsed;
@@ -1724,10 +2882,16 @@ class _ChatInputBarState extends State<ChatInputBar>
     return KeyEventResult.handled;
   }
 
-  Future<String?> _savePastedImageBytes(String format, Uint8List bytes) async {
+  Future<String?> _savePastedImageBytes(
+    String format,
+    Uint8List bytes, {
+    ChatInputBarController? target,
+  }) async {
     File? reserved;
     try {
-      final dir = await AppDirectories.getSystemCacheDirectory();
+      final dir = await (target?._root.draftStore != null
+          ? target!.uploadDirectory()
+          : AppDirectories.getSystemCacheDirectory());
       if (!await dir.exists()) {
         await dir.create(recursive: true);
       }
@@ -1766,6 +2930,12 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   void _handleInsertedContent(KeyboardInsertedContent content) {
+    if (widget.mediaController?.restoringDraft ?? false) return;
+    final document = _controller;
+    if (document is MessageEditingController && document.nativeInputEnabled) {
+      if (!document.isInputPaused) unawaited(document.insertContent(content));
+      return;
+    }
     final format = switch (content.mimeType.toLowerCase()) {
       'image/png' => 'png',
       'image/jpeg' || 'image/jpg' => 'jpeg',
@@ -1777,30 +2947,42 @@ class _ChatInputBarState extends State<ChatInputBar>
     if (!mounted || format == null || bytes == null || bytes.isEmpty) return;
     final pasteId = _nextImagePasteId++;
     setState(() => _pendingImagePasteIds.add(pasteId));
-    unawaited(_enqueueInsertedImage(pasteId, format, bytes));
+    unawaited(
+      _enqueueInsertedImage(
+        pasteId,
+        format,
+        bytes,
+        widget.mediaController?.capture(),
+        context.read<SettingsProvider>().resolveImageCompressConfig(),
+      ),
+    );
   }
 
   Future<void> _enqueueInsertedImage(
     int pasteId,
     String format,
     Uint8List bytes,
+    ChatInputBarController? target,
+    ImageCompressConfig compressConfig,
   ) async {
-    final savedPath = await _savePastedImageBytes(format, bytes);
+    final savedPath = await _savePastedImageBytes(
+      format,
+      bytes,
+      target: target,
+    );
     if (savedPath == null) {
       if (mounted && _pendingImagePasteIds.contains(pasteId)) {
         setState(() => _pendingImagePasteIds.remove(pasteId));
       }
       return;
     }
-    if (!mounted || !_pendingImagePasteIds.contains(pasteId)) {
+    final retained = target?._root.draftStore != null && target!.isValid;
+    if (!retained && (!mounted || !_pendingImagePasteIds.contains(pasteId))) {
       await _deleteTemporaryImageSource(savedPath);
       return;
     }
-    final compressConfig = context
-        .read<SettingsProvider>()
-        .resolveImageCompressConfig();
     _pendingImagePasteIds.remove(pasteId);
-    _enqueueImages(
+    (target?.enqueueImages ?? _enqueueImages)(
       [savedPath],
       compressConfig,
       deleteSourcesAfterProcessing: true,
@@ -1808,6 +2990,14 @@ class _ChatInputBarState extends State<ChatInputBar>
   }
 
   Future<void> _handlePasteFromClipboard() async {
+    if (widget.mediaController?.restoringDraft ?? false) return;
+    final document = _controller;
+    if (document is MessageEditingController && document.nativeInputEnabled) {
+      if (document.isInputPaused) return;
+      await document.performCommand('paste');
+      return;
+    }
+    final target = widget.mediaController?.capture();
     final compressConfig = context
         .read<SettingsProvider>()
         .resolveImageCompressConfig();
@@ -1892,7 +3082,11 @@ class _ChatInputBarState extends State<ChatInputBar>
         }
 
         if (bytes != null && bytes.isNotEmpty && fmt != null) {
-          final savedPath = await _savePastedImageBytes(fmt, bytes);
+          final savedPath = await _savePastedImageBytes(
+            fmt,
+            bytes,
+            target: target,
+          );
           if (!mounted) {
             if (savedPath != null) {
               await _deleteTemporaryImageSource(savedPath);
@@ -1900,7 +3094,7 @@ class _ChatInputBarState extends State<ChatInputBar>
             return;
           }
           if (savedPath != null) {
-            _enqueueImages(
+            (target?.enqueueImages ?? _enqueueImages)(
               [savedPath],
               compressConfig,
               deleteSourcesAfterProcessing: true,
@@ -1914,7 +3108,7 @@ class _ChatInputBarState extends State<ChatInputBar>
           try {
             final String? text = await reader.readValue(Formats.plainText);
             if (text != null && text.isNotEmpty) {
-              await _handlePastedText(text);
+              await _handlePastedText(text, target: target);
               return;
             }
           } catch (_) {}
@@ -1925,7 +3119,15 @@ class _ChatInputBarState extends State<ChatInputBar>
     // 2) Fallback: legacy platform channel image handling
     final imageTempPaths = await ClipboardImages.getImagePaths();
     if (imageTempPaths.isNotEmpty) {
-      await _enqueueClipboardImages(imageTempPaths);
+      if (target != null) {
+        target.enqueueImages(
+          imageTempPaths,
+          compressConfig,
+          deleteSourcesAfterProcessing: true,
+        );
+      } else {
+        await _enqueueClipboardImages(imageTempPaths);
+      }
       return;
     }
 
@@ -1945,21 +3147,27 @@ class _ChatInputBarState extends State<ChatInputBar>
               otherPaths.add(src);
             }
           }
-          _enqueueImages(
+          (target?.enqueueImages ?? _enqueueImages)(
             imagePaths,
             compressConfig,
             deleteSourcesAfterProcessing: false,
           );
 
-          final saved = await _copyFilesToUpload(otherPaths);
+          final saved = await _copyFilesToUpload(otherPaths, target: target);
           if (saved.images.isNotEmpty) {
-            _enqueueImages(
+            (target?.enqueueImages ?? _enqueueImages)(
               saved.images,
               compressConfig,
               deleteSourcesAfterProcessing: false,
             );
           }
-          if (saved.docs.isNotEmpty) _addFiles(saved.docs);
+          if (saved.docs.isNotEmpty) {
+            if (target != null) {
+              target.addFiles(saved.docs);
+            } else {
+              _addFiles(saved.docs);
+            }
+          }
           handledFiles =
               imagePaths.isNotEmpty ||
               saved.images.isNotEmpty ||
@@ -1974,11 +3182,15 @@ class _ChatInputBarState extends State<ChatInputBar>
       final data = await Clipboard.getData(Clipboard.kTextPlain);
       final text = data?.text ?? '';
       if (text.isEmpty) return;
-      await _handlePastedText(text);
+      await _handlePastedText(text, target: target);
     } catch (_) {}
   }
 
-  Future<void> _handlePastedText(String text) async {
+  Future<void> _handlePastedText(
+    String text, {
+    ChatInputBarController? target,
+  }) async {
+    target ??= widget.mediaController?.capture();
     if (!mounted) return;
     final settings = context.read<SettingsProvider>();
     final threshold = settings.longPasteAsFileThreshold;
@@ -1986,7 +3198,11 @@ class _ChatInputBarState extends State<ChatInputBar>
         settings.longPasteAsFile &&
         text.characters.take(threshold + 1).length > threshold;
     if (!isLongPaste) {
-      _insertPastedText(text);
+      if (target != null) {
+        target.insertText(text);
+      } else {
+        _insertPastedText(text);
+      }
       return;
     }
 
@@ -1999,12 +3215,17 @@ class _ChatInputBarState extends State<ChatInputBar>
 
     try {
       await previousWrite;
-      if (!mounted || !_pendingTextPasteIds.contains(pasteId)) return;
+      final retained = target?._root.draftStore != null && target!.isValid;
+      if (!retained && (!mounted || !_pendingTextPasteIds.contains(pasteId))) {
+        return;
+      }
 
       File? file;
       DocumentAttachment? attachment;
       try {
-        final dir = await AppDirectories.getUploadDirectory();
+        final dir =
+            await (target?.uploadDirectory() ??
+                AppDirectories.getUploadDirectory());
         await dir.create(recursive: true);
         file = await _reservePastedTextFile(dir);
         await file.writeAsString(text, flush: true);
@@ -2016,16 +3237,23 @@ class _ChatInputBarState extends State<ChatInputBar>
       } catch (_) {}
 
       if (attachment != null &&
-          mounted &&
-          _pendingTextPasteIds.contains(pasteId)) {
-        setState(() {
-          _pendingTextPasteIds.remove(pasteId);
-          _docs.add(attachment!);
-        });
+          ((retained && target.isValid) ||
+              (mounted && _pendingTextPasteIds.contains(pasteId)))) {
+        if (mounted) setState(() => _pendingTextPasteIds.remove(pasteId));
+        if (target != null) {
+          target.addFiles([attachment]);
+        } else {
+          _addFiles([attachment]);
+        }
         return;
       }
 
       await _deleteUnclaimedPastedText(file);
+      if (retained && target.isValid) {
+        if (mounted) setState(() => _pendingTextPasteIds.remove(pasteId));
+        target.insertText(text);
+        return;
+      }
       if (!mounted || !_pendingTextPasteIds.contains(pasteId)) return;
       setState(() => _pendingTextPasteIds.remove(pasteId));
       _insertPastedText(text);
@@ -2036,6 +3264,7 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   void _insertPastedText(String text) {
     if (!mounted) return;
+    text = text.replaceAll(quotePlaceholder, '');
     final value = _controller.value;
     final selection = value.selection;
     if (!selection.isValid) {
@@ -2085,11 +3314,17 @@ class _ChatInputBarState extends State<ChatInputBar>
   // Copy arbitrary files to upload directory (without deleting the source),
   // split into images and document attachments.
   Future<({List<String> images, List<DocumentAttachment> docs})>
-  _copyFilesToUpload(List<String> srcPaths) async {
+  _copyFilesToUpload(
+    List<String> srcPaths, {
+    ChatInputBarController? target,
+  }) async {
     final images = <String>[];
     final docs = <DocumentAttachment>[];
     try {
-      final dir = await AppDirectories.getUploadDirectory();
+      final dir =
+          await (target?.uploadDirectory() ??
+              widget.mediaController?.uploadDirectory() ??
+              AppDirectories.getUploadDirectory());
       for (final raw in srcPaths) {
         if (!mounted) {
           return (images: images, docs: docs);
@@ -2137,6 +3372,7 @@ class _ChatInputBarState extends State<ChatInputBar>
     return LayoutBuilder(
       builder: (context, constraints) {
         final List<_OverflowAction> actions = [];
+        int? reasoningActionIndex;
 
         // Model select (always present; can be hidden if overflow)
         actions.add(
@@ -2282,12 +3518,14 @@ class _ChatInputBarState extends State<ChatInputBar>
                   customBudget: widget.reasoningCustomBudget,
                 )
               : null;
+          reasoningActionIndex = actions.length;
           actions.add(
             _OverflowAction(
               width: compactLabel == null
                   ? normalButtonW
                   : _reasoningButtonWidth(compactLabel),
               builder: () => _CompactIconButton(
+                key: widget.reasoningButtonKey,
                 tooltip: l10n.chatInputBarReasoningStrengthTooltip,
                 icon: Lucide.Brain,
                 active: widget.reasoningActive,
@@ -2311,11 +3549,14 @@ class _ChatInputBarState extends State<ChatInputBar>
           actions.add(
             _OverflowAction(
               width: normalButtonW,
-              builder: () => _CompactIconButton(
-                tooltip: l10n.workspaceEntryTooltip,
-                icon: Lucide.FolderCode,
-                active: widget.workspaceActive,
-                onTap: lockTap(widget.onOpenWorkspace),
+              builder: () => ToolPermissionDot(
+                conversationId: widget.conversationId,
+                child: _CompactIconButton(
+                  tooltip: l10n.workspaceEntryTooltip,
+                  icon: Lucide.FolderCode,
+                  active: widget.workspaceActive,
+                  onTap: lockTap(widget.onOpenWorkspace),
+                ),
               ),
               menu: DesktopContextMenuItem(
                 icon: Lucide.FolderCode,
@@ -2345,17 +3586,45 @@ class _ChatInputBarState extends State<ChatInputBar>
           );
         }
 
-        // Tools button (local tools and MCP servers)
+        // Tools menu also includes independent browser navigation on desktop.
         if (widget.showToolsButton) {
           actions.add(
             _OverflowAction(
               width: normalButtonW,
-              builder: () => _CompactIconButton(
-                tooltip: l10n.chatInputBarToolsTooltip,
-                icon: Lucide.ToolCase,
-                active: widget.toolsActive,
-                onTap: lockTap(widget.onOpenTools),
-                onLongPress: lockTap(widget.onLongPressTools),
+              builder: () => ToolPermissionDot(
+                conversationId: widget.showWorkspaceButton
+                    ? null
+                    : widget.conversationId,
+                child: Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    _CompactIconButton(
+                      tooltip: widget.toolsConnectionIssue
+                          ? '${l10n.chatInputBarToolsTooltip} · ${l10n.mcpPageStatusFailed}'
+                          : l10n.chatInputBarToolsTooltip,
+                      icon: Lucide.ToolCase,
+                      active: widget.toolsActive,
+                      onTap: lockTap(widget.onOpenTools),
+                      onLongPress: lockTap(widget.onLongPressTools),
+                    ),
+                    if (widget.toolsConnectionIssue)
+                      Positioned(
+                        right: 3,
+                        bottom: 3,
+                        child: IgnorePointer(
+                          child: Container(
+                            key: const ValueKey('chat-tools-connection-issue'),
+                            width: 6,
+                            height: 6,
+                            decoration: BoxDecoration(
+                              color: Theme.of(context).colorScheme.error,
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
               menu: DesktopContextMenuItem(
                 icon: Lucide.ToolCase,
@@ -2439,6 +3708,24 @@ class _ChatInputBarState extends State<ChatInputBar>
           );
         }
 
+        if (widget.onOpenBrowser != null) {
+          actions.add(
+            _OverflowAction(
+              width: normalButtonW,
+              builder: () => _CompactIconButton(
+                tooltip: l10n.browserOpen,
+                icon: Lucide.AppWindow,
+                onTap: lockTap(widget.onOpenBrowser),
+              ),
+              menu: DesktopContextMenuItem(
+                icon: Lucide.AppWindow,
+                label: l10n.browserOpen,
+                onTap: lockTap(widget.onOpenBrowser),
+              ),
+            ),
+          );
+        }
+
         if (widget.onToggleLearningMode != null) {
           actions.add(
             _OverflowAction(
@@ -2479,24 +3766,83 @@ class _ChatInputBarState extends State<ChatInputBar>
         }
 
         if (widget.onClearContext != null) {
-          void showContextMenu() {
-            showDesktopAnchoredMenu(
-              context,
-              anchorKey: _contextMgmtAnchorKey,
-              items: [
-                if (widget.onCompressContext != null)
+          Future<void> showContextMenu() async {
+            if (_contextManagementMenuOpen) return;
+            _contextManagementMenuOpen = true;
+            try {
+              final conversationId = widget.conversationId;
+              final chat = context.read<ChatService?>();
+              final config = conversationId == null || chat == null
+                  ? null
+                  : await chat.compressionConfig(
+                      conversationId,
+                      context.read<SettingsProvider>().compressionDefaults,
+                    );
+              if (!context.mounted || widget.conversationId != conversationId) {
+                return;
+              }
+              await showDesktopAnchoredMenu(
+                context,
+                anchorKey: _contextMgmtAnchorKey,
+                items: [
+                  if (conversationId != null && chat != null && config != null)
+                    DesktopContextMenuItem(
+                      icon: Lucide.Sparkles,
+                      label: l10n.compressionAutoTitle,
+                      checked: config.mode == AutoCompressionMode.auto,
+                      onTap: _savingAutoCompression
+                          ? null
+                          : () async {
+                              if (_savingAutoCompression) return;
+                              _savingAutoCompression = true;
+                              try {
+                                await chat.setAutoCompressionEnabled(
+                                  conversationId,
+                                  config.mode != AutoCompressionMode.auto,
+                                );
+                              } catch (error) {
+                                if (context.mounted) {
+                                  showAppSnackBar(
+                                    context,
+                                    message: error.toString(),
+                                    type: NotificationType.error,
+                                  );
+                                }
+                              } finally {
+                                _savingAutoCompression = false;
+                              }
+                            },
+                    ),
+                  if (widget.onContextOperations != null)
+                    DesktopContextMenuItem(
+                      icon: Lucide.History,
+                      label: l10n.contextOperationsTitle,
+                      onTap: widget.onContextOperations,
+                    ),
+                  if (widget.onCompressContext != null)
+                    DesktopContextMenuItem(
+                      icon: Lucide.package2,
+                      label: l10n.compressContext,
+                      onTap: lockTap(widget.onCompressContext),
+                    ),
                   DesktopContextMenuItem(
-                    icon: Lucide.package2,
-                    label: l10n.compressContext,
-                    onTap: lockTap(widget.onCompressContext),
+                    icon: Lucide.Eraser,
+                    label: l10n.bottomToolsSheetClearContext,
+                    onTap: lockTap(widget.onClearContext),
                   ),
-                DesktopContextMenuItem(
-                  icon: Lucide.Eraser,
-                  label: l10n.bottomToolsSheetClearContext,
-                  onTap: lockTap(widget.onClearContext),
-                ),
-              ],
-            );
+                ],
+              );
+            } catch (error) {
+              if (context.mounted) {
+                showAppSnackBar(
+                  context,
+                  message: error.toString(),
+                  type: NotificationType.error,
+                );
+              }
+            } finally {
+              _contextManagementMenuOpen = false;
+            }
           }
 
           actions.add(
@@ -2507,13 +3853,13 @@ class _ChatInputBarState extends State<ChatInputBar>
                 child: _CompactIconButton(
                   tooltip: l10n.contextManagement,
                   icon: Lucide.Eraser,
-                  onTap: _composerLocked ? null : showContextMenu,
+                  onTap: showContextMenu,
                 ),
               ),
               menu: DesktopContextMenuItem(
                 icon: Lucide.Eraser,
                 label: l10n.contextManagement,
-                onTap: _composerLocked ? null : showContextMenu,
+                onTap: showContextMenu,
               ),
             ),
           );
@@ -2604,6 +3950,11 @@ class _ChatInputBarState extends State<ChatInputBar>
             Container(
               key: _leftOverflowAnchorKey,
               child: _CompactIconButton(
+                key:
+                    reasoningActionIndex != null &&
+                        reasoningActionIndex >= visibleCount
+                    ? widget.reasoningButtonKey
+                    : null,
                 tooltip: l10n.chatInputBarMoreTooltip,
                 icon: Lucide.Plus,
                 onTap: () {
@@ -2741,6 +4092,296 @@ class _ChatInputBarState extends State<ChatInputBar>
     setState(() {});
   }
 
+  Future<void> _imageQualityWork = Future<void>.value();
+
+  bool _sameImageSession(int revision, List<_DraftImage> images) =>
+      mounted &&
+      revision == _draftReplacementRevision &&
+      images.every(_images.contains);
+
+  EditorImage _editorInput(_DraftImage image) => EditorImage(
+    id: image.id,
+    path: image.path,
+    sourcePath: image.sourcePath,
+    document: image.edits,
+    failed: _failedImageIds.contains(image.id),
+  );
+
+  List<String> _ownedImagePaths(
+    ChatInputBarController target,
+    Iterable<_DraftImage> images, {
+    Set<String> keep = const {},
+  }) => {
+    for (final image in images)
+      for (final path
+          in target.persistent
+              ? [image.path, if (image.sourcePath != null) image.sourcePath!]
+              : image.ownedFiles)
+        if (!keep.contains(path)) path,
+  }.toList();
+
+  Future<void> _releaseReplacedImageFiles(
+    ChatInputBarController target,
+    Iterable<String> paths,
+  ) async {
+    if (paths.isEmpty) return;
+    try {
+      final store = target._root.draftStore;
+      final owner = target._owner ?? target._root.draftOwnerId;
+      if (target.persistent && store != null && owner != null) {
+        await store.releaseReplacedFiles(owner, paths);
+      } else {
+        final directory = await target.uploadDirectory();
+        for (final path in paths.toSet()) {
+          if (p.isWithin(directory.path, path) &&
+              !_docs.any((doc) => doc.path == path) &&
+              !_images.any(
+                (image) => image.path == path || image.sourcePath == path,
+              )) {
+            await UploadDedupe.deleteIfUnshared(path);
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('[ChatInputBar] Failed to clean replaced image: $error');
+    }
+  }
+
+  Future<void> _openDraftViewer(int index) async {
+    if (_composerLocked) return;
+    final clicked = _images[index];
+    final images = _images
+        .where(
+          (i) =>
+              !_processingImageIds.contains(i.id) &&
+              !_failedImageIds.contains(i.id),
+        )
+        .toList();
+    final initial = images.indexOf(clicked);
+    if (initial < 0) return;
+    final revision = _draftReplacementRevision;
+    final hadFocus = widget.focusNode?.hasFocus ?? false;
+    widget.focusNode?.unfocus();
+    final target = (widget.mediaController ?? _ownedNativeMedia).capture();
+    final settings = context.read<SettingsProvider>();
+    await ImageViewerPage(
+      images: images.map((i) => i.path).toList(),
+      initialIndex: initial,
+      draft: ImageViewerDraftMode(
+        onEdit: (i) async {
+          await _imageQualityWork;
+          if (!_sameImageSession(revision, images)) return false;
+          final completed = await _openImageEditor(_images.indexOf(images[i]));
+          return completed || !_sameImageSession(revision, images);
+        },
+        qualityOf: (i) => images[i].quality ?? settings.imageUploadQuality,
+        customQualityOf: (i) =>
+            images[i].customQuality ?? settings.imageCompressCustomQuality,
+        originalAvailable: (i) =>
+            images[i].sourceIsOriginal && images[i].sourcePath != null,
+        onQualityChanged: (i, quality, custom) async {
+          final image = images[i], version = ++images[i].qualityRevision;
+          setState(() => image.changingQuality = true);
+          final previousWork = _imageQualityWork;
+          final finished = Completer<void>();
+          _imageQualityWork = finished.future;
+          try {
+            await previousWork;
+            if (!_sameImageSession(revision, images) ||
+                !target.isValid ||
+                image.qualityRevision != version) {
+              return image.path;
+            }
+            final source = image.sourcePath ?? image.path;
+            final dir = await target.uploadDirectory();
+            final result = await ImageEditRenderer.export(
+              sourcePath: source,
+              document: image.edits,
+              directory: dir,
+              config: SettingsProvider.configFor(
+                quality,
+                custom: custom ?? settings.imageCompressCustomQuality,
+                includeTransparent: settings.imageCompressTransparentEnabled,
+              ),
+            );
+            if (!_sameImageSession(revision, images) ||
+                !target.isValid ||
+                image.qualityRevision != version) {
+              if (!result.reused &&
+                  !images.any(
+                    (i) => i.path == result.path || i.sourcePath == result.path,
+                  )) {
+                await UploadDedupe.deleteIfUnshared(result.path);
+              }
+              return image.path;
+            }
+            final previous = _ownedImagePaths(
+              target,
+              [image],
+              keep: {source, result.path},
+            );
+            setState(() {
+              image.sourcePath ??= source;
+              if (!result.reused) image.ownedFiles.add(result.path);
+              image.ownedFiles.removeAll(previous);
+              image.path = result.path;
+              image.quality = quality;
+              image.customQuality = custom;
+            });
+            unawaited(_releaseReplacedImageFiles(target, previous));
+            return result.path;
+          } finally {
+            if (mounted &&
+                _images.contains(image) &&
+                version == image.qualityRevision) {
+              setState(() => image.changingQuality = false);
+            }
+            finished.complete();
+          }
+        },
+      ),
+    ).open(context);
+    if (mounted && revision == _draftReplacementRevision && hadFocus) {
+      widget.focusNode?.requestFocus();
+    }
+  }
+
+  Future<bool> _openImageEditor(int index) async {
+    if (_composerLocked || index < 0 || index >= _images.length) return false;
+    final clicked = _images[index];
+    final images = _images
+        .where((i) => !_processingImageIds.contains(i.id))
+        .toList();
+    final initial = images.indexOf(clicked);
+    if (initial < 0) return false;
+    final revision = _draftReplacementRevision;
+    final target = (widget.mediaController ?? _ownedNativeMedia).capture();
+    final settings = context.read<SettingsProvider>();
+    final hadFocus = widget.focusNode?.hasFocus ?? false;
+    widget.focusNode?.unfocus();
+    final result = await Navigator.of(context).push<bool>(
+      PageRouteBuilder(
+        opaque: false,
+        pageBuilder: (ctx, _, __) => ImageEditorPage(
+          images: images.map(_editorInput).toList(),
+          initialIndex: initial,
+          onSave: (documents) async {
+            final writes = <_DraftImage, UploadWrite>{};
+            try {
+              if (!_sameImageSession(revision, images) || !target.isValid) {
+                throw StateError('Draft changed');
+              }
+              final dir = await target.uploadDirectory();
+              for (final entry in documents.entries) {
+                final image = images.firstWhere((i) => i.id == entry.key);
+                writes[image] = await ImageEditRenderer.export(
+                  sourcePath: image.sourcePath ?? image.path,
+                  document: entry.value,
+                  directory: dir,
+                  config: SettingsProvider.configFor(
+                    image.quality ?? settings.imageUploadQuality,
+                    custom:
+                        image.customQuality ??
+                        settings.imageCompressCustomQuality,
+                    includeTransparent:
+                        settings.imageCompressTransparentEnabled,
+                  ),
+                );
+              }
+              if (!_sameImageSession(revision, images) || !target.isValid) {
+                throw StateError('Draft changed');
+              }
+              final previousPaths = <String>[];
+              setState(() {
+                for (final entry in writes.entries) {
+                  final image = entry.key;
+                  image.sourcePath ??= image.path;
+                  final retired = _ownedImagePaths(
+                    target,
+                    [image],
+                    keep: {image.sourcePath!, entry.value.path},
+                  );
+                  previousPaths.addAll(retired);
+                  image.ownedFiles.removeAll(retired);
+                  if (!entry.value.reused) {
+                    image.ownedFiles.add(entry.value.path);
+                  }
+                  entry.key.path = entry.value.path;
+                  entry.key.edits = documents[entry.key.id]!;
+                }
+              });
+              unawaited(_releaseReplacedImageFiles(target, previousPaths));
+            } catch (_) {
+              for (final entry in writes.entries) {
+                if (!entry.value.reused &&
+                    entry.value.path != entry.key.path &&
+                    entry.value.path != entry.key.sourcePath) {
+                  await UploadDedupe.deleteIfUnshared(entry.value.path);
+                }
+              }
+              rethrow;
+            }
+          },
+          onRetry: (id) async {
+            if (!_sameImageSession(revision, images) || !target.isValid) {
+              return null;
+            }
+            final image = images.firstWhere((i) => i.id == id);
+            final dir = await target.uploadDirectory();
+            final source = image.sourcePath ?? image.path;
+            final config = SettingsProvider.configFor(
+              image.quality ?? settings.imageUploadQuality,
+              custom:
+                  image.customQuality ?? settings.imageCompressCustomQuality,
+              includeTransparent: settings.imageCompressTransparentEnabled,
+            );
+            final prepared = await ImageEditRenderer.prepareDraft(
+              source,
+              dir,
+              config,
+              image.edits,
+              reuseSourceInPlace:
+                  target.persistent || image.ownedFiles.contains(source),
+            );
+            if (prepared == null) return null;
+            final writes = [prepared.source, ?prepared.image];
+            if (!_sameImageSession(revision, images) || !target.isValid) {
+              for (final write in writes) {
+                if (!write.reused && write.path != source) {
+                  await UploadDedupe.deleteIfUnshared(write.path);
+                }
+              }
+              return null;
+            }
+            setState(() {
+              image.sourcePath = prepared.source.path;
+              for (final write in writes) {
+                if (!write.reused && write.path != source) {
+                  image.ownedFiles.add(write.path);
+                }
+              }
+              if (prepared.image case final saved?) {
+                image.path = saved.path;
+                _failedImageIds.remove(id);
+              }
+            });
+            return prepared.image == null ? null : _editorInput(image);
+          },
+          onRemove: (id) {
+            if (!_sameImageSession(revision, images)) return;
+            final at = _images.indexWhere((i) => i.id == id);
+            if (at >= 0) _removeImageAt(at);
+            images.removeWhere((i) => i.id == id);
+          },
+        ),
+      ),
+    );
+    if (mounted && revision == _draftReplacementRevision && hadFocus) {
+      widget.focusNode?.requestFocus();
+    }
+    return result ?? false;
+  }
+
   Widget _buildImageAttachmentPreview(
     BuildContext context,
     int idx,
@@ -2756,42 +4397,55 @@ class _ChatInputBarState extends State<ChatInputBar>
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        DecoratedBox(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: previewBorder, width: 1),
-          ),
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(9),
-            child: processing
-                ? ColoredBox(
-                    color: theme.colorScheme.scrim,
-                    child: const SizedBox(width: 88, height: 88),
-                  )
-                : Image(
-                    image: ResizeImage(
-                      FileImage(File(image.path)),
-                      width: (88 * MediaQuery.devicePixelRatioOf(context))
-                          .ceil(),
-                      height: (88 * MediaQuery.devicePixelRatioOf(context))
-                          .ceil(),
-                      policy: ResizeImagePolicy.fit,
-                    ),
-                    width: 88,
-                    height: 88,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => Container(
+        _DraftImageTapTarget(
+          key: ValueKey('chat-input-image-preview:$idx'),
+          label: l10n.imageViewerPageImageLabel(idx + 1, _images.length),
+          onTap: processing || _composerLocked
+              ? null
+              : () {
+                  if (failed) {
+                    unawaited(_openImageEditor(idx));
+                  } else {
+                    unawaited(_openDraftViewer(idx));
+                  }
+                },
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: previewBorder, width: 1),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(9),
+              child: processing
+                  ? ColoredBox(
+                      color: theme.colorScheme.scrim,
+                      child: const SizedBox(width: 88, height: 88),
+                    )
+                  : Image(
+                      image: ResizeImage(
+                        FileImage(File(image.path)),
+                        width: (88 * MediaQuery.devicePixelRatioOf(context))
+                            .ceil(),
+                        height: (88 * MediaQuery.devicePixelRatioOf(context))
+                            .ceil(),
+                        policy: ResizeImagePolicy.fit,
+                      ),
                       width: 88,
                       height: 88,
-                      color: previewFill,
-                      child: Icon(
-                        Icons.broken_image,
-                        color: theme.colorScheme.onSurface.withValues(
-                          alpha: 0.45,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => Container(
+                        width: 88,
+                        height: 88,
+                        color: previewFill,
+                        child: Icon(
+                          Icons.broken_image,
+                          color: theme.colorScheme.onSurface.withValues(
+                            alpha: 0.45,
+                          ),
                         ),
                       ),
                     ),
-                  ),
+            ),
           ),
         ),
         Positioned.fill(
@@ -2906,6 +4560,7 @@ class _ChatInputBarState extends State<ChatInputBar>
               child: ComposerAttachmentCard(
                 key: ValueKey(file.path),
                 file: file,
+                notice: _documentNotice(file),
                 removeKey: ValueKey('chat-input-document-remove:$docIndex'),
                 onRemove: () => _removeDocumentAt(docIndex),
               ),
@@ -2918,6 +4573,7 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   @override
   Widget build(BuildContext context) {
+    _configureNativeOwner(context);
     final theme = Theme.of(context);
     final settings = context.watch<SettingsProvider>();
     final selectedAsrService = settings.selectedAsrService;
@@ -2937,6 +4593,7 @@ class _ChatInputBarState extends State<ChatInputBar>
     final hasText = _controller.text.trim().isNotEmpty;
     final hasImages = _images.isNotEmpty;
     final hasDocs = _docs.isNotEmpty;
+    final hasInput = hasText || hasImages || hasDocs || _uiContext != null;
     _supportsImagesApiRouting(context);
     final bool isMobileLayout =
         MediaQuery.sizeOf(context).width < AppBreakpoints.tablet;
@@ -2962,12 +4619,65 @@ class _ChatInputBarState extends State<ChatInputBar>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (_docs.any((doc) => _missingDocumentPaths.contains(doc.path)))
+                Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Text(
+                    AppLocalizations.of(context)!.composerDraftMissingFile,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ),
+              if (widget.mediaController?.draftStore?.errors.containsKey(
+                    widget.conversationId,
+                  ) ??
+                  false)
+                _QueuedInputBanner(
+                  label: AppLocalizations.of(context)!.composerDraftSaveFailed,
+                  cancelLabel: AppLocalizations.of(context)!.composerDraftRetry,
+                  onCancel: widget.mediaController?.onRetrySave,
+                ),
+              if (!widget.hasQueuedInput &&
+                  !(widget.mediaController?.draftStore?.submitting.contains(
+                        widget.mediaController?.draftOwnerId,
+                      ) ??
+                      false) &&
+                  (widget.mediaController?.draftStore
+                          ?.peek(widget.mediaController?.draftOwnerId ?? '')
+                          ?.pending !=
+                      null))
+                Row(
+                  children: [
+                    Expanded(
+                      child: _QueuedInputBanner(
+                        label: AppLocalizations.of(
+                          context,
+                        )!.composerDraftRecovered,
+                        cancelLabel: AppLocalizations.of(
+                          context,
+                        )!.composerDraftRestore,
+                        onCancel: widget.mediaController?.onRecoverDraft,
+                      ),
+                    ),
+                    IosIconButton(
+                      icon: Lucide.Trash2,
+                      tooltip: AppLocalizations.of(
+                        context,
+                      )!.composerDraftDiscard,
+                      onTap: widget.mediaController?.onDiscardRecoveredDraft,
+                    ),
+                  ],
+                ),
               if (widget.hasQueuedInput) ...[
                 _QueuedInputBanner(
-                  label: AppLocalizations.of(
-                    context,
-                  )!.chatInputBarQueuedPending,
+                  label:
+                      widget.queuedStatusLabel ??
+                      AppLocalizations.of(context)!.chatInputBarQueuedPending,
                   previewText: widget.queuedPreviewText,
+                  subtitle: widget.queuedSubtitle,
+                  paused: widget.queuedPaused,
                   cancelLabel: AppLocalizations.of(
                     context,
                   )!.chatInputBarQueuedCancel,
@@ -3103,6 +4813,28 @@ class _ChatInputBarState extends State<ChatInputBar>
                                             ),
                                     ),
                                 ],
+                                if (_uiContext case final attachment?)
+                                  Padding(
+                                    padding:
+                                        const EdgeInsetsDirectional.fromSTEB(
+                                          AppSpacing.md,
+                                          AppSpacing.xs,
+                                          AppSpacing.md,
+                                          AppSpacing.xs,
+                                        ),
+                                    child: UiComposerContextChip(
+                                      attachment: attachment,
+                                      onRemove: _composerLocked || _isSubmitting
+                                          ? null
+                                          : () {
+                                              setState(() => _uiContext = null);
+                                              widget
+                                                  .mediaController
+                                                  ?.onDraftChanged
+                                                  ?.call();
+                                            },
+                                    ),
+                                  ),
                                 if (hasDocs || hasImages)
                                   _buildInlineAttachmentPreviews(
                                     context,
@@ -3210,7 +4942,8 @@ class _ChatInputBarState extends State<ChatInputBar>
                                                 // onSecondaryTapDown: (details) {
                                                 //   // _showDesktopContextMenu(details.globalPosition);
                                                 // },
-                                                child: TextField(
+                                                child: LongMessageEditor(
+                                                  key: _longEditorKey,
                                                   controller: _controller,
                                                   focusNode: widget.focusNode,
                                                   onChanged: _onTextChanged,
@@ -3239,8 +4972,6 @@ class _ChatInputBarState extends State<ChatInputBar>
                                                   expands: expandedLayout,
                                                   // On mobile, optionally show "Send" on the return key and submit on tap.
                                                   // Still keep multiline so pasted text preserves line breaks.
-                                                  keyboardType:
-                                                      TextInputType.multiline,
                                                   textInputAction: enterToSend
                                                       ? TextInputAction.send
                                                       : TextInputAction.newline,
@@ -3253,10 +4984,13 @@ class _ChatInputBarState extends State<ChatInputBar>
                                                   // caused by recreating the callback on every build.
                                                   // See: https://github.com/flutter/flutter/issues/150551
                                                   contextMenuBuilder:
-                                                      _buildContextMenu,
+                                                      _buildMessageContextMenu,
+                                                  onKeyEvent: _handleKeyEvent,
                                                   autofocus: false,
                                                   decoration: InputDecoration(
                                                     hintText: _hint(context),
+                                                    hintFadeDuration:
+                                                        Duration.zero,
                                                     hintStyle: TextStyle(
                                                       color: theme
                                                           .colorScheme
@@ -3294,22 +5028,34 @@ class _ChatInputBarState extends State<ChatInputBar>
                                         PositionedDirectional(
                                           top: 2,
                                           end: 6,
-                                          child: IosIconButton(
-                                            icon: _isExpanded
-                                                ? Lucide.Minimize2
-                                                : Lucide.Maximize2,
-                                            size: 16,
-                                            color: theme.colorScheme.onSurface
-                                                .withValues(alpha: 0.45),
-                                            tooltip: _isExpanded
-                                                ? AppLocalizations.of(
-                                                    context,
-                                                  )!.chatInputBarCollapse
-                                                : AppLocalizations.of(
-                                                    context,
-                                                  )!.chatInputBarExpand,
-                                            onTap: () =>
-                                                _setExpanded(!_isExpanded),
+                                          // Inside both editors' tap regions, so
+                                          // a non-touch pointer (mouse,
+                                          // trackpad, stylus) or any desktop
+                                          // click here is not a "tap outside"
+                                          // that drops focus and bounces the
+                                          // keyboard.
+                                          child: CodeEditorTapRegion(
+                                            child: TextFieldTapRegion(
+                                              child: IosIconButton(
+                                                icon: _isExpanded
+                                                    ? Lucide.Minimize2
+                                                    : Lucide.Maximize2,
+                                                size: 16,
+                                                color: theme
+                                                    .colorScheme
+                                                    .onSurface
+                                                    .withValues(alpha: 0.45),
+                                                tooltip: _isExpanded
+                                                    ? AppLocalizations.of(
+                                                        context,
+                                                      )!.chatInputBarCollapse
+                                                    : AppLocalizations.of(
+                                                        context,
+                                                      )!.chatInputBarExpand,
+                                                onTap: () =>
+                                                    _setExpanded(!_isExpanded),
+                                              ),
+                                            ),
                                           ),
                                         ),
                                     ],
@@ -3415,10 +5161,8 @@ class _ChatInputBarState extends State<ChatInputBar>
                                                               ?.isNotEmpty ??
                                                           false))
                                                     _ContextUsageInputControl(
-                                                      onTap: _composerLocked
-                                                          ? null
-                                                          : widget
-                                                                .onOpenContextUsage,
+                                                      onTap: widget
+                                                          .onOpenContextUsage,
                                                     ),
                                                   if (showVoiceInput) ...[
                                                     _CompactIconButton(
@@ -3438,12 +5182,13 @@ class _ChatInputBarState extends State<ChatInputBar>
                                                   ],
                                                   _CompactSendButton(
                                                     enabled:
-                                                        (hasText ||
-                                                            hasImages ||
-                                                            hasDocs) &&
-                                                        !_hasUnreadyImages &&
-                                                        !widget.loading,
-                                                    loading: widget.loading,
+                                                        hasInput &&
+                                                        !_composerLocked &&
+                                                        !_hasUnreadyAttachments,
+                                                    loading:
+                                                        widget.loading &&
+                                                        (!hasInput ||
+                                                            _composerLocked),
                                                     onSend: _handleSend,
                                                     onStop: widget.loading
                                                         ? widget.onStop
@@ -3524,7 +5269,7 @@ class _ChatInputBarState extends State<ChatInputBar>
                 : null,
             child: child,
           ),
-          child: composer,
+          child: RepaintBoundary(child: composer),
         );
       },
     );
@@ -3536,12 +5281,16 @@ class _QueuedInputBanner extends StatelessWidget {
     required this.label,
     required this.cancelLabel,
     this.previewText,
+    this.subtitle,
+    this.paused = false,
     this.onCancel,
   });
 
   final String label;
   final String cancelLabel;
   final String? previewText;
+  final String? subtitle;
+  final bool paused;
   final VoidCallback? onCancel;
 
   @override
@@ -3571,9 +5320,11 @@ class _QueuedInputBanner extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.only(top: 2),
             child: Icon(
-              Icons.schedule_rounded,
+              paused ? LucideIcons.pause : LucideIcons.clock,
               size: 16,
-              color: theme.colorScheme.primary,
+              color: paused
+                  ? context.appColors.warning
+                  : theme.colorScheme.primary,
             ),
           ),
           const SizedBox(width: AppSpacing.xs),
@@ -3582,11 +5333,26 @@ class _QueuedInputBanner extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
-                  label,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    fontWeight: AppFontWeights.semibold,
-                  ),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 2,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text(
+                      label,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: AppFontWeights.semibold,
+                      ),
+                    ),
+                    if (subtitle != null)
+                      Text(
+                        subtitle!,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontSize: 12.5,
+                        ),
+                      ),
+                  ],
                 ),
                 if (hasPreview) ...[
                   const SizedBox(height: 2),
@@ -3750,6 +5516,7 @@ double _reasoningButtonWidth(String label) {
 
 class _CompactIconButton extends StatelessWidget {
   const _CompactIconButton({
+    super.key,
     required this.icon,
     this.onTap,
     this.onLongPress,
@@ -4061,4 +5828,64 @@ class _VoiceWaveformPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_VoiceWaveformPainter oldDelegate) => true;
+}
+
+class _DraftImageTapTarget extends StatefulWidget {
+  const _DraftImageTapTarget({
+    super.key,
+    required this.label,
+    required this.child,
+    this.onTap,
+  });
+  final String label;
+  final Widget child;
+  final VoidCallback? onTap;
+  @override
+  State<_DraftImageTapTarget> createState() => _DraftImageTapTargetState();
+}
+
+class _DraftImageTapTargetState extends State<_DraftImageTapTarget> {
+  bool _hover = false, _pressed = false;
+  @override
+  Widget build(BuildContext context) => Semantics(
+    button: true,
+    label: widget.label,
+    enabled: widget.onTap != null,
+    child: MouseRegion(
+      cursor: widget.onTap == null
+          ? MouseCursor.defer
+          : SystemMouseCursors.zoomIn,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() {
+        _hover = false;
+        _pressed = false;
+      }),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        onTapDown: widget.onTap == null
+            ? null
+            : (_) => setState(() => _pressed = true),
+        onTapUp: (_) => setState(() => _pressed = false),
+        onTapCancel: () => setState(() => _pressed = false),
+        child: AnimatedScale(
+          scale: _pressed ? .97 : 1,
+          duration: const Duration(milliseconds: 120),
+          child: Container(
+            foregroundDecoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: _hover && widget.onTap != null
+                  ? Border.all(
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.primary.withValues(alpha: .28),
+                      width: 2,
+                    )
+                  : null,
+            ),
+            child: widget.child,
+          ),
+        ),
+      ),
+    ),
+  );
 }

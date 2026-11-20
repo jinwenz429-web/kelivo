@@ -456,18 +456,65 @@ void main() {
   });
 
   group('Qwen Audio ASR', () {
-    test(
-      'combineQwenAudioTranscript inserts space after Latin punctuation',
-      () {
-        expect(combineQwenAudioTranscript('Hello.', 'World'), 'Hello. World');
-        expect(combineQwenAudioTranscript('Hello!', 'World'), 'Hello! World');
-        expect(combineQwenAudioTranscript('Hello', 'World'), 'Hello World');
-        expect(combineQwenAudioTranscript('Hello. ', 'World'), 'Hello. World');
-        // CJK joins stay unspaced.
-        expect(combineQwenAudioTranscript('你好。', '今天'), '你好。今天');
-        expect(combineQwenAudioTranscript('你好', '世界'), '你好世界');
-      },
-    );
+    for (final endpoint in [
+      '',
+      'wss://proxy.test/custom/inference?project=one',
+    ]) {
+      test(
+        'uses Singapore Workspace ID and endpoint override "$endpoint"',
+        () async {
+          final socket = _FakeWebSocket();
+          final session =
+              await CloudAsrService(
+                websocketConnector: (uri, headers) async {
+                  expect(
+                    uri.toString(),
+                    endpoint.isEmpty
+                        ? 'wss://token-plan.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference'
+                        : endpoint,
+                  );
+                  expect(headers['X-DashScope-WorkSpace'], 'token-plan');
+                  return socket;
+                },
+              ).startSession(
+                QwenAudioAsrOptions(
+                  apiKey: 'key',
+                  workspaceId: 'token-plan',
+                  region: 'ap-southeast-1',
+                  endpoint: endpoint,
+                ),
+              );
+          expect(
+            socket.sentJson.single['payload']['model'],
+            'qwen-audio-3.0-asr-flash-streaming',
+          );
+          await session.cancel();
+        },
+      );
+    }
+
+    test('combineAsrTranscript inserts space after Latin punctuation', () {
+      expect(combineAsrTranscript('Hello.', 'World'), 'Hello. World');
+      expect(combineAsrTranscript('Hello!', 'World'), 'Hello! World');
+      expect(combineAsrTranscript('Hello', 'World'), 'Hello World');
+      expect(combineAsrTranscript('Hello. ', 'World'), 'Hello. World');
+      expect(
+        combineAsrTranscript('Hola.', '¿Cómo estás?'),
+        'Hola. ¿Cómo estás?',
+      );
+      expect(combineAsrTranscript('Hola.', '¡Bien!'), 'Hola. ¡Bien!');
+      expect(combineAsrTranscript('He said:', '“Hello.”'), 'He said: “Hello.”');
+      expect(combineAsrTranscript('He said:', "'Hello.'"), "He said: 'Hello.'");
+      expect(
+        combineAsrTranscript('Il a dit :', '«\u00a0Bonjour\u00a0»'),
+        'Il a dit : «\u00a0Bonjour\u00a0»',
+      );
+      expect(combineAsrTranscript('don', "'t"), "don't");
+      // CJK joins stay unspaced.
+      expect(combineAsrTranscript('你好。', '今天'), '你好。今天');
+      expect(combineAsrTranscript('你好', '世界'), '你好世界');
+      expect(combineAsrTranscript('她说：', '“你好。”'), '她说：“你好。”');
+    });
 
     test('accumulates finalized sentences with the current partial', () async {
       final socket = _FakeWebSocket();

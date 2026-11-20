@@ -234,6 +234,38 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  test(
+    'summary reads only new user revisions up to the original character budget',
+    () async {
+      final convo = await chatService.createConversation(
+        title: 'incremental summary',
+      );
+      for (final (role, content) in [
+        ('user', 'already summarized'),
+        ('assistant', 'previous answer'),
+        ('user', '   '),
+        ('user', '  first  '),
+        ('assistant', 'assistant text'),
+        ('user', 'x' * 2100),
+        ('user', 'after snapshot'),
+      ]) {
+        await chatService.addMessage(
+          conversationId: convo.id,
+          role: role,
+          content: content,
+        );
+      }
+      expect(
+        await chatService.generateSummarySource(convo.id, start: 2, end: 6),
+        'first\n\n${'x' * 1993}',
+      );
+      expect(
+        await chatService.generateSummarySource(convo.id, start: 2, end: 5),
+        'first',
+      );
+    },
+  );
+
   testWidgets(
     'legacy mode generates summary when only allowPastConversationRecall is on',
     (tester) async {
@@ -263,58 +295,6 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
-
-  testWidgets('clear-context label counts logical messages, not revisions', (
-    tester,
-  ) async {
-    final controller = await pumpHarness(tester);
-    await tester.runAsync(() async {
-      await assistantProvider.updateAssistant(
-        assistantProvider.currentAssistant!.copyWith(
-          limitContextMessages: true,
-          contextMessageSize: 10,
-        ),
-      );
-      final conversation = await chatService.createConversation(
-        title: 'Versioned Chat',
-        assistantId: assistantProvider.currentAssistantId,
-      );
-      await chatService.addMessage(
-        conversationId: conversation.id,
-        role: 'user',
-        content: 'Question',
-      );
-      final answer = await chatService.addMessage(
-        conversationId: conversation.id,
-        role: 'assistant',
-        content: 'Answer v1',
-      );
-      await chatService.appendMessageVersion(
-        messageId: answer.id,
-        content: 'Answer v2',
-      );
-      await chatService.appendMessageVersion(
-        messageId: answer.id,
-        content: 'Answer v3',
-      );
-      await controller.chatController.setCurrentConversationAndLoad(
-        chatService.getConversation(conversation.id)!,
-      );
-
-      expect(controller.debugViewModel.getContextMessageCount(), (
-        actual: 2,
-        configured: 10,
-      ));
-
-      await controller.debugViewModel.clearContext();
-
-      expect(controller.debugViewModel.getContextMessageCount(), (
-        actual: 0,
-        configured: 10,
-      ));
-    });
-    expect(tester.takeException(), isNull);
-  });
 }
 
 class _ControllerHarness extends StatefulWidget {

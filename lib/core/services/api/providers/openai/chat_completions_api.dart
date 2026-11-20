@@ -1,3 +1,8 @@
+import '../../../../models/carried_original.dart';
+import '../../../network/provider_http_exception.dart';
+import '../../../../models/image_context.dart';
+import '../../request_history_context.dart';
+import '../../request_image_context.dart';
 import '../../../custom_request_merger.dart';
 import '../../../../models/provider_oauth.dart';
 import 'dart:async';
@@ -12,6 +17,8 @@ import '../../../../providers/settings_provider.dart';
 import '../../../../utils/multimodal_input_utils.dart';
 import '../../../../../utils/sandbox_path_resolver.dart';
 import '../../chat_api_helpers.dart';
+import '../../response_speed.dart';
+import '../../builtin_tools.dart';
 import '../../native_input_attachments.dart';
 import '../../tool_result_content.dart';
 import '../../generation/tool_loop_runner.dart';
@@ -31,6 +38,9 @@ Map<String, dynamic> copyChatCompletionMessage(Map<String, dynamic> m) {
   final out = <String, dynamic>{
     'role': role,
     'content': m.containsKey('content') ? (m['content'] ?? '') : '',
+    if (m[historySourceKey] != null) historySourceKey: m[historySourceKey],
+    if (m[imageContextOwnerKey] != null)
+      imageContextOwnerKey: m[imageContextOwnerKey],
   };
 
   // Preserve optional name (some providers support it on non-tool roles).
@@ -65,6 +75,12 @@ Map<String, dynamic> copyChatCompletionMessage(Map<String, dynamic> m) {
 
   // Preserve tool linkage fields.
   if (role == 'tool') {
+    // Follow-up requests still need typed image metadata to rebuild history.
+    // The final request builder removes it after resolving the image payloads.
+    final metadata = m['metadata'];
+    if (metadata is Map) {
+      out['metadata'] = Map<String, dynamic>.from(metadata);
+    }
     final toolCallId = m['tool_call_id'];
     if (toolCallId != null && toolCallId.toString().isNotEmpty) {
       out['tool_call_id'] = toolCallId;
@@ -76,6 +92,10 @@ Map<String, dynamic> copyChatCompletionMessage(Map<String, dynamic> m) {
 
   // Keep structured media refs across tool-followup rebuilds so later
   // Chat Completions builders can still emit image_url / multimodal parts.
+  final imageReferences = internalImageReferences(m);
+  if (imageReferences.isNotEmpty) {
+    out[multimodalInternalImageReferencesKey] = imageReferences;
+  }
   final mediaPaths = m[multimodalInternalMediaPathsKey];
   if (mediaPaths != null) {
     if (mediaPaths is List) {
@@ -103,26 +123,19 @@ Map<String, dynamic> copyChatCompletionMessage(Map<String, dynamic> m) {
   return out;
 }
 
-List<Map<String, dynamic>> cleanToolsForCompatibility(
+List<Map<String, dynamic>> copyChatCompletionTools(
   List<Map<String, dynamic>> tools,
 ) {
-  final cleaned = tools.map((tool) {
+  // These parameters are JSON Schema. Google's native Schema repairs can add
+  // constraints (e.g. string items/required properties) that change its meaning.
+  return tools.map((tool) {
     final result = Map<String, dynamic>.from(tool);
     final fn = result['function'];
     if (fn is Map) {
-      final fnMap = Map<String, dynamic>.from(fn);
-      final params = fnMap['parameters'];
-      if (params is Map) {
-        fnMap['parameters'] = cleanSchemaForGemini(
-          Map<String, dynamic>.from(params),
-        );
-      }
-      result['function'] = fnMap;
+      result['function'] = Map<String, dynamic>.from(fn);
     }
     return result;
   }).toList();
-  // print('[ChatApi/Tools] Cleaned ${cleaned.length} tools: ${jsonEncode(cleaned)}');
-  return cleaned;
 }
 
 bool _isRemoteImageContentPart(dynamic part) {
@@ -262,27 +275,34 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
   required bool allowRemoteImages,
   required ReasoningReplayPolicy reasoningReplay,
   ReasoningReplayField replayField = ReasoningReplayField.reasoningContent,
+  // Replay preferences filter stored history; active tool continuations must
+  // retain the reasoning returned by this request, including signed blocks.
+  int? currentToolMessagesStart,
   bool skipImageParsing = false,
 }) async {
   final out = <Map<String, dynamic>>[];
+  final upstreamModelId = (nativeInputs.spec.apiModelId ?? nativeInputs.spec.id)
+      .toLowerCase();
+  final requiresSignedReasoning =
+      upstreamModelId.contains('claude') ||
+      upstreamModelId.startsWith('anthropic/');
+  final prefersStructuredReasoning =
+      replayField == ReasoningReplayField.reasoningDetails ||
+      BuiltInToolsHelper.isOpenRouterProvider(nativeInputs.config);
   // Assistant turns cannot carry image_url/video_url; stash for the last user
   // message (same pattern as Responses shouldAttachAssistantImage).
   // Use last *user* index — not array-tail — so tool follow-ups that append
   // assistant tool_calls / tool results still receive stashed assistant media.
-  int lastUserIndex = -1;
-  for (int i = messages.length - 1; i >= 0; i--) {
-    if ((messages[i]['role'] ?? '').toString() == 'user') {
-      lastUserIndex = i;
-      break;
-    }
-  }
+  final lastUserIndex = lastUserInputIndex(messages);
   final pendingAssistantMediaUrls = <String>[];
   final pendingToolImageParts = <Map<String, dynamic>>[];
+  Object? pendingToolOwner;
   void flushToolImages() {
     if (pendingToolImageParts.isEmpty) return;
     out.add({
       'role': 'user',
       'content': [...pendingToolImageParts],
+      if (pendingToolOwner != null) historySourceKey: pendingToolOwner,
     });
     pendingToolImageParts.clear();
   }
@@ -328,6 +348,7 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
           ...nativeParts,
         ];
       }
+      RequestHistoryContext.mark(m, [message]);
       out.add(message);
     }
 
@@ -335,11 +356,18 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
       m[multimodalInternalMediaPathsKey],
     );
     final outMsg = Map<String, dynamic>.from(m);
+    outMsg.remove(imageContextOwnerKey);
+    outMsg.remove(multimodalInternalImageReferencesKey);
     outMsg.remove(multimodalInternalMediaPathsKey);
+    outMsg.remove(multimodalInternalLiteralTextKey);
+    outMsg.remove(carriedTextOnlyKey);
+    outMsg.remove(carriedImageHandlesKey);
     outMsg.remove(multimodalInternalDocumentPathsKey);
     outMsg.remove(multimodalInternalRevisionIdKey);
     outMsg.remove(multimodalInternalClaudeContainerKey);
     outMsg.remove(multimodalInternalClaudeTurnKey);
+    outMsg.remove(multimodalInternalClaudeThinkingRecoveryKey);
+    outMsg.remove(multimodalInternalResponsesItemKey);
     outMsg.remove(multimodalInternalGeminiThoughtSignatureKey);
     outMsg.remove('metadata');
     outMsg['role'] = role;
@@ -353,37 +381,70 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
         ];
       }
       final rawDetails = outMsg['reasoning_details'];
-      final signedDetails = reasoningDetailsNeedSignedReplay(rawDetails);
-      final keepReasoningContent =
-          !signedDetails &&
-          (reasoningReplay == ReasoningReplayPolicy.all ||
-              (reasoningReplay == ReasoningReplayPolicy.toolTurns &&
-                  toolTurnIds.contains(messageTurnIds[i])));
-      if (!keepReasoningContent) {
-        outMsg.remove('reasoning_content');
-        outMsg.remove('reasoning');
-        if (!signedDetails &&
-            replayField == ReasoningReplayField.reasoningDetails) {
-          outMsg.remove('reasoning_details');
-        }
-      } else if (replayField != ReasoningReplayField.reasoningDetails) {
-        final field = replayField.wireName;
-        final value =
-            outMsg[field] ?? outMsg['reasoning_content'] ?? outMsg['reasoning'];
-        outMsg.remove('reasoning_content');
-        outMsg.remove('reasoning');
-        if (value != null) {
-          outMsg[field] = value;
+      // The all-history policy must not turn legacy unsigned Claude text into
+      // a thinking block. Only its native details can carry the signature.
+      final signedDetails =
+          requiresSignedReasoning ||
+          reasoningDetailsNeedSignedReplay(rawDetails);
+      final keepReplay =
+          (currentToolMessagesStart != null && i >= currentToolMessagesStart) ||
+          reasoningReplay == ReasoningReplayPolicy.all ||
+          (reasoningReplay == ReasoningReplayPolicy.toolTurns &&
+              toolTurnIds.contains(messageTurnIds[i]));
+      final details = keepReplay
+          ? normalizeReasoningDetailsForReplay(rawDetails)
+          : null;
+      final field = replayField.wireName;
+      Object? replayValue;
+      for (final key in [field, 'reasoning_content', 'reasoning']) {
+        final value = outMsg[key];
+        replayValue ??= value;
+        if (value is String && value.isNotEmpty) {
+          replayValue = value;
+          break;
         }
       }
-      // Signed / Anthropic-tagged fragments must be rebuilt into whole
-      // blocks; other vendors document replaying the sequence verbatim.
-      if (signedDetails) {
-        final details = normalizeReasoningDetailsForReplay(rawDetails);
-        if (details == null) {
+      // Plain history imported from another endpoint must still use the
+      // target's scalar field (e.g. native DeepSeek). An empty tool echo is
+      // not a replacement for details, and signed/opaque blocks stay intact.
+      final replayAsText =
+          !prefersStructuredReasoning &&
+          !signedDetails &&
+          replayValue is String &&
+          replayValue.isNotEmpty &&
+          details != null &&
+          details.every(
+            (entry) =>
+                entry['type'] == null ||
+                entry['type'] == 'reasoning.text' ||
+                entry['type'] == 'reasoning.summary',
+          );
+      if (!keepReplay) {
+        outMsg.remove('reasoning_content');
+        outMsg.remove('reasoning');
+        outMsg.remove('reasoning_details');
+      } else if (details != null && !replayAsText) {
+        // Structured reasoning is the complete replay representation. Sending
+        // its parallel plain text echo as well can duplicate the same thought.
+        outMsg['reasoning_details'] = details;
+        outMsg.remove('reasoning_content');
+        outMsg.remove('reasoning');
+      } else {
+        // An explicitly empty array can mark a non-thinking response. It has
+        // no duplicated prose, so retain it for providers that replay it.
+        if (rawDetails is! List || rawDetails.isNotEmpty) {
           outMsg.remove('reasoning_details');
-        } else {
-          outMsg['reasoning_details'] = details;
+        }
+        if (signedDetails) {
+          outMsg.remove('reasoning_details');
+          outMsg.remove('reasoning_content');
+          outMsg.remove('reasoning');
+        } else if (replayField != ReasoningReplayField.reasoningDetails) {
+          outMsg.remove('reasoning_content');
+          outMsg.remove('reasoning');
+          if (replayValue != null) {
+            outMsg[field] = replayValue;
+          }
         }
       }
     }
@@ -437,14 +498,7 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
         final seenImageUrls = <String>{};
         final seenVideoUrls = <String>{};
 
-        String normalizeSrc(String src) {
-          if (src.startsWith('http') || src.startsWith('data:')) return src;
-          try {
-            return SandboxPathResolver.fix(src);
-          } catch (_) {
-            return src;
-          }
-        }
+        String normalizeSrc(String src) => SandboxPathResolver.dedupeKey(src);
 
         void addImageUrl(String url) {
           if (url.isEmpty) return;
@@ -593,14 +647,16 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
         (m['name'] ?? '').toString(),
         raw,
         metadata: (m['metadata'] as Map?)?.cast<String, dynamic>(),
+        toolCallId: m['tool_call_id']?.toString(),
         canImageInput: canImageInput,
       );
       outMsg['content'] = result.text;
       addMessage(outMsg);
       if (result.imageUrls.isNotEmpty) {
+        pendingToolOwner = m[historySourceKey];
         pendingToolImageParts.add({
           'type': 'text',
-          'text': 'Image returned by view_image (${m['tool_call_id']}):',
+          'text': 'Image returned by ${m['name']} (${m['tool_call_id']}):',
         });
         pendingToolImageParts.addAll([
           for (final url in result.imageUrls)
@@ -641,6 +697,8 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
 
     final parsed = await parseTextAndImages(
       raw,
+      literalText: internalLiteralText(m),
+      imageReferences: internalImageReferences(m),
       allowRemoteImages: canImageInput && allowRemoteImages,
       allowLocalImages: canImageInput,
       allowDataImages: canImageInput,
@@ -659,14 +717,7 @@ Future<List<Map<String, dynamic>>> buildOpenAIChatCompletionMessages(
     final seenImageUrls = <String>{};
     final seenVideoUrls = <String>{};
 
-    String normalizeSrc(String src) {
-      if (src.startsWith('http') || src.startsWith('data:')) return src;
-      try {
-        return SandboxPathResolver.fix(src);
-      } catch (_) {
-        return src;
-      }
-    }
+    String normalizeSrc(String src) => SandboxPathResolver.dedupeKey(src);
 
     void addImageUrl(String url) {
       if (url.isEmpty) return;
@@ -824,6 +875,7 @@ Stream<StreamChunk> runOpenAIChatCompletionsToolFollowUps({
   required Object? builtInSearchQuery,
   required Map<String, dynamic> extraBodyCfg,
   required String? promptCacheKey,
+  String? serviceTier,
   required Map<String, String>? extraHeaders,
   required bool wantsImageOutput,
   required bool needsReasoningEcho,
@@ -848,9 +900,10 @@ Stream<StreamChunk> runOpenAIChatCompletionsToolFollowUps({
       lastRound?.assistantContent ?? firstAssistantContent;
   String reasoningEcho() => lastRound?.reasoningEcho ?? firstReasoning;
   dynamic reasoningDetails() =>
-      lastRound?.reasoningDetails ?? firstReasoningDetails;
+      lastRound == null ? firstReasoningDetails : lastRound!.reasoningDetails;
 
   yield* runClientToolFollowUps(
+    reasoningDetailsOf: reasoningDetails,
     initialCalls: clientToolCallsFromChatAcc(firstToolAcc),
     onToolCall: onToolCall,
     append: (executed) {
@@ -882,6 +935,7 @@ Stream<StreamChunk> runOpenAIChatCompletionsToolFollowUps({
           canImageInput: canImageInput,
           allowRemoteImages: allowRemoteImages,
           reasoningReplay: spec.reasoning.replay,
+          currentToolMessagesStart: messages.length,
           replayField: spec.reasoning.replayField,
           skipImageParsing: skipImageParsing,
         ),
@@ -889,18 +943,20 @@ Stream<StreamChunk> runOpenAIChatCompletionsToolFollowUps({
         if (temperature != null) 'temperature': temperature,
         if (topP != null) 'top_p': topP,
         if (tools != null && tools.isNotEmpty)
-          'tools': cleanToolsForCompatibility(tools),
+          'tools': copyChatCompletionTools(tools),
         if (tools != null && tools.isNotEmpty) 'tool_choice': 'auto',
       };
       applyMaxTokens(body2);
       maybeAddStreamingUsageOptions(body2, stream: true, config: config);
       applyOpenAIResolvedRequest(
         body2,
+        config: config,
         spec: spec,
         reasoning: reasoning,
         transport: ReasoningTransport.chatCompletions,
       );
       CustomRequestMerger.applyBody(body2, extraBodyCfg);
+      applyServiceTier(body2, config, serviceTier);
       if (promptCacheKey != null) {
         body2.putIfAbsent('prompt_cache_key', () => promptCacheKey);
       }
@@ -925,14 +981,16 @@ Stream<StreamChunk> runOpenAIChatCompletionsToolFollowUps({
           assistantHeaders: extraHeaders,
         ),
       );
-      req2.body = jsonEncode(body2);
+      req2.body = await RequestImageContext.encodeBody(body2);
       final http.StreamedResponse resp2;
       try {
         resp2 = await client.send(req2);
         if (resp2.statusCode < 200 || resp2.statusCode >= 300) {
           final errorBody = await resp2.stream.bytesToString();
-          throw HttpException('HTTP ${resp2.statusCode}: $errorBody');
+          throw ProviderHttpException(resp2, errorBody);
         }
+      } on ImageContextBudgetException {
+        rethrow;
       } on ProviderOAuthException {
         rethrow;
       } on HttpException {
@@ -972,8 +1030,9 @@ Stream<StreamChunk> runOpenAIChatCompletionsToolFollowUps({
       final approxTotal = approxPromptTokens + (chars / 4).round();
       return emitDone(
         ids: StreamChunkIds('finish'),
+        finishReason: lastRound?.finishReason,
         reasoningDetails: includeReasoningDetailsOnDone
-            ? lastRound?.reasoningDetails ?? firstReasoningDetails
+            ? reasoningDetails()
             : null,
         usage: usage,
         totalTokens: usage?.totalTokens ?? approxTotal,
@@ -1014,8 +1073,26 @@ Stream<StreamChunk> runOpenAIChatCompletionsNonStreamToolFollowUps({
   var currentMessages = [
     for (final message in messages) copyChatCompletionMessage(message),
   ];
+  var round = 0;
+  Stream<StreamChunk> emitToolRoundOutput() async* {
+    final message = openaiFirstChoiceMessage(lastObj);
+    final visible = openaiVisibleOutputFromMessage(message);
+    final ids = StreamChunkIds('round-${round++}');
+    yield* emitDelta(
+      ids: ids,
+      content: visible.content,
+      reasoning: openaiReasoningText(message),
+      reasoningDetails: mergeReasoningDetails(message?['reasoning_details']),
+    );
+    yield* emitImages(visible.images, ids: ids);
+  }
+
+  yield* emitToolRoundOutput();
 
   yield* runClientToolFollowUps(
+    reasoningDetailsOf: () => mergeReasoningDetails(
+      openaiFirstChoiceMessage(lastObj)?['reasoning_details'],
+    ),
     initialCalls: initialCalls,
     onToolCall: onToolCall,
     emitCalls: true,
@@ -1064,19 +1141,25 @@ Stream<StreamChunk> runOpenAIChatCompletionsNonStreamToolFollowUps({
         canImageInput: canImageInput,
         allowRemoteImages: allowRemoteImages,
         reasoningReplay: spec.reasoning.replay,
+        currentToolMessagesStart: messages.length,
         replayField: spec.reasoning.replayField,
         skipImageParsing: skipImageParsing,
       );
       reqBody.remove('stream');
-      req.body = jsonEncode(reqBody);
+      req.body = await RequestImageContext.encodeBody(reqBody);
       final resp2 = await client.send(req);
       if (resp2.statusCode < 200 || resp2.statusCode >= 300) {
         final errorBody = await resp2.stream.bytesToString();
-        throw HttpException('HTTP ${resp2.statusCode}: $errorBody');
+        throw ProviderHttpException(resp2, errorBody);
       }
       lastObj =
           jsonDecode(await decodeUtf8Stream(resp2.stream))
               as Map<String, dynamic>;
+      if (openaiCallsFromCompletionMessage(
+        openaiFirstChoiceMessage(lastObj),
+      ).isNotEmpty) {
+        yield* emitToolRoundOutput();
+      }
       final roundUsage = openaiUsageFromObj(lastObj);
       for (final chunk in citationsDecoder.decodeCitations(lastObj)) {
         yield chunk;
@@ -1108,7 +1191,9 @@ Stream<StreamChunk> runOpenAIChatCompletionsNonStreamToolFollowUps({
         ids: ids,
         content: visible.content,
         reasoning: openaiReasoningText(lastMessage),
-        reasoningDetails: lastMessage?['reasoning_details'],
+        reasoningDetails: mergeReasoningDetails(
+          lastMessage?['reasoning_details'],
+        ),
         usage: usage,
         totalTokens: usage?.totalTokens ?? 0,
         finishReason: (choice['finish_reason'] ?? '').toString().isEmpty

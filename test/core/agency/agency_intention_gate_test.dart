@@ -7,17 +7,15 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   const gate = AgencyIntentionGate();
 
-  AgencyConsideration consideration(
-    AgencyEvent event, {
-    double score = 0.8,
-  }) => AgencyConsideration(
-    event: event,
-    appraisal: AgencyAppraisal(
-      action: AgencyAppraisalAction.consider,
-      score: score,
-      reasons: const <String>['test'],
-    ),
-  );
+  AgencyConsideration consideration(AgencyEvent event, {double score = 0.8}) =>
+      AgencyConsideration(
+        event: event,
+        appraisal: AgencyAppraisal(
+          action: AgencyAppraisalAction.consider,
+          score: score,
+          reasons: const <String>['test'],
+        ),
+      );
 
   test('calendar waits until the event is close enough', () {
     final early = gate.decide(
@@ -68,10 +66,7 @@ void main() {
       consideration(
         AgencyEvent(
           kind: AgencyEventKind.batteryChanged,
-          payload: const <String, Object?>{
-            'level': 10,
-            'charging': true,
-          },
+          payload: const <String, Object?>{'level': 10, 'charging': true},
         ),
       ),
     );
@@ -79,10 +74,7 @@ void main() {
       consideration(
         AgencyEvent(
           kind: AgencyEventKind.batteryChanged,
-          payload: const <String, Object?>{
-            'level': 18,
-            'charging': false,
-          },
+          payload: const <String, Object?>{'level': 18, 'charging': false},
         ),
       ),
     );

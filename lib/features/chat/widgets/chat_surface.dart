@@ -5,6 +5,7 @@ import 'package:Kelivo/core/providers/settings_provider.dart';
 import 'package:Kelivo/theme/chat_bubble_style.dart';
 
 import 'frosted/frosted_surface.dart';
+import 'package:Kelivo/shared/markdown/markdown_surface_scope.dart';
 
 ({ChatMessageBackgroundStyle style, ChatBubbleStyleOverrides overrides})
 _chatSurfaceStyleSelection(BuildContext context, {bool isUser = false}) {
@@ -47,7 +48,7 @@ Widget buildSharedChatSurface(
   required BorderRadius borderRadius,
   required EdgeInsetsGeometry padding,
   Color? defaultColor,
-  bool bareOnDefault = false,
+  bool bare = false,
   bool isUser = false,
 }) {
   final theme = Theme.of(context);
@@ -56,15 +57,29 @@ Widget buildSharedChatSurface(
   final style = selection.style;
   final overrides = selection.overrides;
   final resolved = resolveBubbleStyle(cs, theme.brightness, style, overrides);
-  Widget paddedChild = Padding(padding: padding, child: child);
+  Widget content = bare ? child : Padding(padding: padding, child: child);
   if (style != ChatMessageBackgroundStyle.defaultStyle &&
       overrides.hasTextOverride(theme.brightness)) {
-    paddedChild = DefaultTextStyle.merge(
+    content = DefaultTextStyle.merge(
       style: TextStyle(color: resolved.text),
-      child: paddedChild,
+      child: content,
     );
   }
+  if (bare) return content;
 
+  final customBackgroundArgb = theme.brightness == Brightness.dark
+      ? overrides.backgroundArgbDark
+      : overrides.backgroundArgbLight;
+  final customBackground = customBackgroundArgb == null
+      ? null
+      : resolved.background.withValues(alpha: 1);
+  // A lightly tinted bubble does not provide the .66 veil assumed by the
+  // frosted block tokens. A translucent solid bubble needs the same treatment.
+  final surfaceKind = resolved.background.a < .66
+      ? MarkdownSurfaceKind.tinted
+      : style == ChatMessageBackgroundStyle.solid && resolved.background.a == 1
+      ? MarkdownSurfaceKind.solid
+      : MarkdownSurfaceKind.frosted;
   switch (style) {
     case ChatMessageBackgroundStyle.frosted:
       final radius = BorderRadius.circular(resolved.radius);
@@ -72,7 +87,11 @@ Widget buildSharedChatSurface(
         style: resolved,
         borderRadius: radius,
         isUser: isUser,
-        child: paddedChild,
+        child: MarkdownSurfaceScope(
+          kind: surfaceKind,
+          customBackground: customBackground,
+          child: content,
+        ),
       );
     case ChatMessageBackgroundStyle.solid:
       final radius = BorderRadius.circular(resolved.radius);
@@ -85,23 +104,35 @@ Widget buildSharedChatSurface(
             width: resolved.borderWidth,
           ),
         ),
-        child: paddedChild,
+        child: MarkdownSurfaceScope(
+          kind: surfaceKind,
+          customBackground: customBackground,
+          child: content,
+        ),
       );
     case ChatMessageBackgroundStyle.defaultStyle:
-      if (bareOnDefault) {
-        return child;
-      }
       if (defaultColor == null) {
-        return paddedChild;
+        return content;
       }
       return DecoratedBox(
         decoration: BoxDecoration(
           color: defaultColor,
           borderRadius: borderRadius,
         ),
-        child: paddedChild,
+        child: MarkdownSurfaceScope(
+          kind: MarkdownSurfaceKind.tinted,
+          child: content,
+        ),
       );
   }
+}
+
+/// Quiet fill used by compact cards and chips inside the chat timeline.
+Color chatQuietFill(BuildContext context) {
+  final theme = Theme.of(context);
+  return theme.colorScheme.onSurface.withValues(
+    alpha: theme.brightness == Brightness.dark ? 0.06 : 0.04,
+  );
 }
 
 class ChatSurfaceForegroundPalette {

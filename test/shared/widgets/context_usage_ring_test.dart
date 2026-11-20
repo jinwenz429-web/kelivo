@@ -10,6 +10,8 @@ ContextUsageSnapshot usageSnap({
   ContextUsageState state = ContextUsageState.estimated,
   int used = 400,
   int? window = 1000,
+  bool hasUsage = true,
+  bool hasUnknownNativeTokens = false,
   ContextUsageBuckets buckets = const ContextUsageBuckets(),
 }) {
   return ContextUsageSnapshot(
@@ -22,7 +24,8 @@ ContextUsageSnapshot usageSnap({
     providerKey: 'TestProvider',
     modelId: 'window-model',
     assistantId: null,
-    computedAt: DateTime.utc(2026, 1, 1),
+    computedAt: hasUsage ? DateTime.utc(2026, 1, 1) : null,
+    hasUnknownNativeTokens: hasUnknownNativeTokens,
   );
 }
 
@@ -53,9 +56,62 @@ ContextUsageRingPainter ringPainter(WidgetTester tester) {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets('partial native context has no misleading window percentage', (
+    tester,
+  ) async {
+    await pumpRing(
+      tester,
+      snapshot: usageSnap(
+        state: ContextUsageState.opaque,
+        hasUnknownNativeTokens: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(ringPainter(tester).ratio, isNull);
+    expect(
+      find.byTooltip('Estimated 400, plus unknown server-side usage'),
+      findsOneWidget,
+    );
+  });
+
   final cs = ColorScheme.light();
   final warning = AppSemanticColors.light(cs).warning;
   final normal = cs.onSurface.withValues(alpha: 0.70);
+
+  testWidgets('failed first count reports unavailable instead of zero usage', (
+    tester,
+  ) async {
+    await pumpRing(
+      tester,
+      snapshot: usageSnap(
+        state: ContextUsageState.failed,
+        used: 0,
+        hasUsage: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(ringPainter(tester).ratio, isNull);
+    expect(
+      find.byTooltip(
+        'Couldn’t calculate usage. Please try again.\nUsage isn’t available right now.',
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('failed refresh labels the ring value as stale', (tester) async {
+    await pumpRing(
+      tester,
+      snapshot: usageSnap(state: ContextUsageState.failed),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byTooltip(
+        'Couldn’t refresh. Showing the previous result, which may be out of date.\n400 / 1k (40%)',
+      ),
+      findsOneWidget,
+    );
+  });
 
   test('contextUsageColor maps ratio thresholds', () {
     expect(contextUsageColor(cs, null, warning: warning), cs.outline);

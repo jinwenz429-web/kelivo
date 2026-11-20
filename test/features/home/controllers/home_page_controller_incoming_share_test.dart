@@ -1,6 +1,11 @@
 import 'dart:async';
+import 'dart:io';
+import 'package:Kelivo/shared/widgets/snackbar.dart';
 
 import 'package:Kelivo/core/models/chat_input_data.dart';
+import 'package:Kelivo/core/models/composer_draft.dart';
+import 'package:Kelivo/core/models/image_edit_document.dart';
+import 'package:Kelivo/features/intelligent_ui/models/ui_context_attachment.dart';
 import 'package:Kelivo/core/models/chat_message.dart';
 import 'package:Kelivo/core/models/conversation.dart';
 import 'package:Kelivo/core/providers/assistant_provider.dart';
@@ -53,6 +58,7 @@ class _DraftService extends ChatService {
     String? title,
     String? assistantId,
     bool temporary = false,
+    bool reuseNewEntry = false,
   }) async {
     await createGate?.future;
     final draft = Conversation(
@@ -78,10 +84,26 @@ class _Media extends ChatInputBarController {
   @override
   List<Object> get draftMediaIdentity => [...images, ...files];
   @override
-  void clearDraft() {
-    images.clear();
-    files.clear();
+  ComposerDraftInput snapshotDraft(String text) => super
+      .snapshotDraft(text)
+      .copyWith(
+        images: [for (final path in images) DraftImage(path: path)],
+        documents: List.of(files),
+      );
+
+  @override
+  void restoreDraft(ComposerDraftInput input, {bool resetHistory = true}) {
+    super.restoreDraft(input, resetHistory: resetHistory);
+    images
+      ..clear()
+      ..addAll(input.images.map((image) => image.path));
+    files
+      ..clear()
+      ..addAll(input.documents);
   }
+
+  @override
+  void clearDraft() => restoreDraft(const ComposerDraftInput());
 
   @override
   void addFiles(List<DocumentAttachment> docs) {
@@ -93,6 +115,7 @@ class _Media extends ChatInputBarController {
     List<String> paths,
     ImageCompressConfig config, {
     bool deleteSourcesAfterProcessing = false,
+    Map<int, ImageEditDocument> editsByIndex = const {},
   }) {
     images.addAll(paths);
     deletesOwnedSources = deleteSourcesAfterProcessing;
@@ -124,10 +147,14 @@ void main() {
           fileName: 'report.pdf',
           mime: 'application/pdf',
         );
+        final attachment = UiContextAttachment.history(
+          UiContextText(title: 'Parameters', body: 'Rate: 3'),
+        );
         await _pumpUntilDone(
           tester,
           state.controller.openIncomingShareDraft(
-            const ChatInputData(
+            ChatInputData(
+              uiContext: attachment,
               text: '分享内容',
               imagePaths: ['/upload/图片.png'],
               documents: [document],
@@ -143,6 +170,10 @@ void main() {
         expect(state.text.text, '分享内容');
         expect(state.media.images, ['/upload/图片.png']);
         expect(state.media.files, [document]);
+        expect(
+          state.media.snapshotDraft(state.text.text).uiContext,
+          same(attachment),
+        );
         expect(state.media.deletesOwnedSources, isTrue);
         expect(tester.takeException(), isNull);
         await tester.pumpWidget(const SizedBox.shrink());
@@ -286,11 +317,15 @@ void main() {
     final key = GlobalKey<_HarnessState>();
     await tester.pumpWidget(_app(service, key));
     final state = key.currentState!;
-    const input = ChatInputData(
+    final dir = Directory.systemTemp.createTempSync('kelivo_shared_binary_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final file = File('${dir.path}/app.apk')
+      ..writeAsBytesSync([0x50, 0x4b, 3, 4, 0, 1]);
+    final input = ChatInputData(
       text: 'inspect this',
       documents: [
         DocumentAttachment(
-          path: '/upload/app.apk',
+          path: file.path,
           fileName: 'app.apk',
           mime: 'application/vnd.android.package-archive',
         ),
@@ -301,8 +336,12 @@ void main() {
       state.controller.openIncomingShareDraft(input),
     );
     expect(
-      await state.controller.sendMessage(input),
+      await tester.runAsync(() => state.controller.sendMessage(input)),
       ChatInputSubmissionResult.rejected,
+    );
+    expect(
+      AppSnackBarManager().activeToasts.first.notification.message,
+      '“app.apk” isn’t a text file, so it can’t be used here.',
     );
     expect(state.text.text, 'inspect this');
     expect(state.media.files, input.documents);

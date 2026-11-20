@@ -68,10 +68,15 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
 
   TokenUsage? get usage => _round?.asSnapshot() ?? initialUsage;
 
+  String? finishReason;
   bool completed = false;
   int approxCompletionChars = 0;
 
-  List<Map<String, dynamic>> outputItems = const <Map<String, dynamic>>[];
+  final _outputItems = <int, Map<String, dynamic>>{};
+  List<Map<String, dynamic>> get outputItems => [
+    for (final index in _outputItems.keys.toList()..sort())
+      _outputItems[index]!,
+  ];
   final List<Map<String, dynamic>> citations = <Map<String, dynamic>>[];
   final Map<int, ResponsesFunctionCall> toolCallsByIndex =
       <int, ResponsesFunctionCall>{};
@@ -90,6 +95,8 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
   final Set<String> _openServerToolIds = <String>{};
   final Set<String> _endedServerToolIds = <String>{};
   final Set<String> _seenCitationUrls = <String>{};
+  final Set<String> _openReasoningIds = <String>{};
+  final Set<String> _endedReasoningIds = <String>{};
   bool _emittedCitationEvents = false;
   bool _closed = false;
 
@@ -224,14 +231,18 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
         type == 'response.reasoning_text.delta') {
       final delta = obj['delta'];
       if (delta is String && delta.isNotEmpty) {
-        chunks.add(ReasoningDelta(id: _reasoningSeriesId(obj), text: delta));
+        final id = _reasoningSeriesId(obj);
+        chunks.addAll(_startReasoning(id));
+        chunks.add(ReasoningDelta(id: id, text: delta));
       }
       return;
     }
     if (type == 'response.output_item.added') {
       final item = obj['item'];
       final idx = (obj['output_index'] ?? 0) as int;
-      if (item is Map && (item['type'] ?? '') == 'function_call') {
+      if (item is Map && item['type'] == 'reasoning') {
+        chunks.addAll(_startReasoning(_reasoningSeriesId(obj)));
+      } else if (item is Map && (item['type'] ?? '') == 'function_call') {
         final callId = (item['call_id'] ?? '').toString();
         final name = (item['name'] ?? '').toString();
         final args = (item['arguments'] ?? '').toString();
@@ -297,7 +308,10 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
     if (type == 'response.output_item.done') {
       final item = obj['item'];
       final idx = (obj['output_index'] ?? 0) as int;
-      if (item is Map && (item['type'] ?? '') == 'function_call') {
+      if (item is Map) _outputItems[idx] = item.cast<String, dynamic>();
+      if (item is Map && item['type'] == 'reasoning') {
+        chunks.addAll(_endReasoning(_reasoningSeriesId(obj)));
+      } else if (item is Map && (item['type'] ?? '') == 'function_call') {
         final args = (item['arguments'] ?? '').toString();
         final entry = toolCallsByIndex.putIfAbsent(
           idx,
@@ -413,6 +427,8 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
     required bool failed,
   }) {
     final response = obj['response'];
+    finishReason =
+        responsesFinishReason(obj) ?? (failed ? 'incomplete' : 'completed');
     if (response is Map) {
       final u = response['usage'];
       if (u != null) {
@@ -420,12 +436,15 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
         if (usage != null) chunks.add(Usage(usage!));
       }
       final output = response['output'];
-      outputItems = const <Map<String, dynamic>>[];
       if (output is List) {
-        outputItems = [
-          for (final it in output)
-            if (it is Map) it.cast<String, dynamic>(),
-        ];
+        for (var index = 0; index < output.length; index++) {
+          final item = output[index];
+          if (item is Map) {
+            // output_item.done owns the completed reasoning state. Some
+            // terminal envelopes omit it or contain only a reduced snapshot.
+            _outputItems.putIfAbsent(index, () => item.cast<String, dynamic>());
+          }
+        }
         try {
           _collectCitations(output);
           _collectCompletedImages(output);
@@ -671,10 +690,26 @@ class ResponsesStreamDecoder implements StreamChunkDecoder {
     ];
   }
 
+  List<StreamChunk> _startReasoning(String id) {
+    if (_endedReasoningIds.contains(id) || !_openReasoningIds.add(id)) {
+      return const [];
+    }
+    return [ReasoningStart(id: id)];
+  }
+
+  List<StreamChunk> _endReasoning(String id) {
+    if (!_openReasoningIds.remove(id)) return const [];
+    _endedReasoningIds.add(id);
+    return [ReasoningEnd(id: id)];
+  }
+
   List<StreamChunk> _closeOpenSeries({
     ServerToolStatus serverStatus = ServerToolStatus.completed,
   }) {
     final chunks = <StreamChunk>[];
+    for (final id in _openReasoningIds.toList()) {
+      chunks.addAll(_endReasoning(id));
+    }
     for (final id in _openToolIds.toList()) {
       chunks.addAll(_endTool(id));
     }
@@ -773,4 +808,27 @@ int _readInt(dynamic value) {
   if (value is num) return value.toInt();
   if (value is String) return int.tryParse(value) ?? 0;
   return 0;
+}
+
+/// Preserve terminal status even when a Responses payload contains partial text.
+String? responsesFinishReason(Map response) {
+  final value = response['response'] is Map
+      ? response['response'] as Map
+      : response;
+  final status = value['status']?.toString();
+  if (status == 'incomplete') {
+    final details = value['incomplete_details'];
+    final reason = details is Map ? details['reason']?.toString() : null;
+    return reason == 'max_output_tokens' || reason == 'content_filter'
+        ? reason
+        : 'incomplete';
+  }
+  if (status == 'completed' &&
+      value['output'] is List &&
+      (value['output'] as List).whereType<Map>().any(
+        (item) => item['type'] == 'function_call',
+      )) {
+    return 'tool_calls';
+  }
+  return status;
 }

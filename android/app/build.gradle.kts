@@ -57,6 +57,16 @@ android {
     }
 
     signingConfigs {
+        // Fixed, intentionally public debug-grade key for the companion fork.
+        // CI runners otherwise mint a new debug key per build, and Android then
+        // refuses to update the installed app without an uninstall (data loss).
+        create("companion") {
+            storeFile = file("signing/companion-debug.p12")
+            storeType = "PKCS12"
+            storePassword = "android"
+            keyAlias = "companion"
+            keyPassword = "android"
+        }
         create("release") {
             if (keystorePropertiesFile.exists()) {
                 storeFile = file(keystoreProperties["storeFile"] as String)
@@ -68,9 +78,19 @@ android {
     }
 
     buildTypes {
+        getByName("debug") {
+            // Separate package so this build installs next to the official Kelivo.
+            applicationIdSuffix = ".companion"
+            signingConfig = signingConfigs.getByName("companion")
+        }
         getByName("release") {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            applicationIdSuffix = ".companion"
+            // Without key.properties (no signing secrets in CI) use the fixed
+            // companion key so successive builds update in place.
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("companion")
             }
         }
     }

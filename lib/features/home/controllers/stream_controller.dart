@@ -1,3 +1,4 @@
+import '../../../core/services/api/request_image_context.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
@@ -9,8 +10,10 @@ import '../../../core/providers/settings_provider.dart';
 import '../../../core/services/api/chat_api_service.dart';
 import '../../../core/services/api/stream/stream_chunk.dart';
 import '../../../core/services/api/stream/stream_chunk_handler.dart';
+import 'assistant_part_snapshots.dart';
 import '../../../core/services/api/stream/stream_text_buffer.dart';
 import '../../chat/widgets/chat_message_widget.dart';
+import '../../chat/utils/tool_event_deduplication.dart';
 import '../../../utils/markdown_media_sanitizer.dart';
 import 'streaming_content_notifier.dart';
 
@@ -33,6 +36,7 @@ class StreamController {
     required this.getSettingsProvider,
     required this.getCurrentConversationId,
     this.onStreamTick,
+    this.onMessagePresented,
   });
 
   /// Callback when state changes (trigger setState in the widget).
@@ -42,6 +46,7 @@ class StreamController {
 
   /// Optional callback fired during streaming updates (e.g., auto-scroll).
   final VoidCallback? onStreamTick;
+  final ValueChanged<String>? onMessagePresented;
 
   /// Lightweight notifier for streaming content updates.
   /// This avoids triggering full page rebuilds during streaming.
@@ -121,6 +126,8 @@ class StreamController {
   /// repeat restores (e.g. paging re-walks the whole window) skip them until
   /// their state is cleared.
   final Set<String> _restoredUiMessageIds = <String>{};
+  final Map<String, ({bool? reasoning, List<bool> segments})>
+  _offWindowExpansion = {};
 
   int _reasoningPayloadDecodeCount = 0;
 
@@ -242,7 +249,7 @@ class StreamController {
 
   /// Set tool parts for a message.
   void setToolParts(String messageId, List<ToolUIPart> parts) {
-    _toolParts[messageId] = parts;
+    _toolParts[messageId] = ToolPartSnapshot(parts);
   }
 
   /// Remove tool parts for a message.
@@ -252,6 +259,7 @@ class StreamController {
 
   /// Clear all state for a message (reasoning, segments, tools).
   void clearMessageState(String messageId) {
+    _offWindowExpansion.remove(messageId);
     _reasoning.remove(messageId);
     _reasoningSegments.remove(messageId);
     _contentSplits.remove(messageId);
@@ -265,6 +273,7 @@ class StreamController {
   /// Clear cached UI state while preserving any runs still owned by ChatActions.
   void clearAllState({Set<String> keepMessageIds = const {}}) {
     bool discard(String id) => !keepMessageIds.contains(id);
+    _offWindowExpansion.removeWhere((id, _) => discard(id));
     _reasoning.removeWhere((id, _) => discard(id));
     _reasoningSegments.removeWhere((id, _) => discard(id));
     _contentSplits.removeWhere((id, _) => discard(id));
@@ -274,6 +283,34 @@ class StreamController {
     _restoredUiMessageIds.removeWhere(discard);
     _cancelAllTimers(keepMessageIds: keepMessageIds);
     streamingContentNotifier.clear(keepMessageIds: keepMessageIds);
+  }
+
+  /// Release decoded history payloads while remembering the user's small
+  /// expand/collapse choices. Background generation remains owned by its run.
+  void pruneOffWindowState(Set<String> visibleMessageIds) {
+    final retained = {...visibleMessageIds, ..._activeStreamingIds};
+    final ids = {
+      ..._reasoning.keys,
+      ..._reasoningSegments.keys,
+      ..._contentSplits.keys,
+      ..._toolParts.keys,
+      ..._reasoningDetails.keys,
+      ..._decodedReasoningPayloads.keys,
+      ..._restoredUiMessageIds,
+    };
+    for (final id in ids) {
+      if (retained.contains(id)) continue;
+      final reasoning = _reasoning[id]?.expanded;
+      final segments = [
+        for (final segment
+            in _reasoningSegments[id] ?? const <ReasoningSegmentData>[])
+          segment.expanded,
+      ];
+      clearMessageState(id);
+      if (reasoning != null || segments.isNotEmpty) {
+        _offWindowExpansion[id] = (reasoning: reasoning, segments: segments);
+      }
+    }
   }
 
   /// Re-apply in-bubble retry UI after [clearAllState] / conversation switch.
@@ -372,26 +409,27 @@ class StreamController {
   List<ToolUIPart> dedupeToolPartsList(List<ToolUIPart> parts) {
     final completedIds = <String>{
       for (final p in parts)
-        if (p.id.trim().isNotEmpty && _hasToolContent(p.content)) p.id.trim(),
+        if (p.id.trim().isNotEmpty && hasCompletedToolContent(p.content))
+          p.id.trim(),
     };
     final completedNoIdBases = <String>{
       for (final p in parts)
-        if (p.id.trim().isEmpty && _hasToolContent(p.content))
-          _toolDedupeBase(p.toolName, p.arguments),
+        if (p.id.trim().isEmpty && hasCompletedToolContent(p.content))
+          toolEventBaseKey(p.toolName, p.arguments),
     };
     final indexByKey = <String, int>{};
     final out = <ToolUIPart>[];
     for (final p in parts) {
       final id = p.id.trim();
-      if (!_hasToolContent(p.content) &&
+      if (!hasCompletedToolContent(p.content) &&
           ((id.isNotEmpty && completedIds.contains(id)) ||
               (id.isEmpty &&
                   completedNoIdBases.contains(
-                    _toolDedupeBase(p.toolName, p.arguments),
+                    toolEventBaseKey(p.toolName, p.arguments),
                   )))) {
         continue;
       }
-      final key = _toolDedupeKey(
+      final key = toolEventIdentityKey(
         id: p.id,
         name: p.toolName,
         arguments: p.arguments,
@@ -406,79 +444,6 @@ class StreamController {
       out.add(p);
     }
     return out;
-  }
-
-  /// Deduplicate raw persisted tool events.
-  List<Map<String, dynamic>> dedupeToolEvents(
-    List<Map<String, dynamic>> events,
-  ) {
-    final completedIds = <String>{
-      for (final e in events)
-        if ((e['id']?.toString() ?? '').trim().isNotEmpty &&
-            _hasToolContent(e['content']?.toString()))
-          (e['id']?.toString() ?? '').trim(),
-    };
-    final completedNoIdBases = <String>{
-      for (final e in events)
-        if ((e['id']?.toString() ?? '').trim().isEmpty &&
-            _hasToolContent(e['content']?.toString()))
-          _toolDedupeBase(
-            e['name']?.toString() ?? '',
-            (e['arguments'] as Map?)?.cast<String, dynamic>() ??
-                const <String, dynamic>{},
-          ),
-    };
-    final indexByKey = <String, int>{};
-    final out = <Map<String, dynamic>>[];
-    for (final e in events) {
-      final id = (e['id']?.toString() ?? '').trim();
-      final name = (e['name']?.toString() ?? '');
-      final args =
-          ((e['arguments'] as Map?)?.cast<String, dynamic>() ??
-          const <String, dynamic>{});
-      if (!_hasToolContent(e['content']?.toString()) &&
-          ((id.isNotEmpty && completedIds.contains(id)) ||
-              (id.isEmpty &&
-                  completedNoIdBases.contains(_toolDedupeBase(name, args))))) {
-        continue;
-      }
-      final key = _toolDedupeKey(
-        id: id,
-        name: name,
-        arguments: args,
-        content: e['content']?.toString(),
-      );
-      final normalizedEvent = e.map((k, v) => MapEntry(k.toString(), v));
-      final existingIndex = indexByKey[key];
-      if (existingIndex != null) {
-        if (id.isNotEmpty) out[existingIndex] = normalizedEvent;
-        continue;
-      }
-      indexByKey[key] = out.length;
-      out.add(normalizedEvent);
-    }
-    return out;
-  }
-
-  String _toolDedupeBase(String name, Map<String, dynamic> arguments) {
-    return 'name:$name|args:${_encodeJson(arguments)}';
-  }
-
-  bool _hasToolContent(String? content) => content?.trim().isNotEmpty == true;
-
-  String _toolDedupeKey({
-    required String id,
-    required String name,
-    required Map<String, dynamic> arguments,
-    String? content,
-  }) {
-    final trimmedId = id.trim();
-    if (trimmedId.isNotEmpty) return 'id:$trimmedId';
-
-    final base = _toolDedupeBase(name, arguments);
-    final trimmedContent = content?.trim();
-    if (trimmedContent == null || trimmedContent.isEmpty) return base;
-    return '$base|content:$trimmedContent';
   }
 
   // ============================================================================
@@ -606,6 +571,7 @@ class StreamController {
       parts: state.partsBuilder?.call(content),
       reasoningText: state.reasoningDirty ? state.pendingReasoning?.text : null,
       reasoningStartAt: state.pendingReasoningStartAt,
+      forceRebuild: state.reasoningActivityDirty,
       contentSplitOffsets: state.contentSplitOffsets,
       reasoningCountAtSplit: state.reasoningCountAtSplit,
       toolCountAtSplit: state.toolCountAtSplit,
@@ -615,12 +581,14 @@ class StreamController {
       durationMs: state.durationMs,
     );
     state.reasoningDirty = false;
+    state.reasoningActivityDirty = false;
     state.partsDirty = false;
     state.updateMessageInList?.call(
       messageId,
       state.targetContent,
       state.totalTokens,
     );
+    onMessagePresented?.call(messageId);
     onStreamTick?.call();
   }
 
@@ -795,69 +763,101 @@ class StreamController {
   // Stream Chunk Processing
   // ============================================================================
 
-  /// Process a reasoning chunk from stream.
-  Future<void> handleReasoningChunk(
-    String reasoning,
-    StreamingState state,
-  ) async {
-    if (reasoning.isEmpty || !state.ctx.supportsReasoning) return;
+  /// A reasoning item can be active without a public summary.
+  void handleReasoningStart(String id, StreamingState state) {
+    final receivedAt = state.reasoningReceivedAt.remove(id) ?? DateTime.now();
+    if (!state.ctx.supportsReasoning || state.finishHandled) return;
+    state.reasoningStartAt ??= receivedAt;
+    if (!state.ctx.streamOutput) return;
+    _beginReasoning(id, state, startedAt: receivedAt);
+    _scheduleReasoningUpdate(state, activityChanged: true);
+    streamingContentNotifier.notifyToolHeightChanged(state.messageId);
+  }
 
-    final messageId = state.messageId;
-    final conversationId = state.conversationId;
-    if (state.ctx.streamOutput) {
-      final initialExpanded = !getSettingsProvider().autoCollapseThinking;
-      final isNewReasoning = !_reasoning.containsKey(messageId);
-      final r = _reasoning[messageId] ?? ReasoningData();
-      r.appendText(reasoning);
-      r.startAt ??= DateTime.now();
-      // NOTE: Do not reset r.expanded here - preserve user's toggle state during streaming
-      if (isNewReasoning) {
-        r.expanded = initialExpanded;
-      }
-      _reasoning[messageId] = r;
-
-      // Add to reasoning segments for mixed display
-      final segments =
-          _reasoningSegments[messageId] ?? <ReasoningSegmentData>[];
-      if (segments.isEmpty) {
-        final newSegment = ReasoningSegmentData();
-        newSegment.text = reasoning;
-        newSegment.startAt = DateTime.now();
-        newSegment.expanded = initialExpanded;
-        newSegment.toolStartIndex = (_toolParts[messageId]?.length ?? 0);
-        segments.add(newSegment);
-      } else {
-        final hasToolsAfterLastSegment =
-            (_toolParts[messageId]?.isNotEmpty ?? false);
-        final lastSegment = segments.last;
-        if (hasToolsAfterLastSegment && lastSegment.finishedAt != null) {
-          final newSegment = ReasoningSegmentData();
-          newSegment.text = reasoning;
-          newSegment.startAt = DateTime.now();
-          newSegment.expanded = initialExpanded;
-          newSegment.toolStartIndex = (_toolParts[messageId]?.length ?? 0);
-          segments.add(newSegment);
-        } else {
-          lastSegment.appendText(reasoning);
-          lastSegment.startAt ??= DateTime.now();
+  void handleReasoningEnd(String id, StreamingState state) {
+    if (state.finishHandled) return;
+    final segment = state.reasoningById.remove(id);
+    if (segment == null) return;
+    segment.finishedAt ??= DateTime.now();
+    if (getSettingsProvider().autoCollapseThinking) segment.expanded = false;
+    if (!state.reasoningById.values.any((part) => part.finishedAt == null)) {
+      final reasoning = _reasoning[state.messageId];
+      if (reasoning != null) {
+        reasoning.finishedAt = segment.finishedAt;
+        if (getSettingsProvider().autoCollapseThinking) {
+          reasoning.expanded = false;
         }
       }
-      _reasoningSegments[messageId] = segments;
+    }
+    _scheduleReasoningUpdate(state, activityChanged: true);
+    streamingContentNotifier.notifyToolHeightChanged(state.messageId);
+  }
 
-      final smooth = _streamSmoothStates.putIfAbsent(
-        messageId,
-        _StreamSmoothState.new,
-      );
-      smooth
-        ..conversationId = conversationId
-        ..pendingReasoning = r
-        ..pendingReasoningStartAt = r.startAt
-        ..contentSplitOffsets = state.contentSplitOffsets
-        ..reasoningCountAtSplit = state.reasoningCountAtSplit
-        ..toolCountAtSplit = state.toolCountAtSplit
-        ..reasoningDirty = true;
-      streamingContentNotifier.getNotifier(messageId);
-      _ensureStreamTimer(messageId);
+  ReasoningSegmentData _beginReasoning(
+    String id,
+    StreamingState state, {
+    DateTime? startedAt,
+  }) {
+    final messageId = state.messageId;
+    final now = startedAt ?? DateTime.now();
+    final initialExpanded = !getSettingsProvider().autoCollapseThinking;
+    final reasoning = _reasoning.putIfAbsent(
+      messageId,
+      () => ReasoningData()..expanded = initialExpanded,
+    );
+    reasoning.startAt ??= now;
+    reasoning.finishedAt = null;
+    final segment = state.reasoningById.putIfAbsent(id, () {
+      final segment = ReasoningSegmentData()
+        ..startAt = now
+        ..expanded = initialExpanded
+        ..toolStartIndex = (_toolParts[messageId]?.length ?? 0);
+      (_reasoningSegments[messageId] ??= []).add(segment);
+      return segment;
+    });
+    segment.finishedAt = null;
+    return segment;
+  }
+
+  void _scheduleReasoningUpdate(
+    StreamingState state, {
+    bool activityChanged = false,
+  }) {
+    final reasoning = _reasoning[state.messageId];
+    if (reasoning == null) return;
+    final smooth = _streamSmoothStates.putIfAbsent(
+      state.messageId,
+      _StreamSmoothState.new,
+    );
+    smooth
+      ..conversationId = state.conversationId
+      ..pendingReasoning = reasoning
+      ..pendingReasoningStartAt = reasoning.startAt
+      ..contentSplitOffsets = state.contentSplitOffsets
+      ..reasoningCountAtSplit = state.reasoningCountAtSplit
+      ..toolCountAtSplit = state.toolCountAtSplit
+      ..reasoningDirty = true;
+    smooth.reasoningActivityDirty |= activityChanged;
+    streamingContentNotifier.getNotifier(state.messageId);
+    _ensureStreamTimer(state.messageId);
+  }
+
+  /// Process a reasoning chunk from stream, sharing its item's activity state.
+  Future<void> handleReasoningChunk(
+    String reasoning,
+    StreamingState state, {
+    required String id,
+  }) async {
+    if (reasoning.isEmpty ||
+        !state.ctx.supportsReasoning ||
+        state.finishHandled) {
+      return;
+    }
+
+    if (state.ctx.streamOutput) {
+      _beginReasoning(id, state).appendText(reasoning);
+      _reasoning[state.messageId]!.appendText(reasoning);
+      _scheduleReasoningUpdate(state);
     } else {
       state.reasoningStartAt ??= DateTime.now();
       state.appendBufferedReasoning(reasoning);
@@ -886,15 +886,7 @@ class StreamController {
 
     // Finish any unfinished reasoning segment when tools start
     final segments = _reasoningSegments[messageId] ?? <ReasoningSegmentData>[];
-    if (segments.isNotEmpty && segments.last.finishedAt == null) {
-      segments.last.finishedAt = DateTime.now();
-      final autoCollapse = getSettingsProvider().autoCollapseThinking;
-      if (autoCollapse) {
-        segments.last.expanded = false;
-        final rd = _reasoning[messageId];
-        if (rd != null) rd.expanded = false;
-      }
-      _reasoningSegments[messageId] = segments;
+    if (finishReasoningIfNeeded(messageId)) {
       await updateReasoningSegmentsInDb(
         messageId,
         serializeReasoningSegmentsWithSplits(segments),
@@ -911,7 +903,7 @@ class StreamController {
         loading: true,
       ),
     );
-    _toolParts[messageId] = dedupeToolPartsList(existing);
+    _toolParts[messageId] = ToolPartSnapshot(dedupeToolPartsList(existing));
     if (getCurrentConversationId() == conversationId) {
       streamingContentNotifier.notifyToolPartsUpdated(
         messageId,
@@ -1015,7 +1007,7 @@ class StreamController {
         metadata: result.metadata,
       );
     } catch (_) {}
-    _toolParts[messageId] = dedupeToolPartsList(parts);
+    _toolParts[messageId] = ToolPartSnapshot(dedupeToolPartsList(parts));
     if (getCurrentConversationId() == conversationId) {
       final splits = _contentSplits[messageId];
       streamingContentNotifier.notifyToolPartsUpdated(
@@ -1177,18 +1169,7 @@ class StreamController {
   Map<String, dynamic>? _toolPayloadFromHandler(
     StreamingState state,
     String id,
-  ) {
-    for (final part in state.partsHandler.parts.reversed) {
-      if (part is! ToolCallPart) continue;
-      try {
-        final decoded = jsonDecode(part.payloadJson);
-        if (decoded is Map && (decoded['id'] ?? '').toString() == id) {
-          return decoded.cast<String, dynamic>();
-        }
-      } catch (_) {}
-    }
-    return null;
-  }
+  ) => state.partsHandler.toolPayload(id);
 
   String _toolResultName(
     StreamingState state,
@@ -1384,22 +1365,24 @@ class StreamController {
     // This allows users to expand reasoning during content streaming without it
     // being immediately collapsed again.
 
-    // Finish last reasoning segment (only when it first finishes)
+    // Terminal/content/tool transitions also close items missing an explicit end.
     final segments = _reasoningSegments[messageId];
-    if (segments != null && segments.isNotEmpty) {
-      final lastSegment = segments.last;
-      if (lastSegment.finishedAt == null) {
-        lastSegment.finishedAt = DateTime.now();
-        if (autoCollapse) {
-          lastSegment.expanded = false;
+    if (segments != null &&
+        (changed ||
+            (segments.isNotEmpty && segments.last.finishedAt == null))) {
+      for (final segment in segments) {
+        if (segment.finishedAt == null) {
+          segment.finishedAt = DateTime.now();
+          if (autoCollapse) {
+            segment.expanded = false;
+          }
+          changed = true;
         }
-        _reasoningSegments[messageId] = segments;
-        changed = true;
       }
-      // NOTE: Removed the "else if" branch that would force collapse on every call.
     }
 
     if (changed) {
+      streamingContentNotifier.notifyToolHeightChanged(messageId);
       _safeNotifyStateChanged();
     }
     return changed;
@@ -1487,24 +1470,26 @@ class StreamController {
     try {
       final events = dedupeToolEvents(getToolEventsFromDb(messageId));
       if (events.isNotEmpty) {
-        _toolParts[messageId] = events
-            .map(
-              (e) => ToolUIPart(
-                id: (e['id'] ?? '').toString(),
-                toolName: (e['name'] ?? '').toString(),
-                arguments:
-                    (e['arguments'] as Map?)?.cast<String, dynamic>() ??
-                    const <String, dynamic>{},
-                content: (e['content']?.toString().isNotEmpty == true)
-                    ? e['content'].toString()
-                    : null,
-                metadata: e['metadata'] is Map
-                    ? Map<String, dynamic>.from(e['metadata'] as Map)
-                    : null,
-                loading: !(e['content']?.toString().isNotEmpty == true),
-              ),
-            )
-            .toList();
+        _toolParts[messageId] = ToolPartSnapshot(
+          events
+              .map(
+                (e) => ToolUIPart(
+                  id: (e['id'] ?? '').toString(),
+                  toolName: (e['name'] ?? '').toString(),
+                  arguments:
+                      (e['arguments'] as Map?)?.cast<String, dynamic>() ??
+                      const <String, dynamic>{},
+                  content: (e['content']?.toString().isNotEmpty == true)
+                      ? e['content'].toString()
+                      : null,
+                  metadata: e['metadata'] is Map
+                      ? Map<String, dynamic>.from(e['metadata'] as Map)
+                      : null,
+                  loading: !(e['content']?.toString().isNotEmpty == true),
+                ),
+              )
+              .toList(),
+        );
       }
     } catch (_) {}
 
@@ -1529,6 +1514,21 @@ class StreamController {
     final details = payload.reasoningDetails;
     if (details != null) {
       _reasoningDetails[messageId] = details;
+    }
+    final expanded = _offWindowExpansion.remove(messageId);
+    if (expanded != null) {
+      if (expanded.reasoning != null && _reasoning[messageId] != null) {
+        _reasoning[messageId]!.expanded = expanded.reasoning!;
+      }
+      final segments =
+          _reasoningSegments[messageId] ?? const <ReasoningSegmentData>[];
+      for (
+        var i = 0;
+        i < segments.length && i < expanded.segments.length;
+        i++
+      ) {
+        segments[i].expanded = expanded.segments[i];
+      }
     }
   }
 
@@ -1566,6 +1566,7 @@ class GenerationContext {
     required this.apiMessages,
     this.contextUsageConfiguration,
     this.contextUsageRevision,
+    this.imageContext,
     required this.userImagePaths,
     required this.allowImagesApiRouting,
     required this.providerKey,
@@ -1577,12 +1578,14 @@ class GenerationContext {
     this.onToolCall,
     this.extraHeaders,
     this.extraBody,
+    this.serviceTier,
     required this.supportsReasoning,
     required this.enableReasoning,
     required this.streamOutput,
     this.ocrActive = false,
     this.generateTitleOnFinish = true,
     this.generationRunId,
+    this.isContinuation = false,
     this.scheduled = false,
     this.scheduledNotify = true,
     this.scheduledPreview = true,
@@ -1592,6 +1595,7 @@ class GenerationContext {
   final List<Map<String, dynamic>> apiMessages;
   final Object? contextUsageConfiguration;
   final int? contextUsageRevision;
+  final RequestImageContext? imageContext;
   final List<String> userImagePaths;
   final bool allowImagesApiRouting;
   final String providerKey;
@@ -1603,26 +1607,35 @@ class GenerationContext {
   final ToolCallHandler? onToolCall;
   final Map<String, String>? extraHeaders;
   final Map<String, dynamic>? extraBody;
+  final String? serviceTier;
   final bool supportsReasoning;
   final bool enableReasoning;
   final bool streamOutput;
   final bool ocrActive;
   final bool generateTitleOnFinish;
   final String? generationRunId;
+
+  /// This request resumes an existing message after a recovered tool answer.
+  final bool isContinuation;
   final bool scheduled;
   final bool scheduledNotify, scheduledPreview;
 }
 
 /// State object for streaming message generation.
 class StreamingState {
-  StreamingState(this.ctx)
+  StreamingState(this.ctx, {this.responsesTurnPrefix, this.claudeTurnPrefix})
     : _content = StreamTextBuffer(ctx.assistantMessage.content),
       totalTokens = ctx.assistantMessage.totalTokens ?? 0,
+      firstResponseMs = ctx.assistantMessage.firstResponseMs,
       firstTokenMs = ctx.assistantMessage.firstTokenMs,
       _previousUsage = ctx.assistantMessage.tokenUsage,
       partsHandler = StreamChunkHandler(seed: ctx.assistantMessage.parts);
 
   final GenerationContext ctx;
+
+  /// Immutable native history already owned by this message before resuming.
+  final String? responsesTurnPrefix;
+  final String? claudeTurnPrefix;
   final StreamTextBuffer _content;
   String get fullContentRaw => _content.value;
   set fullContentRaw(String text) => _content.value = text;
@@ -1649,7 +1662,9 @@ class StreamingState {
   bool titleQueued = false;
   DateTime? requestStartedAt;
   DateTime? requestFinishedAt;
+  int? firstResponseMs;
   int? firstTokenMs;
+  final Map<String, DateTime> reasoningReceivedAt = {};
 
   /// Whole-generation elapsed time, including waiting and reasoning. A tool
   /// answer can resume the same message, so keep time spent in earlier runs.
@@ -1667,10 +1682,15 @@ class StreamingState {
     return elapsed < 0 ? null : elapsed;
   }
 
-  void recordFirstOutput(StreamChunk chunk) {
-    if (firstTokenMs != null ||
-        requestFinishedAt != null ||
-        ctx.assistantMessage.durationMs != null) {
+  /// Capture arrival before queued database work or UI updates can delay it.
+  void recordStreamArrival(StreamChunk chunk) {
+    if (requestFinishedAt != null || !ctx.streamOutput) return;
+    final receivedAt = DateTime.now();
+    if (chunk is ReasoningStart) {
+      reasoningReceivedAt.putIfAbsent(chunk.id, () => receivedAt);
+    }
+    if ((firstResponseMs != null && firstTokenMs != null) ||
+        ctx.isContinuation) {
       return;
     }
     final hasOutput = switch (chunk) {
@@ -1684,18 +1704,23 @@ class StreamingState {
       GeneratedFile(:final uri) => uri.isNotEmpty,
       _ => false,
     };
-    if (hasOutput) firstTokenMs = _requestElapsedMs(DateTime.now());
+    if (hasOutput || chunk is ReasoningStart) {
+      final elapsed = _requestElapsedMs(receivedAt);
+      firstResponseMs ??= elapsed;
+      if (hasOutput) firstTokenMs ??= elapsed;
+    }
   }
 
   /// Freeze before UI draining, persistence or cancellation cleanup.
   void finishRequestTiming() => requestFinishedAt ??= DateTime.now();
-  int? generationStateRevision;
-  bool generationStreamingStarted = false;
+  bool stopRequested = false;
   final Map<String, String> pendingToolNames = <String, String>{};
   List<int> contentSplitOffsets = <int>[];
   List<int> reasoningCountAtSplit = <int>[];
   List<int> toolCountAtSplit = <int>[];
   final StreamChunkHandler partsHandler;
+  final Map<String, ReasoningSegmentData> reasoningById = {};
+  final partSnapshots = AssistantPartSnapshots();
   RetryStatus? retryStatus;
 
   String get messageId => ctx.assistantMessage.id;
@@ -1855,6 +1880,7 @@ class _StreamSmoothState {
   ReasoningData? pendingReasoning;
   DateTime? pendingReasoningStartAt;
   bool reasoningDirty = false;
+  bool reasoningActivityDirty = false;
   void Function(String messageId, String content, int totalTokens)?
   updateMessageInList;
   final List<int> _recentPickCounts = <int>[];

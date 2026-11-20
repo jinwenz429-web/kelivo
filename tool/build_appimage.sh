@@ -37,7 +37,8 @@ Icon=kelivo
 Type=Application
 Categories=Utility;
 DESKTOP
-cp "$repo_root/assets/app_icon.png" "$work_dir/kelivo.png"
+dart run "$repo_root/tool/prepare_appimage_icon.dart" \
+  "$repo_root/assets/app_icon.png" "$work_dir/kelivo.png"
 
 curl -fL --retry 3 -o "$work_dir/linuxdeploy.AppImage" \
   "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${arch}.AppImage"
@@ -54,6 +55,10 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 export NO_STRIP=1
 export ARCH="$arch"
 export VERSION="$version"
+
+# GTK input methods are loaded dynamically, so an ELF dependency scan alone
+# cannot discover them. Install them and their AppRun hook before linuxdeploy.
+bash "$repo_root/tool/bundle_appimage_gtk.sh" "$app_dir"
 
 # This scans every ELF in the AppDir, including Flutter plugins and native
 # assets. The plugin also bundles GStreamer's dynamically loaded codecs and

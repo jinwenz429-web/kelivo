@@ -1,4 +1,6 @@
+import 'package:Kelivo/core/services/backup/backup_secure_password_store.dart';
 import 'package:flutter/widgets.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:Kelivo/core/services/backup/backup_cancel_token.dart';
@@ -20,6 +22,35 @@ void main() {
       ),
     );
 
+    final l10n = AppLocalizations.of(context)!;
+    expect(
+      backupRestoreErrorMessage(
+        l10n,
+        const BackupMacKeychainAccessError(MacBackupAuthorization.denied),
+      ),
+      l10n.backupMacKeychainAccessDenied,
+    );
+    expect(
+      backupRestoreErrorMessage(
+        l10n,
+        const BackupMacKeychainAccessError(MacBackupAuthorization.cancelled),
+      ),
+      l10n.backupProgressCancelled,
+    );
+    expect(
+      backupRestoreErrorMessage(
+        l10n,
+        const BackupMacKeychainAccessError(MacBackupAuthorization.locked),
+      ),
+      l10n.backupMacKeychainNeedsUnlock,
+    );
+    expect(
+      automaticBackupErrorMessage(
+        l10n,
+        const BackupMacKeychainAccessError(MacBackupAuthorization.locked),
+      ),
+      l10n.backupMacKeychainNeedsUnlock,
+    );
     expect(
       backupRestoreErrorMessage(
         AppLocalizations.of(context)!,
@@ -33,6 +64,13 @@ void main() {
         const BackupCancelledException(),
       ),
       'Cancelled',
+    );
+    expect(
+      backupRestoreErrorMessage(
+        AppLocalizations.of(context)!,
+        PlatformException(code: 'backup_destination_inside_app'),
+      ),
+      AppLocalizations.of(context)!.backupPageChooseExternalFolder,
     );
   });
 }

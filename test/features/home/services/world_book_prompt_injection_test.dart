@@ -18,6 +18,7 @@ import 'package:Kelivo/core/database/chat_database_repository.dart';
 import 'package:Kelivo/core/models/assistant.dart';
 import 'package:Kelivo/core/models/chat_message.dart';
 import 'package:Kelivo/core/models/conversation.dart';
+import 'package:Kelivo/core/models/context_operation.dart';
 import 'package:Kelivo/core/models/conversation_prompt_settings.dart';
 import 'package:Kelivo/core/models/instruction_injection.dart';
 import 'package:Kelivo/core/models/world_book.dart';
@@ -28,6 +29,7 @@ import 'package:Kelivo/core/services/chat/chat_service.dart';
 import 'package:Kelivo/core/services/world_book_activation.dart';
 import 'package:Kelivo/features/home/services/message_builder_service.dart';
 import 'package:Kelivo/l10n/app_localizations.dart';
+import 'package:Kelivo/features/world_book/utils/world_book_import.dart';
 
 import '../../../support/business_test_harness.dart';
 
@@ -49,8 +51,9 @@ class _Chat extends ChatService {
   @override
   Future<void> updateConversationExtras(
     String id,
-    Map<String, dynamic> Function(Map<String, dynamic>) update,
-  ) async {
+    Map<String, dynamic> Function(Map<String, dynamic>) update, {
+    Conversation? expectedOwner,
+  }) async {
     extrasWrites++;
     await repository.updateConversationExtras(id, update);
     conversations[id] = (await repository.getConversation(id))!;
@@ -63,9 +66,12 @@ class _Chat extends ChatService {
       (await repository.getConversation(id))!.messageIds.length;
 
   @override
-  Future<List<ChatMessage>> loadSelectedContextMessages(
+  Future<List<ChatMessage>> loadSelectedMessageProjections(String id) =>
+      repository.getSelectedMessageProjections(id);
+
+  @override
+  Future<List<ChatMessage>> loadRawSelectedContextMessages(
     String id, {
-    required int truncateIndex,
     required int limit,
     String? throughRevisionId,
     bool includeFollowingAssistant = false,
@@ -73,7 +79,6 @@ class _Chat extends ChatService {
     historyReads++;
     return repository.getSelectedContextMessages(
       id,
-      truncateIndex: truncateIndex,
       limit: limit,
       throughRevisionId: throughRevisionId,
       includeFollowingAssistant: includeFollowingAssistant,
@@ -91,7 +96,10 @@ class _Generation extends Fake implements GenerationController {
   @override
   Map<String, dynamic>? buildCustomBody(Assistant? assistant) => null;
   @override
-  McpToolRouteSnapshot captureMcpToolRoutes(Assistant? assistant) => _Routes();
+  McpToolRouteSnapshot captureMcpToolRoutes(
+    Assistant? assistant, {
+    String? conversationId,
+  }) => _Routes();
   @override
   List<Map<String, dynamic>> buildToolDefinitions(
     SettingsProvider settings,
@@ -284,6 +292,101 @@ void main() {
       });
     },
   );
+
+  for (final position in [
+    WorldBookInjectionPosition.topOfChat,
+    WorldBookInjectionPosition.bottomOfChat,
+    WorldBookInjectionPosition.atDepth,
+  ]) {
+    for (final role in [
+      WorldBookInjectionRole.user,
+      WorldBookInjectionRole.assistant,
+    ]) {
+      for (final fixedStart in [false, true]) {
+        testWidgets(
+          'history limit precedes lore: $position $role fixed=$fixedStart',
+          (tester) async {
+            await mount(tester);
+            await tester.runAsync(() async {
+              await books.addBook(
+                WorldBook(
+                  id: 'limited',
+                  entries: [
+                    WorldBookEntry(
+                      id: 'always',
+                      content: 'ACTIVE_LORE',
+                      constantActive: true,
+                      position: position,
+                      role: role,
+                      injectDepth: 0,
+                    ),
+                    const WorldBookEntry(
+                      id: 'old',
+                      content: 'OLD_TRIGGER_LORE',
+                      keywords: ['OLD_QUESTION'],
+                      scanDepth: 200,
+                    ),
+                  ],
+                ),
+              );
+              await books.setActiveBookIds([
+                'limited',
+              ], assistantId: 'assistant');
+              final generation = MessageGenerationService(
+                chatService: chat,
+                messageBuilderService: builder,
+                generationController: _Generation(),
+                streamController: _Stream(),
+                contextProvider: context,
+              );
+              final packed = await generation.assembleUnprocessedRequestContext(
+                fixedContextStart: fixedStart,
+                messages: [
+                  for (final entry in [
+                    ('old-user', 'user', 'OLD_QUESTION'),
+                    ('old-assistant', 'assistant', 'OLD_ANSWER'),
+                    ('current-user', 'user', 'CURRENT_QUESTION'),
+                  ])
+                    ChatMessage(
+                      id: entry.$1,
+                      role: entry.$2,
+                      content: entry.$3,
+                      conversationId: 'one',
+                    ),
+                ],
+                versionSelections: {},
+                currentConversation: null,
+                settings: settings,
+                assistant: const Assistant(
+                  id: 'assistant',
+                  name: 'A',
+                  limitContextMessages: true,
+                  contextMessageSize: 1,
+                ),
+                assistantId: 'assistant',
+                providerKey: 'test',
+                modelId: 'model',
+                persistWorldBookActivation: false,
+              );
+              final contents = packed.apiMessages
+                  .map((m) => m['content'])
+                  .join('\n');
+              expect(contents, contains('CURRENT_QUESTION'));
+              expect(contents, contains('ACTIVE_LORE'));
+              expect(contents.contains('OLD_QUESTION'), fixedStart);
+              expect(contents.contains('OLD_ANSWER'), fixedStart);
+              expect(contents.contains('OLD_TRIGGER_LORE'), fixedStart);
+              final realUsers = packed.apiMessages.where(
+                (m) =>
+                    m.containsKey(MessageBuilderService.internalRevisionIdKey),
+              );
+              expect(realUsers.last['content'], 'CURRENT_QUESTION');
+            });
+          },
+        );
+      }
+    }
+  }
 
   testWidgets(
     'context previews inject timed lore without persisting activation',
@@ -801,6 +904,242 @@ void main() {
         // Regenerating before the trigger must not count later conversation messages.
         expect(await inject([history.first]), hasLength(1));
         expect(chat.getConversation('one')!.extras['keep'], isTrue);
+      });
+    },
+  );
+
+  testWidgets(
+    'compression preserves real-message timers while scans use effective history',
+    (tester) async {
+      await mount(tester);
+      await tester.runAsync(() async {
+        await books.addBook(
+          const WorldBook(
+            id: 'timed',
+            entries: [
+              WorldBookEntry(
+                id: 'sticky',
+                content: 'STICKY',
+                keywords: ['dragon'],
+                scanDepth: 1,
+                sticky: 2,
+                cooldown: 2,
+                delay: 3,
+              ),
+              WorldBookEntry(
+                id: 'delayed',
+                content: 'DELAYED',
+                constantActive: true,
+                delay: 6,
+              ),
+              WorldBookEntry(
+                id: 'original-only',
+                content: 'ORIGINAL_ONLY',
+                keywords: ['old-secret'],
+                scanDepth: 200,
+              ),
+            ],
+          ),
+        );
+        await books.setActiveBookIds(['timed'], assistantId: 'assistant');
+        final history = <ChatMessage>[];
+        Future<ChatMessage> add(String role, String content) async {
+          final message = ChatMessage(
+            id: 'clock-${history.length}',
+            conversationId: 'one',
+            role: role,
+            content: content,
+          );
+          history.add(message);
+          await repository.putMessage(message);
+          chat.conversations['one'] = (await repository.getConversation(
+            'one',
+          ))!;
+          return message;
+        }
+
+        Future<String> inject(
+          List<ChatMessage> source, {
+          bool preview = false,
+        }) async {
+          final messages = builder.buildApiMessages(
+            messages: source,
+            versionSelections: {},
+            currentConversation: chat.getConversation('one'),
+          );
+          await builder.injectWorldBookPrompts(
+            messages,
+            'assistant',
+            conversation: chat.getConversation('one'),
+            sourceMessages: source,
+            persistActivation: !preview,
+          );
+          return messages.map((message) => message['content']).join('\n');
+        }
+
+        await add('user', 'old-secret');
+        await add('assistant', 'away');
+        final trigger = await add('user', 'dragon');
+        expect(await inject([trigger]), contains('STICKY'));
+        final snapshot = await repository.readContextSnapshot('one');
+        await repository.appendContextOperation(
+          'one',
+          ContextOperation(
+            id: 'summary',
+            kind: ContextOperationKind.compress,
+            anchorGroupId: trigger.id,
+            appliedAfterGroupId: trigger.id,
+            sourceGroups: history.map(ContextHistory.group).toList(),
+            dependencies: const [],
+            createdAt: DateTime(2026),
+            summary: 'Summary without keyword triggers',
+            originalSummary: 'Summary without keyword triggers',
+          ),
+          expectedFingerprint: snapshot.fingerprint,
+        );
+        final summaryOnly = await repository.getEffectiveContextMessages(
+          'one',
+          limit: 100,
+        );
+        expect(summaryOnly, hasLength(1));
+        final preview = await inject(summaryOnly, preview: true);
+        expect(preview, contains('STICKY'));
+        expect(preview, isNot(contains('DELAYED')));
+        expect(preview, isNot(contains('ORIGINAL_ONLY')));
+        expect(
+          (chat.getConversation('one')!.extras[WorldBookActivation.extrasKey]
+              as Map)['messageCount'],
+          3,
+        );
+        final pending = ChatMessage(
+          id: 'not-submitted',
+          conversationId: 'one',
+          role: 'user',
+          content: 'away',
+        );
+        expect(
+          await inject([...summaryOnly, pending], preview: true),
+          contains('STICKY'),
+        );
+        await add('assistant', 'away');
+        await add('user', 'away');
+        final retained = await repository.getEffectiveContextMessages(
+          'one',
+          limit: 1,
+        );
+        final sticky = await inject(retained);
+        expect(sticky, contains('STICKY'));
+        expect(sticky, isNot(contains('DELAYED')));
+        expect(sticky, isNot(contains('ORIGINAL_ONLY')));
+        await add('assistant', 'away');
+        await add('user', 'dragon');
+        final cooling = await inject(
+          await repository.getEffectiveContextMessages('one', limit: 1),
+        );
+        expect(cooling, isNot(contains('STICKY')));
+        expect(cooling, contains('DELAYED'));
+        expect(cooling, isNot(contains('ORIGINAL_ONLY')));
+        expect(
+          (chat.getConversation('one')!.extras[WorldBookActivation.extrasKey]
+              as Map)['messageCount'],
+          7,
+        );
+        // A historical request still excludes all later real messages.
+        final historical = await inject([history.first], preview: true);
+        expect(historical, isNot(contains('DELAYED')));
+        expect(historical, isNot(contains('STICKY')));
+      });
+    },
+  );
+
+  testWidgets(
+    'imported ST entries preserve prompt order, supported roles and depth zero',
+    (tester) async {
+      await mount(tester);
+      await tester.runAsync(() async {
+        final imported = parseWorldBookImport({
+          'entries': {
+            '0': {
+              'key': [],
+              'content': 'LATER',
+              'constant': true,
+              'position': 0,
+              'order': 250,
+            },
+            '1': {
+              'key': [],
+              'content': 'EARLIER',
+              'constant': true,
+              'position': 0,
+              'order': 100,
+            },
+            '2': {
+              'key': ['dragon'],
+              'content': 'DEPTH ONE',
+              'position': 4,
+              'depth': 1,
+              'role': 1,
+            },
+            '3': {
+              'key': ['dragon'],
+              'content': 'DEPTH ZERO',
+              'position': 4,
+              'depth': 0,
+              'role': 1,
+            },
+            '5': {
+              'key': ['dragon'],
+              'content': 'INLINE SYSTEM MUST NOT INJECT',
+              'position': 4,
+              'depth': 0,
+              'role': 0,
+            },
+            '6': {
+              'key': [],
+              'constant': true,
+              'content': '{{getvar::current_location}}',
+            },
+            '7': {
+              'key': ['dragon'],
+              'content': 'DEEP',
+              'position': 4,
+              'depth': 100,
+              'role': 2,
+            },
+            '8': {
+              'key': ['dragon'],
+              'content': 'LESS DEEP',
+              'position': 4,
+              'depth': 99,
+              'role': 2,
+            },
+            '4': {
+              'key': ['dragon'],
+              'keysecondary': ['missing'],
+              'content': 'MUST NOT INJECT',
+            },
+          },
+        }, fileName: 'World.json')!;
+        final book = normalizeImportedWorldBook(
+          imported.book,
+          existingBookIds: {},
+        );
+        await books.addBook(book);
+        await books.setActiveBookIds([book.id], assistantId: 'assistant');
+        final messages = <Map<String, dynamic>>[
+          {'role': 'system', 'content': 'BASE'},
+          {'role': 'user', 'content': 'dragon'},
+        ];
+        await builder.injectWorldBookPrompts(messages, 'assistant');
+        builder.stripInternalRevisionIds(messages);
+        expect(messages, [
+          {'role': 'system', 'content': 'EARLIER\nLATER\nBASE'},
+          {'role': 'assistant', 'content': 'DEEP'},
+          {'role': 'assistant', 'content': 'LESS DEEP'},
+          {'role': 'user', 'content': '<system>\nDEPTH ONE\n</system>'},
+          {'role': 'user', 'content': 'dragon'},
+          {'role': 'user', 'content': '<system>\nDEPTH ZERO\n</system>'},
+        ]);
       });
     },
   );

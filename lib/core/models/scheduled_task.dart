@@ -6,6 +6,9 @@ enum ScheduledTaskUnavailablePolicy { remind, skip }
 
 enum ScheduledTaskRepeat { once, daily, weekdays, custom }
 
+/// Id of the built-in task that drives Companion Agency self-wakes.
+const agencyWakeTaskId = 'companion-agency-wake';
+
 class ScheduledTask {
   static const defaultPreparationWindowMinutes = Duration.minutesPerDay;
   static const defaultPreparationPrompt =
@@ -45,6 +48,7 @@ class ScheduledTask {
     this.unavailablePolicy = ScheduledTaskUnavailablePolicy.skip,
     this.notify = true,
     this.showPreview = true,
+    this.companionWake = false,
     this.preparationWindowMinutes = defaultPreparationWindowMinutes,
     this.maxPrepareAttempts = 2,
     this.preparationCooldownMinutes = 10,
@@ -63,6 +67,11 @@ class ScheduledTask {
   final DateTime? onceDate, startDate, endDate;
   final bool exhausted;
   final bool allowPreparation, notify, showPreview;
+
+  /// Follow-up only: the assistant wakes on its own instead of answering
+  /// [prompt] as a user message. [prompt] becomes hidden wake context and the
+  /// assistant may stay silent (see `companion_wake.dart`).
+  final bool companionWake;
   final String preparationPrompt;
   final ScheduledTaskContextPolicy contextPolicy;
   final ScheduledTaskUnavailablePolicy unavailablePolicy;
@@ -73,7 +82,15 @@ class ScheduledTask {
       scheduleRevision;
 
   bool get canPrepare =>
-      allowPreparation && mode != ScheduledTaskMode.regenerate;
+      allowPreparation &&
+      mode != ScheduledTaskMode.regenerate &&
+      !isCompanionWake;
+
+  bool get isCompanionWake =>
+      companionWake && mode == ScheduledTaskMode.followUp;
+
+  /// The hidden Companion Agency self-wake; never listed with user tasks.
+  bool get isAgencyWake => id == agencyWakeTaskId;
 
   ScheduledTaskRepeat get repeat {
     if (onceDate != null) return ScheduledTaskRepeat.once;
@@ -122,6 +139,7 @@ class ScheduledTask {
     unavailablePolicy: unavailablePolicy,
     notify: notify,
     showPreview: showPreview,
+    companionWake: companionWake,
     preparationWindowMinutes: preparationWindowMinutes,
     maxPrepareAttempts: maxPrepareAttempts,
     preparationCooldownMinutes: preparationCooldownMinutes,
@@ -158,6 +176,7 @@ class ScheduledTask {
     ),
     notify: json['notify'] != false,
     showPreview: json['showPreview'] != false,
+    companionWake: json['companionWake'] == true,
     preparationWindowMinutes:
         (json['preparationWindowMinutes'] as int? ??
                 defaultPreparationWindowMinutes)
@@ -200,6 +219,7 @@ class ScheduledTask {
     'unavailablePolicy': unavailablePolicy.name,
     'notify': notify,
     'showPreview': showPreview,
+    'companionWake': companionWake,
     'preparationWindowMinutes': preparationWindowMinutes,
     'maxPrepareAttempts': maxPrepareAttempts,
     'preparationCooldownMinutes': preparationCooldownMinutes,

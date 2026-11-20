@@ -10,7 +10,8 @@ import 'agency_event_bus.dart';
 /// snapshots/events after app startup and only supplies compact current context
 /// to an enabled companion assistant.
 class AgencyWorldState {
-  AgencyWorldState({AgencyEventBus? bus}) : _bus = bus ?? AgencyEventBus.instance;
+  AgencyWorldState({AgencyEventBus? bus})
+    : _bus = bus ?? AgencyEventBus.instance;
 
   static final AgencyWorldState instance = AgencyWorldState();
 
@@ -20,10 +21,8 @@ class AgencyWorldState {
   AgencyEvent? _battery;
   AgencyEvent? _network;
   final Map<String, AgencyEvent> _bluetoothAudio = <String, AgencyEvent>{};
-  final Map<String, AgencyEvent> _screenTimeByOrigin =
-      <String, AgencyEvent>{};
-  final Map<String, AgencyEvent> _locationByOrigin =
-      <String, AgencyEvent>{};
+  final Map<String, AgencyEvent> _screenTimeByOrigin = <String, AgencyEvent>{};
+  final Map<String, AgencyEvent> _locationByOrigin = <String, AgencyEvent>{};
   final Map<String, AgencyEvent> _calendarByKey = <String, AgencyEvent>{};
 
   void start() {
@@ -160,21 +159,22 @@ class AgencyWorldState {
       }
     }
 
-    final upcoming = _calendarByKey.values
-        .where((event) => _originKey(event) == origin)
-        .map(
-          (event) => (
-            event: event,
-            start: _parseDeviceDate(event.payload['start']),
-          ),
-        )
-        .where((item) => item.start != null)
-        .where((item) {
-          final delta = item.start!.difference(clock);
-          return !delta.isNegative && delta <= const Duration(hours: 2);
-        })
-        .toList(growable: false)
-      ..sort((a, b) => a.start!.compareTo(b.start!));
+    final upcoming =
+        _calendarByKey.values
+            .where((event) => _originKey(event) == origin)
+            .map(
+              (event) => (
+                event: event,
+                start: _parseDeviceDate(event.payload['start']),
+              ),
+            )
+            .where((item) => item.start != null)
+            .where((item) {
+              final delta = item.start!.difference(clock);
+              return !delta.isNegative && delta <= const Duration(hours: 2);
+            })
+            .toList(growable: false)
+          ..sort((a, b) => a.start!.compareTo(b.start!));
 
     for (final item in upcoming.take(2)) {
       final event = item.event;
@@ -242,9 +242,7 @@ class AgencyWorldState {
 
   static String _fixedToken(Object? value) {
     final token = value?.toString().trim().toLowerCase() ?? '';
-    return RegExp(r'^[a-z0-9_\-]{1,40}$').hasMatch(token)
-        ? token
-        : 'unknown';
+    return RegExp(r'^[a-z0-9_\-]{1,40}$').hasMatch(token) ? token : 'unknown';
   }
 
   static DateTime? _parseDeviceDate(Object? value) {

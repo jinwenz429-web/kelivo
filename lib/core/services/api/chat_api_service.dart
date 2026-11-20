@@ -1,4 +1,14 @@
+import 'providers/openai/native_compaction.dart';
+import 'providers/openai/responses_request.dart';
+import '../../models/native_compaction.dart';
+import 'native_compaction_context.dart';
+import 'generation/model_request_attempts.dart';
+import '../../models/compress_context_options.dart' show isContextLengthError;
+import 'request_history_context.dart';
+import 'request_image_context.dart';
+import 'request_timeout.dart';
 import '../auth/provider_oauth_service.dart';
+import '../auth/codex_turn_state.dart';
 import 'dart:async';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:dio/dio.dart';
@@ -16,7 +26,9 @@ import 'stream/stream_chunk_handler.dart';
 
 import '../../models/auto_retry_options.dart';
 import '../../models/reasoning_request.dart';
+import '../model_override_payload_parser.dart';
 import '../model_spec/model_spec_resolver.dart';
+import 'builtin_tools.dart';
 import 'chat_api_helpers.dart';
 import 'provider_request_headers.dart';
 import 'providers/claude_official.dart';
@@ -36,7 +48,94 @@ export 'generation/text_generation_result.dart';
 export 'generation/tool_loop_runner.dart';
 export 'stream/stream_chunk_emit.dart';
 
+/// Controls which built-in tools are available to a generation request.
+enum BuiltInToolMode { configured, searchOnly, none }
+
 class ChatApiService {
+  static Future<NativeCompactionResult> compactHistory({
+    required ProviderConfig config,
+    required String modelId,
+    required List<Map<String, dynamic>> messages,
+    required String requestId,
+    required String conversationId,
+    List<Map<String, dynamic>>? tools,
+    RequestImageContext? imageContext,
+    Map<String, String>? extraHeaders,
+    bool Function()? isCancelled,
+    Duration? requestTimeout,
+    NativeUserRetention retention = NativeUserRetention.auto,
+  }) async {
+    final token = CancelToken();
+    _activeCancelTokens.remove(requestId)?.cancel('replaced');
+    _activeCancelTokens[requestId] = token;
+    final timeout = cancelOnRequestTimeout(
+      token,
+      requestTimeout ?? const Duration(minutes: 5),
+    );
+    http.Client? client;
+    void check() {
+      checkRequestTimeout(token);
+      if (token.isCancelled || (isCancelled?.call() ?? false)) {
+        throw StateError('cancelled');
+      }
+    }
+
+    try {
+      check();
+      config = await Future.any<ProviderConfig>([
+        ProviderOAuthService.instance.resolve(config),
+        _whenCancelled(token).then((_) => throw StateError('cancelled')),
+      ]);
+      check();
+      validateNativeCompactionScope(messages, config);
+      config = nativeResponsesConfig(config);
+      final body = await buildOpenAIResponsesBody(
+        config,
+        modelId,
+        RequestHistoryContext.identify(messages),
+        tools: tools,
+        stream: config.oauthProvider == OAuthProvider.chatgpt,
+      );
+      check();
+      final projected =
+          await imageContext?.project(body, preserveSources: true) ?? body;
+      check();
+      client = ProviderOAuthService.instance.authenticatedClient(
+        providerHttpClient(config, cancelToken: token, logRequests: false),
+        config,
+        cancelToken: token,
+      );
+      final authenticatedClient = client;
+      Future<NativeCompactionResult> sendCompact() => requestNativeCompaction(
+        authenticatedClient,
+        config,
+        modelId,
+        projected,
+        retention: retention,
+        extraHeaders: providerSessionHeaders(
+          config,
+          conversationId: conversationId,
+          extraHeaders: extraHeaders,
+        ),
+        conversationId: conversationId,
+      );
+      final result = await (imageContext == null
+          ? sendCompact()
+          : imageContext.run(() => Stream.fromFuture(sendCompact())).first);
+      check();
+      return result;
+    } catch (_) {
+      checkRequestTimeout(token);
+      rethrow;
+    } finally {
+      timeout?.cancel();
+      client?.close();
+      if (identical(_activeCancelTokens[requestId], token)) {
+        _activeCancelTokens.remove(requestId);
+      }
+    }
+  }
+
   static final Map<String, CancelToken> _activeCancelTokens =
       <String, CancelToken>{};
 
@@ -70,9 +169,13 @@ class ChatApiService {
     } catch (_) {}
   }
 
-  static Future<String> _stripImageMarkersFromText(String raw) async {
+  static Future<String> _stripImageMarkersFromText(
+    String raw, {
+    String? literalText,
+  }) async {
     final parsed = await parseTextAndImages(
       raw,
+      literalText: literalText,
       allowRemoteImages: false,
       allowLocalImages: false,
       allowDataImages: false,
@@ -84,13 +187,24 @@ class ChatApiService {
     return parsed.text;
   }
 
-  static Future<dynamic> _stripImageInputsFromContent(dynamic content) async {
-    if (content is String) return _stripImageMarkersFromText(content);
+  static Future<dynamic> _stripImageInputsFromContent(
+    dynamic content, {
+    String? literalText,
+  }) async {
+    if (content is String) {
+      return _stripImageMarkersFromText(content, literalText: literalText);
+    }
     if (content is List) {
-      return _stripImageMarkersFromText(textFromContentParts(content));
+      return _stripImageMarkersFromText(
+        textFromContentParts(content),
+        literalText: literalText,
+      );
     }
     if (content is Map) {
-      return _stripImageMarkersFromText(textFromContentParts([content]));
+      return _stripImageMarkersFromText(
+        textFromContentParts([content]),
+        literalText: literalText,
+      );
     }
     return content;
   }
@@ -165,7 +279,10 @@ class ChatApiService {
         }
       }
       if (!keepImage && copy.containsKey('content')) {
-        copy['content'] = await _stripImageInputsFromContent(copy['content']);
+        copy['content'] = await _stripImageInputsFromContent(
+          copy['content'],
+          literalText: internalLiteralText(copy),
+        );
       }
       out.add(copy);
     }
@@ -202,6 +319,27 @@ class ChatApiService {
     );
   }
 
+  static ProviderConfig _withoutBuiltInTools(
+    ProviderConfig config,
+    String modelId,
+  ) {
+    final override = ModelOverridePayloadParser.modelOverride(
+      config.modelOverrides,
+      modelId,
+    );
+    return config.copyWith(
+      // The filtered, merged body is passed through extraBody for this request.
+      customBody: const [],
+      modelOverrides: {
+        ...config.modelOverrides,
+        modelId: {...override, 'builtInTools': const <String>[]}
+          ..remove('tools') // Older model overrides store tool switches here.
+          ..remove('webSearch')
+          ..remove('body'),
+      },
+    );
+  }
+
   static Stream<StreamChunk> sendMessageStream({
     required ProviderConfig config,
     required String modelId,
@@ -218,14 +356,18 @@ class ChatApiService {
     bool stream = true,
     String? requestId,
     String? conversationId,
+    String? serviceTier,
     bool allowImagesApiRouting = true,
     bool ocrActive = false,
-    bool builtInSearchOnly = false,
+    BuiltInToolMode builtInToolMode = BuiltInToolMode.configured,
     bool skipImageParsing = false,
     bool parseMarkdownImageLinks = true,
     // Disallow media, tools and body overrides for detached text generation.
     bool textOnly = false,
     AutoRetryOptions? retryOverride,
+    RequestImageContext? imageContext,
+    RequestHistoryContext? historyContext,
+    Duration? requestTimeout,
   }) async* {
     final sessionToken = CancelToken();
     final toolCancellation = ToolCallCancellation(
@@ -240,6 +382,7 @@ class ChatApiService {
       } catch (_) {}
       _activeCancelTokens[rid] = sessionToken;
     }
+    final timeout = cancelOnRequestTimeout(sessionToken, requestTimeout);
     try {
       config = await Future.any<ProviderConfig>([
         ProviderOAuthService.instance.resolve(config),
@@ -249,13 +392,24 @@ class ChatApiService {
           ),
         ),
       ]);
+      checkRequestTimeout(sessionToken);
       if (sessionToken.isCancelled) return;
-      if (textOnly) config = _textOnlyConfig(config, modelId);
+      if (textOnly) {
+        config = _textOnlyConfig(config, modelId);
+      } else if (builtInToolMode == BuiltInToolMode.none) {
+        final body = customBody(config, modelId, assistantBody: extraBody);
+        BuiltInToolsHelper.removeToolOverrides(body, config);
+        extraBody = body;
+        config = _withoutBuiltInTools(config, modelId);
+      }
       if (config.oauthProvider == OAuthProvider.chatgpt) stream = true;
-      if (config.oauthProvider == OAuthProvider.kimi &&
-          (config.modelOverrides[modelId] as Map?)?['oauthProtocol'] ==
-              'anthropic') {
-        config = config.copyWith(providerType: ProviderKind.claude);
+      config = config.forModelProtocol(modelId);
+      final nativeHistory = hasNativeCompaction(messages);
+      final nativeTransport =
+          nativeHistory || historyContext?.nativeCompression == true;
+      if (nativeTransport) {
+        validateNativeCompactionScope(messages, config);
+        config = nativeResponsesConfig(config);
       }
       final options = retryOverride ?? AutoRetryConfig.current;
       final sessionHeaders = providerSessionHeaders(
@@ -263,18 +417,30 @@ class ChatApiService {
         conversationId: conversationId,
         extraHeaders: extraHeaders,
       );
+      final codexTurnState = config.oauthProvider == OAuthProvider.chatgpt
+          ? CodexTurnState()
+          : null;
       final kind = ProviderConfig.classify(
         config.id,
         explicitType: config.providerType,
       );
       final useOpenAIImagesApi =
+          !nativeTransport &&
+          imageContext?.omitImages != true &&
           !textOnly &&
           kind == ProviderKind.openai &&
           allowImagesApiRouting &&
           shouldUseOpenAIImagesApi(config, modelId);
       final useZhipuLayoutParsing =
-          !textOnly && shouldUseZhipuLayoutParsing(config, modelId);
-      final unicodeSafeMessages = _sanitizeMessages(messages);
+          !nativeTransport &&
+          imageContext?.omitImages != true &&
+          !textOnly &&
+          shouldUseZhipuLayoutParsing(config, modelId);
+      final unicodeSafeMessages = _sanitizeMessages(
+        historyContext == null
+            ? messages
+            : RequestHistoryContext.identify(messages),
+      );
       final spec = _stripSpecForRequest(
         spec: ModelSpecResolver.instance.spec(config, modelId),
         keepImages:
@@ -285,7 +451,10 @@ class ChatApiService {
                 useZhipuLayoutParsing),
       );
       final safeMessages = await stripUnsupportedMediaFromMessages(
-        unicodeSafeMessages,
+        spec.supportsImageInput
+            ? unicodeSafeMessages
+            : imageContext?.withoutImageInput(unicodeSafeMessages) ??
+                  unicodeSafeMessages,
         spec,
       );
       final safeUserImagePaths = userImagePaths == null
@@ -305,11 +474,13 @@ class ChatApiService {
           options: options,
           isCancelled: () => sessionToken.isCancelled,
           cancelled: _whenCancelled(sessionToken),
-          shouldRetry: (error) => shouldRetryError(
-            error,
-            options,
-            retryOnNetworkError: retryNetworkErrors ? null : false,
-          ),
+          shouldRetry: (error) =>
+              !isContextLengthError(error) &&
+              shouldRetryError(
+                error,
+                options,
+                retryOnNetworkError: retryNetworkErrors ? null : false,
+              ),
           retryEvent: emitRetryUi
               ? (attempt, delay, error) => RetryPending(
                   attempt: attempt + 1,
@@ -322,41 +493,71 @@ class ChatApiService {
           attemptStartEvent: emitRetryUi
               ? () => const RetryAttemptStart()
               : null,
-          attempt: (_) => carrySplitSurrogates(sendRound()),
+          attempt: (_) => carrySplitSurrogates(
+            historyContext == null
+                ? sendRound()
+                : historyContext.recoverOverflow(sendRound),
+          ),
         );
       }
 
+      Stream<StreamChunk> inImageContext(
+        Stream<StreamChunk> Function() action,
+      ) {
+        Stream<StreamChunk> withImages() => imageContext == null
+            ? RequestImageContext.without(action)
+            : imageContext.run(action);
+        return historyContext == null
+            ? RequestHistoryContext.without(withImages)
+            : historyContext.run(withImages);
+      }
+
       yield* retryRound(
-        () => _sendOnce(
-          config: config,
-          modelId: modelId,
-          messages: safeMessages,
-          userImagePaths: safeUserImagePaths,
-          reasoning: reasoning,
-          temperature: temperature,
-          topP: topP,
-          maxTokens: maxTokens,
-          tools: textOnly ? null : tools,
-          onToolCall: toolHandler == null
-              ? null
-              : (name, args, {toolCallId}) => toolCancellation.run(
-                  () => toolHandler(name, args, toolCallId: toolCallId),
-                ),
-          extraHeaders: sessionHeaders,
-          extraBody: textOnly ? null : extraBody,
-          conversationId: conversationId,
-          stream: stream,
-          builtInSearchOnly: builtInSearchOnly,
-          skipImageParsing:
-              textOnly || skipImageParsing || !parseMarkdownImageLinks,
-          kind: kind,
-          useOpenAIImagesApi: useOpenAIImagesApi,
-          useZhipuLayoutParsing: useZhipuLayoutParsing,
-          sessionToken: sessionToken,
-          retryRound: retryRound,
+        () => inImageContext(
+          () => toolCancellation.runStream(
+            () => _sendOnce(
+              config: config,
+              modelId: modelId,
+              messages: safeMessages,
+              userImagePaths: safeUserImagePaths,
+              reasoning: reasoning,
+              temperature: temperature,
+              topP: topP,
+              maxTokens: maxTokens,
+              tools: textOnly ? null : tools,
+              onToolCall: toolHandler == null
+                  ? null
+                  : (name, args, {toolCallId}) => toolCancellation.run(
+                      () => toolHandler(name, args, toolCallId: toolCallId),
+                    ),
+              extraHeaders: sessionHeaders,
+              extraBody: textOnly ? null : extraBody,
+              serviceTier: textOnly ? null : serviceTier,
+              conversationId: conversationId,
+              stream: stream,
+              builtInSearchOnly: builtInToolMode == BuiltInToolMode.searchOnly,
+              skipImageParsing:
+                  textOnly || skipImageParsing || !parseMarkdownImageLinks,
+              kind: kind,
+              useOpenAIImagesApi: useOpenAIImagesApi,
+              useZhipuLayoutParsing: useZhipuLayoutParsing,
+              sessionToken: sessionToken,
+              codexTurnState: codexTurnState,
+              retryRound: retryRound,
+            ),
+          ),
         ),
-      );
+      ).handleError((Object error, StackTrace stack) {
+        // Errors forwarded by yield* do not enter the surrounding catch.
+        checkRequestTimeout(sessionToken);
+        Error.throwWithStackTrace(error, stack);
+      });
+      checkRequestTimeout(sessionToken);
+    } catch (_) {
+      checkRequestTimeout(sessionToken);
+      rethrow;
     } finally {
+      timeout?.cancel();
       if (rid.isNotEmpty) {
         final cur = _activeCancelTokens[rid];
         if (identical(cur, sessionToken)) {
@@ -402,6 +603,7 @@ class ChatApiService {
   static Stream<StreamChunk> _sendOnce({
     required ProviderConfig config,
     String? conversationId,
+    String? serviceTier,
     required String modelId,
     required List<Map<String, dynamic>> messages,
     List<String>? userImagePaths,
@@ -420,6 +622,7 @@ class ChatApiService {
     required bool useOpenAIImagesApi,
     required bool useZhipuLayoutParsing,
     required CancelToken sessionToken,
+    required CodexTurnState? codexTurnState,
     required StreamRoundRunner retryRound,
   }) async* {
     if (sessionToken.isCancelled) {
@@ -428,8 +631,12 @@ class ChatApiService {
     final cancelToken = CancelToken();
     _bridgeCancel(sessionToken, cancelToken);
     final client = ProviderOAuthService.instance.authenticatedClient(
-      providerHttpClient(config, cancelToken: cancelToken),
+      ModelRequestAttempts.wrap(
+        providerHttpClient(config, cancelToken: cancelToken),
+      ),
       config,
+      codexTurnState: codexTurnState,
+      cancelToken: cancelToken,
     );
     try {
       if (useZhipuLayoutParsing) {
@@ -459,6 +666,7 @@ class ChatApiService {
             modelId,
             messages,
             conversationId: conversationId,
+            serviceTier: serviceTier,
             userImagePaths: userImagePaths,
             reasoning: reasoning,
             temperature: temperature,
@@ -480,6 +688,7 @@ class ChatApiService {
             modelId,
             messages,
             conversationId: conversationId,
+            serviceTier: serviceTier,
             userImagePaths: userImagePaths,
             reasoning: reasoning,
             temperature: temperature,
@@ -601,13 +810,14 @@ class ChatApiService {
     String? conversationId,
     bool allowImagesApiRouting = true,
     bool ocrActive = false,
-    bool builtInSearchOnly = false,
+    BuiltInToolMode builtInToolMode = BuiltInToolMode.configured,
     bool skipImageParsing = false,
     bool parseMarkdownImageLinks = true,
     bool textOnly = false,
     AutoRetryOptions? retryOverride,
     void Function(RetryPending? pending)? onRetry,
     void Function(Usage update)? onUsage,
+    Duration? requestTimeout,
   }) async {
     final handler = StreamChunkHandler(
       onRetry: onRetry == null ? null : (pending) => onRetry(pending),
@@ -630,15 +840,17 @@ class ChatApiService {
       conversationId: conversationId,
       allowImagesApiRouting: allowImagesApiRouting,
       ocrActive: ocrActive,
-      builtInSearchOnly: builtInSearchOnly,
+      builtInToolMode: builtInToolMode,
       skipImageParsing: skipImageParsing,
       parseMarkdownImageLinks: parseMarkdownImageLinks,
       textOnly: textOnly,
       retryOverride: retryOverride,
+      requestTimeout: requestTimeout,
     )) {
       if (chunk is RetryAttemptStart) {
         onRetry?.call(null);
       }
+      if (textOnly && chunk is Usage && chunk.estimated) continue;
       handler.handle(chunk);
       if (chunk is Usage) onUsage?.call(chunk);
     }
@@ -668,7 +880,7 @@ class ChatApiService {
       reasoning: reasoning,
       // Utility calls only ever want search; never image generation or a
       // code interpreter.
-      builtInSearchOnly: true,
+      builtInToolMode: BuiltInToolMode.searchOnly,
       skipImageParsing: skipImageParsing,
       allowImagesApiRouting: !skipImageParsing,
     );

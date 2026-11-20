@@ -176,8 +176,11 @@ class ScheduledTasksService extends ChangeNotifier {
   bool loaded = false;
   String? error;
   bool _disposed = false;
+  bool _stoppingForExit = false;
+  final _executions = <Completer<void>>{};
 
   Future<void> attach(ScheduledTaskExecutor executor) async {
+    if (_stoppingForExit) return;
     _executor = executor;
     try {
       if (_prepared case final prepared?) {
@@ -219,6 +222,24 @@ class ScheduledTasksService extends ChangeNotifier {
     }
   }
 
+  /// Stop dispatch before chat shutdown, then await run status persistence.
+  Future<void> stopForExit() async {
+    _stoppingForExit = true;
+    final dispatchStopped = _desktop?.stopForExit();
+    _prepared?.stop();
+    try {
+      await Future.wait([
+        for (final cancellation in _active.values.toList())
+          cancellation.cancel(),
+      ]);
+    } finally {
+      await Future.wait([
+        if (dispatchStopped != null) dispatchStopped,
+        for (final execution in _executions) execution.future,
+      ]);
+    }
+  }
+
   void _desktopChanged() {
     if (_disposed) return;
     final desktop = _desktop!;
@@ -254,6 +275,22 @@ class ScheduledTasksService extends ChangeNotifier {
   }
 
   Future<void> _execute(
+    String id,
+    ScheduledTask task,
+    ScheduledRunCancellation cancellation,
+  ) async {
+    final completion = Completer<void>();
+    _executions.add(completion);
+    try {
+      if (_stoppingForExit) await cancellation.cancel();
+      await _executeRun(id, task, cancellation);
+    } finally {
+      _executions.remove(completion);
+      completion.complete();
+    }
+  }
+
+  Future<void> _executeRun(
     String id,
     ScheduledTask task,
     ScheduledRunCancellation cancellation,
@@ -303,8 +340,20 @@ class ScheduledTasksService extends ChangeNotifier {
     } finally {
       _active.remove(id);
       await refresh();
+      onRunFinished?.call(task);
     }
   }
+
+  /// Tasks the user created; built-in ones such as the agency self-wake
+  /// are managed elsewhere.
+  List<ScheduledTask> get userTasks => [
+    for (final task in tasks)
+      if (!task.isAgencyWake) task,
+  ];
+
+  /// Called after any run has been reported finished, e.g. so the agency
+  /// self-wake can pick its next random time (saving is refused mid-run).
+  void Function(ScheduledTask task)? onRunFinished;
 
   void _apply(Map<Object?, Object?> data) {
     if (_disposed) return;

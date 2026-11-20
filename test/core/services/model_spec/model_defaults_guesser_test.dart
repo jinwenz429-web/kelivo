@@ -46,6 +46,11 @@ void main() {
           expect(raw, isA<Map>(), reason: 'missing fixture for $id');
           final expected = Map<String, dynamic>.from(raw as Map);
           final guess = ModelDefaultsGuesser.guess(id);
+          expect(
+            guess.replay,
+            isNot(ReasoningReplayPolicy.toolTurns),
+            reason: id,
+          );
           final expectedType = _isImagesApiId(id)
               ? ModelType.image
               : _byName(ModelType.values, expected['type'] as String);
@@ -246,9 +251,32 @@ void main() {
       expect(guess.replayField, replayField, reason: id);
     }
 
+    test('GPT-5 variants require at least minimal reasoning', () {
+      for (final model in const ['gpt-5', 'gpt-5-mini', 'gpt-5-nano']) {
+        for (final id in [
+          model,
+          '$model-2025-08-07',
+          'openai/$model',
+          'openai/$model-2025-08-07',
+        ]) {
+          expectHit(
+            id,
+            dialect: ReasoningDialect.openaiReasoningEffort,
+            levels: const [
+              ReasoningLevel.minimal,
+              ReasoningLevel.low,
+              ReasoningLevel.medium,
+              ReasoningLevel.high,
+            ],
+            canDisable: false,
+          );
+        }
+      }
+    });
+
     test('OpenAI effort ladders', () {
       expectHit(
-        'gpt-5',
+        'gpt-5.1',
         dialect: ReasoningDialect.openaiReasoningEffort,
         levels: const [
           ReasoningLevel.low,
@@ -273,6 +301,16 @@ void main() {
         'gpt-5-pro',
         dialect: ReasoningDialect.openaiReasoningEffort,
         levels: const [ReasoningLevel.high],
+        canDisable: false,
+      );
+      expectHit(
+        'gpt-5-codex',
+        dialect: ReasoningDialect.openaiReasoningEffort,
+        levels: const [
+          ReasoningLevel.low,
+          ReasoningLevel.medium,
+          ReasoningLevel.high,
+        ],
         canDisable: false,
       );
       expectHit(
@@ -406,6 +444,79 @@ void main() {
       );
     });
 
+    test(
+      'Claude 5.5 thinking handles provider aliases and version spelling',
+      () {
+        for (final id in [
+          'claude-haiku-5-5',
+          'anthropic/claude-haiku-5.5',
+          'us.anthropic.claude-haiku-5-5-20261007-v1:0',
+          'claude-5-5-haiku',
+        ]) {
+          expectHit(
+            id,
+            dialect: ReasoningDialect.anthropicAdaptiveEffort,
+            levels: const [
+              ReasoningLevel.low,
+              ReasoningLevel.medium,
+              ReasoningLevel.high,
+              ReasoningLevel.xhigh,
+              ReasoningLevel.max,
+            ],
+            canDisable: true,
+            sampling: SamplingPolicy.never,
+            maxOutput: 128000,
+          );
+        }
+        for (final id in [
+          'claude-opus-5-5',
+          'claude-opus-5.5@default',
+          'claude-5.5-opus',
+        ]) {
+          final guess = ModelDefaultsGuesser.guess(id);
+          expect(
+            guess.reasoning!.dialect,
+            ReasoningDialect.anthropicAdaptiveEffort,
+            reason: id,
+          );
+          expect(guess.reasoning!.canDisable, isFalse, reason: id);
+        }
+        for (final id in [
+          'claude-sonnet-5-5',
+          'claude-sonnet-5.5',
+          'claude-5.5-sonnet',
+        ]) {
+          final guess = ModelDefaultsGuesser.guess(id);
+          expect(
+            guess.reasoning!.dialect,
+            ReasoningDialect.anthropicBetweenTools,
+            reason: id,
+          );
+          expect(guess.reasoning!.canDisable, isTrue, reason: id);
+        }
+      },
+    );
+
+    test('Claude snapshot dates are not minor versions', () {
+      for (final id in [
+        'claude-opus-4-20250514',
+        'claude-opus-4-1-20250805',
+        'claude-4.1-opus',
+      ]) {
+        final guess = ModelDefaultsGuesser.guess(id);
+        expect(
+          guess.reasoning!.dialect,
+          ReasoningDialect.anthropicBudget,
+          reason: id,
+        );
+        expect(guess.maxOutput, 32000, reason: id);
+        expect(guess.sampling, isNull, reason: id);
+      }
+      final sonnet = ModelDefaultsGuesser.guess('claude-sonnet-4-20250514');
+      expect(sonnet.reasoning!.dialect, ReasoningDialect.anthropicBudget);
+      expect(sonnet.maxOutput, 64000);
+    });
+
     test('Gemini families', () {
       expectHit(
         'gemma-4',
@@ -488,6 +599,28 @@ void main() {
         ).abilities.contains(ModelAbility.reasoning),
         isTrue,
       );
+      for (final (id, defaultLevel) in const [
+        ('gemini-4-argon', ReasoningLevel.medium),
+        ('gemini-4-argon-cyber-permissive', ReasoningLevel.high),
+      ]) {
+        expectHit(
+          id,
+          dialect: ReasoningDialect.geminiThinkingLevel,
+          levels: const [
+            ReasoningLevel.low,
+            ReasoningLevel.medium,
+            ReasoningLevel.high,
+          ],
+          canDisable: false,
+          sampling: SamplingPolicy.never,
+          maxOutput: 65536,
+          replay: ReasoningReplayPolicy.all,
+        );
+        expect(
+          ModelDefaultsGuesser.guess(id).reasoning!.defaultLevel,
+          defaultLevel,
+        );
+      }
       expectHit(
         'gemini-2.5-flash',
         dialect: ReasoningDialect.geminiThinkingBudget,
@@ -510,7 +643,7 @@ void main() {
         canDisable: true,
         sampling: SamplingPolicy.never,
         maxOutput: 32000,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -519,7 +652,7 @@ void main() {
         levels: const [],
         canDisable: true,
         maxOutput: 32000,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -529,7 +662,7 @@ void main() {
         canDisable: false,
         sampling: SamplingPolicy.never,
         maxOutput: 32000,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -603,7 +736,7 @@ void main() {
           ReasoningLevel.max,
         ],
         canDisable: false,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -617,7 +750,7 @@ void main() {
           ReasoningLevel.max,
         ],
         canDisable: true,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -625,7 +758,7 @@ void main() {
         dialect: ReasoningDialect.thinkingType,
         levels: const [],
         canDisable: true,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -637,7 +770,7 @@ void main() {
           ReasoningLevel.max,
         ],
         canDisable: true,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(
@@ -649,7 +782,7 @@ void main() {
           ReasoningLevel.high,
         ],
         canDisable: true,
-        replay: ReasoningReplayPolicy.toolTurns,
+        replay: ReasoningReplayPolicy.all,
         replayField: ReasoningReplayField.reasoningContent,
       );
       expectHit(

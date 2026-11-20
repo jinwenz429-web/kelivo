@@ -95,7 +95,13 @@ class KelivoLink {
     if (host == 'terminal') {
       var command = '';
       if (query != null && query.length > 1) {
-        command = Uri.splitQueryString(query.substring(1))['cmd'] ?? '';
+        try {
+          command = Uri.splitQueryString(query.substring(1))['cmd'] ?? '';
+        } on ArgumentError {
+          return null;
+        } on FormatException {
+          return null;
+        }
       }
       return KelivoLink(
         kind: KelivoLinkKind.terminal,
@@ -288,7 +294,7 @@ class FileLinkResolver {
       case KelivoLinkKind.skillFile:
         root = (await AppDirectories.getSkillsDirectory()).path;
       case KelivoLinkKind.temporaryFile:
-        root = Directory.systemTemp.path;
+        root = p.join((await AppDirectories.sessionDir(sessionId)).path, 'tmp');
       case KelivoLinkKind.externalFile:
         final provider = externalMounts;
         if (provider == null) {

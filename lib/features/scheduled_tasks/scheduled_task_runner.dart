@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
+import '../../core/agency/companion_wake.dart';
 import '../../core/database/generation_run.dart';
 import '../../core/models/chat_input_data.dart';
 import '../../core/models/conversation.dart';
+import '../../core/models/conversation_mcp_settings.dart';
 import '../../core/models/workspace_binding.dart';
 import '../../core/models/scheduled_task.dart';
 import '../../core/providers/assistant_provider.dart';
@@ -12,9 +14,12 @@ import '../../core/providers/mcp_provider.dart';
 import '../../core/providers/workspace_provider.dart';
 import '../../core/providers/world_book_provider.dart';
 import '../../core/services/chat/chat_service.dart';
+import '../../core/services/chat/document_text_extractor.dart';
 import '../../core/services/scheduled_tasks_service.dart';
+import '../chat/utils/thinking_tag_parser.dart';
 import '../home/controllers/chat_actions.dart';
 import '../home/controllers/home_view_model.dart';
+import '../home/services/agency_wake_planner.dart';
 import '../home/services/ask_user_interaction_service.dart';
 import '../home/services/tool_approval_service.dart';
 
@@ -71,11 +76,14 @@ Future<Map<String, Object?>> runScheduledTask(
       : null;
   if (modelOverride != null) {
     final config = settings.getProviderConfig(modelOverride.providerKey);
-    if (!config.enabled || !config.models.contains(modelOverride.modelId)) {
+    if (!config.enabled || !config.isModelEnabled(modelOverride.modelId)) {
       throw StateError('model_missing');
     }
   }
-  for (final id in assistant.mcpServerIds) {
+  for (final id in ConversationMcpSettings.effectiveServerIds(
+    assistant,
+    targetConversation,
+  )) {
     cancellation.check();
     final server = mcp.getById(id);
     if (server == null || !server.enabled) continue;
@@ -131,6 +139,49 @@ Future<Map<String, Object?>> runScheduledTask(
       scheduledNotify: task.notify,
       scheduledPreview: task.showPreview,
     );
+  } else if (task.isCompanionWake) {
+    final history = await chat.loadSelectedMessageProjections(conversation.id);
+    cancellation.check();
+    final lastUser = history.where((m) => m.role == 'user').lastOrNull;
+    final String instruction;
+    if (task.isAgencyWake) {
+      if (!assistant.companionAgencyEnabled) {
+        return {'conversationId': conversation.id, 'status': 'skipped'};
+      }
+      final planned = await planAgencyWake(
+        settings: settings,
+        assistant: assistant,
+        conversation: conversation,
+        history: history,
+      );
+      cancellation.check();
+      if (planned == null) {
+        return {'conversationId': conversation.id, 'status': 'skipped'};
+      }
+      instruction = planned;
+    } else {
+      instruction = companionWakeInstruction(
+        now: DateTime.now(),
+        note: task.prompt,
+        lastMessageAt: history.lastOrNull?.timestamp,
+        lastUserMessageAt: lastUser?.timestamp,
+      );
+    }
+    final wake = await viewModel.sendProactiveAssistantMessage(
+      conversation: conversation,
+      assistant: assistant,
+      agencyInstruction: instruction,
+      modelOverride: modelOverride,
+      onGenerationStarted: onStarted,
+      notify: task.notify,
+      showPreview: task.showPreview,
+    );
+    // An unanswered user turn or a reply still streaming is not a moment to
+    // interrupt; the wake simply passes.
+    if (!wake.success && _wakePassesQuietly.contains(wake.errorMessage)) {
+      return {'conversationId': conversation.id, 'status': 'skipped'};
+    }
+    result = wake;
   } else {
     result = await viewModel.sendScheduledMessage(
       input: ChatInputData(text: task.prompt),
@@ -145,7 +196,8 @@ Future<Map<String, Object?>> runScheduledTask(
   if (cancellation.cancelled) await cancellation.cancel();
   cancellation.check();
   if (!result.success) {
-    throw StateError(result.errorMessage ?? 'generation_failed');
+    final error = result.errorMessage ?? 'generation_failed';
+    throw AttachmentReadError.fromMessage(error) ?? StateError(error);
   }
   final repository = chat.chatRepositoryOrNull!;
   final runId = result.generationRunId;
@@ -157,6 +209,16 @@ Future<Map<String, Object?>> runScheduledTask(
     if (run == null) throw StateError('generation_run_missing');
     if (run.state.isTerminal) {
       final message = await repository.getMessage(result.assistantMessage!.id);
+      if (task.isCompanionWake &&
+          run.state == GenerationRunState.completed &&
+          (message == null ||
+              isCompanionSilence(
+                ThinkingTagParser.parseWithRanges(
+                  message.content,
+                ).visibleContent,
+              ))) {
+        return {'conversationId': conversation.id, 'status': 'skipped'};
+      }
       return {
         'conversationId': conversation.id,
         'status': run.state == GenerationRunState.completed
@@ -181,3 +243,10 @@ Future<Map<String, Object?>> runScheduledTask(
     await Future<void>.delayed(const Duration(milliseconds: 500));
   }
 }
+
+const _wakePassesQuietly = {
+  'in_flight',
+  'proactive_requires_assistant_tail',
+  'proactive_empty_conversation',
+  'proactive_context_changed',
+};

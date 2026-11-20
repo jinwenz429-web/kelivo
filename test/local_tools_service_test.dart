@@ -378,11 +378,7 @@ void main() {
         expect(
           await LocalToolsService.tryHandleToolCall(
             LocalToolNames.bluetoothScan,
-            const {
-              'name_contains': 'Demo',
-              'duration_ms': 1500,
-              'limit': 3,
-            },
+            const {'name_contains': 'Demo', 'duration_ms': 1500, 'limit': 3},
             assistant,
           ),
           payload,
