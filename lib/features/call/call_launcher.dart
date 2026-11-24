@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import 'package:record/record.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../core/agency/cycle_log.dart';
 import '../../core/database/business_preferences.dart';
 import '../../core/models/assistant.dart';
 import '../../core/providers/assistant_provider.dart';
@@ -183,6 +184,7 @@ Future<void> startCall(
     modelId: setup.modelId,
     systemPrompt: [
       if (basePrompt.isNotEmpty) basePrompt,
+      ?CycleLogStore.instance.value.companionContext(DateTime.now()),
       callSystemInstructions(
         audioTags: CallVoice.audioTagDialect(
           CallVoice.withCallModel(tts, callSettings.voiceModel),

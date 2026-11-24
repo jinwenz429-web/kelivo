@@ -13,6 +13,7 @@ import '../../../core/models/quote_ref.dart';
 import 'package:flutter/widgets.dart';
 import 'package:provider/provider.dart';
 import '../../../core/agency/agency_world_state.dart';
+import '../../../core/agency/cycle_log.dart';
 import '../../../core/models/assistant.dart';
 import '../../../core/models/chat_input_data.dart';
 import '../../../core/models/chat_message.dart';
@@ -390,6 +391,15 @@ class MessageGenerationService {
         messageBuilderService.injectTransientSystemPrompt(
           apiMessages,
           realityContext,
+        );
+      }
+      final cycleContext = CycleLogStore.instance.value.companionContext(
+        DateTime.now(),
+      );
+      if (cycleContext != null) {
+        messageBuilderService.injectTransientSystemPrompt(
+          apiMessages,
+          cycleContext,
         );
       }
     }

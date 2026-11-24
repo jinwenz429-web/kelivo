@@ -122,6 +122,7 @@ import 'features/call/call_settings.dart';
 import 'features/call/incoming_call.dart';
 import 'core/agency/agency_wake_check.dart';
 import 'core/agency/agency_world_state.dart';
+import 'core/agency/cycle_log.dart';
 import 'features/home/controllers/chat_actions.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'core/models/workspace_binding.dart';
@@ -512,6 +513,7 @@ Future<void> main(List<String> arguments) async {
         // Companion agency is process-wide: it lives for the whole app, not
         // for one home page, so it starts next to the preferences it persists to.
         AgencySettingsStore.instance.attach(businessPreferences);
+        CycleLogStore.instance.attach(businessPreferences);
         AgencyFollowUpStore.instance.attach(businessPreferences);
         AgencyWakeMemoryStore.instance.attach(businessPreferences);
         AgencyWorldState.instance.start();

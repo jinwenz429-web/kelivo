@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../../core/agency/agency_settings.dart';
+import '../../../core/agency/cycle_log.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../icons/lucide_adapter.dart';
 import '../../../shared/widgets/ios_form_text_field.dart';
@@ -15,6 +16,7 @@ import '../../../shared/widgets/section_card.dart';
 import '../../../shared/widgets/segmented_tabs.dart';
 import '../../home/services/local_tools_service.dart';
 import '../../model/widgets/model_select_sheet.dart';
+import 'cycle_log_page.dart';
 
 /// Fine-grained Companion Agency settings: its model, a note it always sees,
 /// and every occasion that may wake it, each with an on/off switch and how
@@ -198,6 +200,17 @@ class _CompanionAgencySettingsPageState
                 ),
               ),
               const IosRowDivider(),
+              IosNavRow(
+                icon: Lucide.Droplets,
+                label: '经期记录',
+                subtitle: '他知道你在周期的哪一段，心里有数',
+                detailText: _cycleLabel(),
+                onTap: () async {
+                  await CycleLogPage.open(context);
+                  if (mounted) setState(() {});
+                },
+              ),
+              const IosRowDivider(),
               Padding(
                 padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
                 child: IosFormTextField(
@@ -354,6 +367,13 @@ class _CompanionAgencySettingsPageState
         ),
     ],
   ];
+
+  static String? _cycleLabel() {
+    final now = DateTime.now();
+    final status = CycleLogStore.instance.value.statusOn(now);
+    if (status == null) return '未记录';
+    return status.phase == CyclePhase.period ? '第 ${status.cycleDay} 天' : null;
+  }
 
   static String _hours(int minutes) {
     final h = minutes ~/ 60;
